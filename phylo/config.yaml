@@ -1,0 +1,56 @@
+# =============================================================
+# config.yaml —— 贝类系统发育分析流程配置
+# =============================================================
+
+# ---------- 输入输出 ----------
+input:
+  raw_proteome_dir: "data/proteomes"                  # 原始蛋白目录
+  filtered_proteome_dir: "results/proteomes_filtered" # QC 过滤后输出
+
+# ---------- 蛋白质过滤（QC） ----------
+qc:
+  enable: true        # 是否启用 QC
+  min_len: 50         # 最短序列长度
+  min_entropy: 2.2    # 最小序列熵
+  max_x_frac: 0.05    # X/B/Z 最大比例
+  allow_stop: false   # 是否允许内部 *
+  strict: false       # true: 若物种为空则报错；false: 占位继续
+
+# ---------- OrthoFinder ----------
+orthofinder:
+  threads: 36
+  analysis_threads: 30
+  search_engine: "diamond"
+  gene_tree_engine: "fasttree"
+  msa_and_trees: true
+
+# ---------- 系统发育树 ----------
+species_tree:
+  concat:
+    enabled: true
+    use_strict_sco: true
+    iqtree_threads: 20
+    iqtree_params:
+      model: "MFP+MERGE"
+      bootstrap: 1000
+      alrt: 1000
+      extra_args: "-bnni"
+    min_align_len: 150         # 单基因最短对齐长度
+    min_taxa_per_locus: 0      # 每个分区至少 N 个物种有序列
+    top_n_partitions: 2000     # 仅保留最长的 N 个分区（0=关闭）
+
+# ---------- 覆盖度报告 ----------
+reports:
+  matrix:
+    enable: true
+    outdir: "results/reports"
+
+# ---------- 外部工具路径 ----------
+env:
+  binaries:
+    diamond: "diamond"
+    mafft: "mafft"
+    iqtree: "iqtree"
+    iqtree2: "iqtree2"
+    trimal: "trimal"
+    python: "python"

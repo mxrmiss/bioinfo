@@ -1,0 +1,554 @@
+# -*- coding: utf-8 -*-
+# =============================================================
+# Snakefile —— 贝类系统发育分析流程（仅优化注释版）
+# =============================================================
+# 流程模块总览：
+#   1) 蛋白质序列质量控制（可开关）
+#   2) 使用 OrthoFinder 构建正交簇与（可选）基因树
+#   3) 多序列比对（MSA）后裁剪、表头规范化与 isoform 收敛
+#   4) 基于规范化后的 MSA 进行超矩阵拼接 → IQ-TREE 物种树
+#   6) 覆盖度报告（分区×物种的覆盖情况）
+# 说明：
+#   - 注释已全面优化，便于理解；所有可执行代码保持不变。
+#   - 外部脚本位于 scripts/ 目录（由 config.yaml 的 env.binaries.python 指定解释器）。
+# =============================================================
+
+from pathlib import Path
+import os, glob
+
+# 读取主配置文件（保持路径不变）
+configfile: "config.yaml"
+
+# ---------------------------
+# 配置读取与常量派生
+# ---------------------------
+# 顶层配置块：输入路径、OrthoFinder、物种树、报告
+INP = config.get("input", {})
+OF  = config.get("orthofinder", {})
+ST  = config.get("species_tree", {})
+IQC = ST.get("concat", {}) if isinstance(ST, dict) else {}
+REP = config.get("reports", {}).get("matrix", {})
+SCO_ONLY = bool(IQC.get("use_strict_sco", False))
+
+# 蛋白质数据输入目录推断（优先级：proteome_dir > raw > filtered > 默认）
+DATA_PROTEOMES = (
+    INP.get("proteome_dir")
+    or INP.get("raw_proteome_dir")
+    or INP.get("filtered_proteome_dir")
+    or "data/proteomes"
+)
+
+# -------- OrthoFinder 运行参数（来源 config.orthofinder）--------
+OF_THREADS       = int(OF.get("threads", 16))                 # 序列搜索线程
+OF_ANALYSIS_THR  = int(OF.get("analysis_threads", 8))         # MSA/基因树分析线程
+OF_SEARCH        = str(OF.get("search_engine", "diamond"))    # 搜索引擎（diamond/blast 等）
+OF_MSA_AND_TREES = bool(OF.get("msa_and_trees", True))        # 是否让 OF 自己做 MSA/树
+OF_GENE_TREE_ENG = OF.get("gene_tree_engine", None)           # 基因树引擎（fasttree/iqtree 等）
+
+# -------- IQ-TREE 运行参数（来源 config.species_tree.concat）--------
+IQTREE_ENABLED   = bool(IQC.get("enabled", True))
+IQTREE_THREADS   = int(IQC.get("iqtree_threads", OF_THREADS))
+IQP = IQC.get("iqtree_params", {}) if isinstance(IQC, dict) else {}
+IQTREE_MODEL = str(IQP.get("model", "MFP+MERGE"))             # 模型设定
+IQTREE_BOOT  = int(IQP.get("bootstrap", 1000))                # UFBoot 次数
+IQTREE_ALRT  = int(IQP.get("alrt", 1000))                     # SH-aLRT 次数
+IQTREE_EXTRA = str(IQP.get("extra_args", "")).strip()         # 额外参数
+# 将可选参数拼成可直接传给 iqtree 的标志（空值则不添加）
+IQTREE_MODEL_FLAG = f"-m {IQTREE_MODEL}" if IQTREE_MODEL else ""
+IQTREE_BOOT_FLAG  = f"-B {IQTREE_BOOT}" if IQTREE_BOOT > 0 else ""
+IQTREE_ALRT_FLAG  = f"-alrt {IQTREE_ALRT}" if IQTREE_ALRT > 0 else ""
+IQTREE_EXTRA_FLAG = IQTREE_EXTRA
+
+# -------- QC 参数（来源 config.qc）--------
+QC = config.get("qc", {})
+QC_ENABLED   = bool(QC.get("enable", False))
+QC_MINLEN    = QC.get("min_len", 50)                          # 最短氨基酸长度
+QC_MINENT    = QC.get("min_entropy", 2.2)                     # 最小序列香农熵
+QC_MAXX      = QC.get("max_x_frac", 0.05)                     # 模糊字符比例上限（X/B/Z）
+QC_ALLOWSTOP = bool(QC.get("allow_stop", False))              # 是否允许内部终止子（*）
+
+# -------- 报告参数（来源 config.reports.matrix）--------
+REPORT_ENABLED = bool(REP.get("enable", False))
+REPORT_DIR     = REP.get("outdir", "results/reports")
+
+# -------- 外部二进制路径（来源 config.env.binaries）--------
+ENV  = config.get("env", {})
+BIN  = ENV.get("binaries", {}) if isinstance(ENV, dict) else {}
+BIN_DIAMOND = BIN.get("diamond", "diamond")
+BIN_MAFFT   = BIN.get("mafft", "mafft")
+BIN_IQTREE  = BIN.get("iqtree2", BIN.get("iqtree", "iqtree"))
+BIN_TRIMAL  = BIN.get("trimal", "trimal")
+BIN_PYTHON  = BIN.get("python", "python")
+
+# ---------------------------
+# 路径常量（统一管理输出位置）
+# ---------------------------
+RESULTS_DIR    = "results"
+LOG_DIR        = "logs"
+SCRIPTS_DIR    = "scripts"
+
+# OrthoFinder 产物与中间件
+OF_WORKDIR     = f"{RESULTS_DIR}/orthofinder"
+OF_RESULT_TXT  = f"{RESULTS_DIR}/orthogroups/RESULTS_PATH.txt"   # 记录 OF 的 Results_* 绝对路径
+SCO_LIST       = f"{RESULTS_DIR}/orthogroups/sco.list"           # 这里取 Orthogroups.tsv 第一列（全部 OG）
+
+# MSA 与规范化目录
+TRIM_DIR       = f"{RESULTS_DIR}/trim"
+TRIM_DIR_NORM  = f"{RESULTS_DIR}/trim_norm"
+TRIM_DIR_COLLAPSE          = "results/trim_norm_collapse"         # isoform 收敛后（仍含 SeqID）
+TRIM_DIR_COLLAPSE_SPECIES  = "results/trim_norm_collapse_species" # 收敛为仅物种名（供拼接）
+TRIM_DIR_SCO_SPECIES       = "results/trim_norm_sco_species"      # 仅SCO白名单后的“仅物种名”目录
+SCO_KEEP_LIST              = f"{RESULTS_DIR}/orthogroups/sco.keep.list"  # 严格SCO白名单
+
+
+# 超矩阵与分区文件
+CONCAT_PREFIX  = f"{RESULTS_DIR}/concat/supermatrix"
+CONCAT_FAS     = f"{CONCAT_PREFIX}.aa.fas"
+PARTITIONS_TXT = f"{RESULTS_DIR}/concat/partitions.txt"
+
+# IQ-TREE 输出
+IQTREE_DIR     = f"{RESULTS_DIR}/trees/concat/iqtree"
+IQTREE_PREFIX  = f"{IQTREE_DIR}/supermatrix"
+IQTREE_TREE    = f"{IQTREE_PREFIX}.treefile"
+
+# ---------------------------
+# 汇总目标（根据开关动态追加）
+# ---------------------------
+ALL_TARGETS = [
+    f"{OF_WORKDIR}/.done",
+    OF_RESULT_TXT,
+    SCO_LIST,
+    f"{TRIM_DIR}/.done",
+    f"{TRIM_DIR_NORM}/.done",
+]
+if IQTREE_ENABLED:
+    ALL_TARGETS.append(IQTREE_TREE)
+if REPORT_ENABLED:
+    ALL_TARGETS.append(f"{REPORT_DIR}/matrix.tsv")
+
+rule all:
+    input: ALL_TARGETS
+
+# =============================================================
+# A) 蛋白质过滤（QC）
+#    - 单文件过滤 + 批量聚合 .done 标记
+#    - 仅当 qc.enable: true 时被上游依赖触发
+# =============================================================
+rule filter_one_proteome:
+    input:
+        f"{INP.get('raw_proteome_dir','data/proteomes')}/{{sp}}.faa"
+    output:
+        f"{INP.get('filtered_proteome_dir','results/proteomes_filtered')}/{{sp}}.faa"
+    log:
+        f"{LOG_DIR}/filter_one_proteome.{{sp}}.log"
+    params:
+        py        = BIN_PYTHON,
+        script    = f"{SCRIPTS_DIR}/filter_proteins.py",
+        min_len   = QC_MINLEN,
+        min_ent   = QC_MINENT,
+        max_x     = QC_MAXX,
+        allowstop = QC_ALLOWSTOP,
+        # ★ 新增：在 params 阶段就把开关变成参数字符串
+        allowflag = ("--allow-stop" if QC_ALLOWSTOP else "")
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p $(dirname {output})
+        {params.py} {params.script} {input} {output} \
+          --min-len {params.min_len} \
+          --min-entropy {params.min_ent} \
+          --max-x-frac {params.max_x} \
+          {params.allowflag} \
+          2>&1 | tee -a {log}
+        if [ ! -s {output} ]; then
+          echo "[ERR] QC 过滤后文件为空: {output}" | tee -a {log}; exit 21
+        fi
+        """
+
+rule filter_all_proteomes:
+    """批量过滤所有蛋白文件：仅聚合上一步产物并生成 .done 标记"""
+    input:
+        expand(
+            f"{INP.get('filtered_proteome_dir','results/proteomes_filtered')}" + "/{sp}.faa",
+            sp=[os.path.basename(p)[:-4] for p in sorted(glob.glob(f"{INP.get('raw_proteome_dir','data/proteomes')}/*.faa"))]
+        )
+    output:
+        touch(f"{INP.get('filtered_proteome_dir','results/proteomes_filtered')}/.done")
+    log: f"{LOG_DIR}/filter_all_proteomes.log"
+    shell:
+        r"""
+        echo "[INFO] 全部蛋白质过滤完成" | tee -a {log}
+        """
+
+## =============================================================
+# 1) OrthoFinder 主流程
+#    - 输入：若启用 QC 则依赖 QC 的 .done，否则直接使用原始目录
+#    - 输出：标记 OF_WORKDIR/.done 与写入 RESULTS_PATH.txt
+#    - 线程：threads 控制序列搜索；analysis_threads 控制 MSA/基因树步骤
+## =============================================================
+rule orthofinder:
+    input:
+        f"{INP.get('filtered_proteome_dir','results/proteomes_filtered')}/.done"
+    output:
+        done_flag   = touch(f"{OF_WORKDIR}/.done"),
+        results_txt = OF_RESULT_TXT
+    log: f"{LOG_DIR}/orthofinder.log"
+    threads: OF_THREADS
+    params:
+        search_engine    = OF_SEARCH,
+        msa_and_trees    = OF_MSA_AND_TREES,
+        gene_tree_engine = OF_GENE_TREE_ENG,
+        analysis_threads = OF_ANALYSIS_THR,
+        # ★ 在 params 里准备好目录
+        proteome_dir     = INP.get('filtered_proteome_dir','results/proteomes_filtered')
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p {OF_WORKDIR} {RESULTS_DIR}/orthogroups {LOG_DIR}
+        cd {OF_WORKDIR}
+
+        export OMP_NUM_THREADS={threads}
+        export OPENBLAS_NUM_THREADS=1
+        export MKL_NUM_THREADS=1
+        export NUMEXPR_NUM_THREADS=1
+        export OF_DIAMOND_OPTS="--threads {threads}"
+        OUTDIR="run_of"
+        if [ -d "$OUTDIR" ]; then
+          OUTDIR="${{OUTDIR}}_r$(date +%Y%m%d-%H%M%S)"
+          echo "[WARN] output dir exists, switch to: $OUTDIR" | tee -a ../../{log}
+        fi
+
+        echo "[INFO] Run OrthoFinder → $OUTDIR (input={params.proteome_dir})" | tee -a ../../{log}
+        cmd=(orthofinder -f ../../{params.proteome_dir} \
+                         -S "{params.search_engine}" -t {threads} -a {params.analysis_threads} -o "$OUTDIR")
+        if [ "{params.msa_and_trees}" = "True" ]; then
+            cmd+=(-M msa)
+        fi
+        if [ -n "{params.gene_tree_engine}" ] && [ "{params.gene_tree_engine}" != "None" ]; then
+            cmd+=(-T "{params.gene_tree_engine}")
+        fi
+        "${{cmd[@]}}" 2>&1 | tee -a ../../{log}
+
+        RESDIR=$(find "$OUTDIR" -maxdepth 1 -type d -name "Results_*" -print -quit)
+        if [ -z "$RESDIR" ]; then
+          echo "[ERR] 未找到 Results_* 目录" | tee -a ../../{log}; exit 2
+        fi
+        if [ ! -f "$RESDIR/Orthogroups/Orthogroups.tsv" ]; then
+          echo "[ERR] 缺少 Orthogroups.tsv 于 $RESDIR/Orthogroups/" | tee -a ../../{log}; exit 3
+        fi
+        realpath "$RESDIR" > ../../{output.results_txt}
+        touch ../../{output.done_flag}
+        """
+
+# =============================================================
+# 2) 提取 OG 列表
+#    - 从 Orthogroups.tsv 取第一列（去表头），写入 sco.list
+#    - 这里“sco.list”命名沿用历史习惯，语义为“OG 列表”
+# =============================================================
+rule extract_sco_list:
+    input:  OF_RESULT_TXT
+    output: SCO_LIST
+    log:    f"{LOG_DIR}/extract_sco_list.log"
+    params:
+        py     = BIN_PYTHON,
+        script = f"{SCRIPTS_DIR}/extract_sco_list.py",
+        resfile= OF_RESULT_TXT
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p {RESULTS_DIR}/orthogroups {LOG_DIR}
+        {params.py} {params.script} \
+          --results-file {params.resfile} \
+          --out {output} \
+          2>> {log}
+        """
+
+# =============================================================
+# 2.5) 构建严格SCO白名单（use_strict_sco: true 时会被下游依赖触发）
+#     - 优先用 OrthoFinder 的 Orthogroups_SingleCopyOrthologues.txt
+#     - 若缺失，则从 Orthogroups.tsv 计算“所有物种各1条”的 OG
+# 产物：results/orthogroups/sco.keep.list  （每行一个 OG ID）
+# =============================================================
+rule build_sco_keep_list:
+    input:
+        OF_RESULT_TXT
+    output:
+        SCO_KEEP_LIST
+    log:
+        f"{LOG_DIR}/build_sco_keep_list.log"
+    params:
+        py     = BIN_PYTHON,
+        script = f"{SCRIPTS_DIR}/build_sco_keep_list.py",
+        resfile= OF_RESULT_TXT
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p {RESULTS_DIR}/orthogroups {LOG_DIR}
+        {params.py} {params.script} --results-file {params.resfile} --out {output} >> {log} 2>&1
+        """
+
+# =============================================================
+# 3) MSA 裁剪（批处理）
+#    - 遍历 sco.list 中的 OG，在 OrthoFinder MSA 目录中寻找对应 .fa / .fasta
+#    - 使用 trimal -automated1 裁剪；缺失或空结果生成空占位，保证 DAG 连续
+# =============================================================
+rule prepare_trimmed_alignment:
+    input:
+        SCO_LIST,
+        f"{OF_WORKDIR}/.done",
+        OF_RESULT_TXT
+    output:
+        touch(f"{TRIM_DIR}/.done")
+    log: f"{LOG_DIR}/prepare_trimmed_alignment.log"
+    threads: OF_ANALYSIS_THR
+    params:
+        py      = BIN_PYTHON,
+        script  = f"{SCRIPTS_DIR}/prepare_trimmed_alignment.py",
+        trimal  = BIN_TRIMAL,
+        resfile = OF_RESULT_TXT,
+        oglist  = SCO_LIST,
+        outdir  = TRIM_DIR
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p {params.outdir} {LOG_DIR}
+        {params.py} {params.script} \
+          --results-file {params.resfile} \
+          --og-list {params.oglist} \
+          --outdir {params.outdir} \
+          --trimal {params.trimal} \
+          2>> {log}
+        touch {output}
+        """
+
+# =============================================================
+# 3.5) 表头规范化（>SpeciesID|SeqID）—— 调用 Python 脚本（自动推断物种集合）
+# =============================================================
+rule normalize_all_msas:
+    input:
+        f"{TRIM_DIR}/.done"
+    output:
+        touch(f"{TRIM_DIR_NORM}/.done")
+    log:
+        f"{LOG_DIR}/normalize_all_msas.log"
+    params:
+        py     = BIN_PYTHON,
+        script = f"{SCRIPTS_DIR}/normalize_msas.py",
+        indir  = TRIM_DIR,
+        outdir = TRIM_DIR_NORM,
+        pdir   = DATA_PROTEOMES
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p {params.outdir} {LOG_DIR}
+        export LC_ALL=C
+        {params.py} {params.script} \
+          --indir {params.indir} \
+          --outdir {params.outdir} \
+          --proteome-dir {params.pdir} \
+          2>> {log}
+        # 脚本成功执行后写 .done
+        touch {output}
+        """
+
+# =============================================================
+# 3.7) isoform 收敛（每物种×每 locus 仅保留最长序列）
+#    - 仍保留 >Species|SeqID 形式，为后续“仅物种名”收敛做准备
+# =============================================================
+rule collapse_isoforms:
+    input:
+        f"{TRIM_DIR_NORM}/.done"
+    output:
+        touch(f"{TRIM_DIR_COLLAPSE}/.done")
+    params:
+        py     = BIN_PYTHON,
+        script = f"{SCRIPTS_DIR}/collapse_isoforms.py",
+        indir  = TRIM_DIR_NORM,
+        outdir = TRIM_DIR_COLLAPSE
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p {params.outdir}
+        {params.py} {params.script} \
+          --indir {params.indir} \
+          --outdir {params.outdir}
+        """
+
+# =============================================================
+# 3.8) 表头收敛为“仅物种名”（>Species）
+#    - 目的：避免 SeqID 被错误视作不同物种，利于后续拼接
+# =============================================================
+rule collapse_headers_to_species:
+    input:
+        f"{TRIM_DIR_COLLAPSE}/.done"
+    output:
+        touch(f"{TRIM_DIR_COLLAPSE_SPECIES}/.done")
+    log:
+        f"{LOG_DIR}/collapse_headers_to_species.log"
+    params:
+        py     = BIN_PYTHON,
+        script = f"{SCRIPTS_DIR}/collapse_headers_to_species.py",
+        indir  = TRIM_DIR_COLLAPSE,
+        outdir = TRIM_DIR_COLLAPSE_SPECIES
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p {params.outdir} {LOG_DIR}
+        {params.py} {params.script} \
+          --indir {params.indir} \
+          --outdir {params.outdir} \
+          2>> {log}
+        touch {output}
+        """
+
+# =============================================================
+# 3.9) 仅SCO白名单过滤
+#     - 将 collapse_to_species 目录中的对齐按白名单筛选，并软链接到
+#       results/trim_norm_sco_species/ 中，供后续拼接只扫描严格SCO位点
+# 产物：results/trim_norm_sco_species/.done
+# 说明：不改动任何外部脚本；若个别白名单OG在对齐目录缺失，会打印 WARN
+# =============================================================
+rule filter_alignments_by_sco:
+    input:
+        base_done = f"{TRIM_DIR_COLLAPSE_SPECIES}/.done",
+        keep_list = SCO_KEEP_LIST
+    output:
+        touch(f"{TRIM_DIR_SCO_SPECIES}/.done")
+    log:
+        f"{LOG_DIR}/filter_alignments_by_sco.log"
+    params:
+        py     = BIN_PYTHON,
+        script = f"{SCRIPTS_DIR}/filter_alignments_by_sco.py",
+        indir  = TRIM_DIR_COLLAPSE_SPECIES,
+        outdir = TRIM_DIR_SCO_SPECIES,
+        keep   = SCO_KEEP_LIST
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p {TRIM_DIR_SCO_SPECIES} {LOG_DIR}
+        {params.py} {params.script} --indir {params.indir} --keep-list {params.keep} --outdir {params.outdir} >> {log} 2>&1
+        touch {output}
+        """
+
+# =============================================================
+# 4) 超矩阵拼接
+#    - 使用“仅物种名”目录作为输入，按照阈值过滤并生成分区文件
+#    - 关键参数：min_align_len / min_taxa_per_locus / top_n_partitions
+# =============================================================
+rule concat_supermatrix:
+    input:
+        f"{OF_WORKDIR}/.done",
+        OF_RESULT_TXT,
+        SCO_LIST,
+        f"{TRIM_DIR}/.done",
+        f"{TRIM_DIR_NORM}/.done",
+        f"{TRIM_DIR_COLLAPSE}/.done",
+        (f"{TRIM_DIR_SCO_SPECIES}/.done" if SCO_ONLY else f"{TRIM_DIR_COLLAPSE_SPECIES}/.done")
+    output:
+        CONCAT_FAS,
+        PARTITIONS_TXT
+    params:
+        script  = f"{SCRIPTS_DIR}/concat_supermatrix_safe.py",
+        py      = BIN_PYTHON,
+        minlen  = config.get("species_tree", {}).get("concat", {}).get("min_align_len", 0),
+        mintaxa = config.get("species_tree", {}).get("concat", {}).get("min_taxa_per_locus", 0),  # 使用新键
+        topn    = config.get("species_tree", {}).get("concat", {}).get("top_n_partitions", 0),
+        normdir = (TRIM_DIR_SCO_SPECIES if SCO_ONLY else TRIM_DIR_COLLAPSE_SPECIES)
+    threads: OF_ANALYSIS_THR
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p results/concat
+        echo "[INFO] 使用 MSA 来源目录(仅物种名): {params.normdir}"
+        {params.py} {params.script} \
+          --trim-dir {params.normdir} \
+          --out-prefix {CONCAT_PREFIX} \
+          --datatype aa \
+          --min-align-len {params.minlen} \
+          --min-taxa-per-locus {params.mintaxa} \
+          --top-n {params.topn}
+        """
+
+# =============================================================
+# 5) IQ-TREE 物种树（超矩阵）
+#    - 严格检查输入文件存在性，再运行 IQ-TREE
+#    - 参数完全由 config.species_tree.concat.iqtree_params 控制
+# =============================================================
+rule iqtree_concat_tree:
+    input:
+        fasta = CONCAT_FAS,
+        part  = PARTITIONS_TXT
+    output:
+        IQTREE_TREE
+    log:
+        f"{LOG_DIR}/iqtree_concat_tree.log"
+    threads:
+        IQTREE_THREADS
+    params:
+        iqtree = BIN_IQTREE,
+        pre    = IQTREE_PREFIX,
+        model  = IQTREE_MODEL_FLAG,
+        boot   = IQTREE_BOOT_FLAG,
+        alrt   = IQTREE_ALRT_FLAG,
+        extra  = IQTREE_EXTRA_FLAG
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p {IQTREE_DIR}
+        # 防止 OpenMP/BLAS 超开线程；IQ-TREE 会遵守 -T 和 OMP_NUM_THREADS
+        export OMP_NUM_THREADS={threads}
+        export OPENBLAS_NUM_THREADS=1
+        export MKL_NUM_THREADS=1
+        export NUMEXPR_NUM_THREADS=1
+
+        # 基础输入检查
+        if [ ! -s {input.fasta} ]; then
+          echo "[ERR] supermatrix 为空：{input.fasta}" | tee -a {log}; exit 31
+        fi
+        if [ ! -s {input.part} ]; then
+          echo "[ERR] partitions 为空：{input.part}" | tee -a {log}; exit 32
+        fi
+
+        # 运行 IQ-TREE
+        {params.iqtree} \
+          -s {input.fasta} \
+          -p {input.part} \
+          {params.model} \
+          {params.boot} {params.alrt} \
+          -T {threads} \
+          -pre {params.pre} \
+          {params.extra} \
+          2>&1 | tee -a {log}
+
+        # 产物存在性检查
+        if [ ! -s {params.pre}.treefile ]; then
+          echo "[ERR] IQ-TREE 未生成 treefile" | tee -a {log}; exit 33
+        fi
+        """
+
+# =============================================================
+# 7) 覆盖度报告
+#    - 对拼接后的超矩阵进行覆盖度统计，生成矩阵报告
+#    - 若关闭开关：生成空文件并标注日志
+#    - stdout → {output}；stderr → {log}
+# =============================================================
+rule report_matrix:
+    """生成超矩阵覆盖度报告（物种×分区的存在情况）"""
+    input:
+        CONCAT_FAS
+    output:
+        f"{REPORT_DIR}/matrix.tsv"
+    log:
+        f"{LOG_DIR}/report_matrix.log"
+    params:
+        py     = BIN_PYTHON,
+        script = f"{SCRIPTS_DIR}/report_matrix.py"
+    run:
+        Path(REPORT_DIR).mkdir(parents=True, exist_ok=True)
+        if not REPORT_ENABLED:
+            shell(": > {output} && echo '[INFO] 覆盖度报告关闭，生成空文件' >> {log}")
+        else:
+            # 将脚本的标准输出写入结果文件；仅将错误输出追加到日志
+            shell("{params.py} {params.script} {input} > {output} 2>> {log}")
+        if not Path(output[0]).exists() or Path(output[0]).stat().st_size == 0:
+            shell("echo '[ERR] 覆盖度报告文件为空' >> {log}; exit 51")

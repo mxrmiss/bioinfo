@@ -1,0 +1,339 @@
+# -*- coding: utf-8 -*-
+"""
+极简版 Snakefile（完全由 config.yaml 驱动）
+=================================================
+设计原则：
+1) 不在 Snakefile 中写任何默认值；所有参数、路径、线程、工具均在 config.yaml 定义；
+2) 若配置缺失，立即报错并退出（早失败，易定位）；
+3) 仅用于蛋白模式（BUSCO -m proteins），输入为各物种蛋白质 FASTA（.faa/.fa/.fasta 皆可）；
+4) 不使用 --use-conda，请在执行前手动激活包含 busco/mafft/trimal/iqtree/java 的环境。
+
+流程总览：
+BUSCO(proteins) → 单拷贝整合 → MAFFT → trimAl → 拼接超矩阵 + 分区 → IQ-TREE（超矩阵树）
+可选：每位点基因树 → ASTRAL 物种树
+"""
+
+import sys, os, yaml
+from pathlib import Path
+
+# ========== 读取配置与必填项校验 ==========
+CONFIG_FILE = "config.yaml"
+if not Path(CONFIG_FILE).exists():
+    sys.exit("[致命] 未找到 config.yaml，请先准备完整配置。")
+
+with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+    C = yaml.safe_load(f) or {}
+
+# 顶层必填键
+REQUIRED_TOP = ["species", "dirs", "threads", "busco", "mafft", "trimal", "iqtree", "concat"]
+for key in REQUIRED_TOP:
+    if key not in C:
+        sys.exit(f"[致命] config.yaml 中缺少必填字段: {key}")
+
+# species 列表结构检查
+if not isinstance(C["species"], list) or not C["species"]:
+    sys.exit("[致命] config.yaml.species 必须为非空列表。")
+for item in C["species"]:
+    if "id" not in item or "path" not in item:
+        sys.exit("[致命] config.yaml.species 每项须包含 id 与 path。")
+
+# 目录必填键
+REQUIRED_DIRS = ["busco", "loci", "align", "trim", "concat", "trees"]
+for k in REQUIRED_DIRS:
+    if k not in C["dirs"]:
+        sys.exit(f"[致命] config.yaml.dirs 缺少目录键：{k}")
+
+# 线程必填键
+REQUIRED_THREADS = ["busco", "mafft", "trimal", "iqtree_concat", "iqtree_gene", "astral"]
+for k in REQUIRED_THREADS:
+    if k not in C["threads"]:
+        sys.exit(f"[致命] config.yaml.threads 缺少线程键：{k}")
+
+# BUSCO、MAFFT、trimAl、IQ-TREE、拼接配置校验
+for k in ["lineage", "mode", "extra_args"]:
+    if k not in C["busco"]:
+        sys.exit(f"[致命] config.yaml.busco 缺少键：{k}")
+if C["busco"]["mode"] != "proteins":
+    sys.exit("[致命] 目前仅支持 BUSCO 蛋白模式（busco.mode 应为 'proteins'）。")
+
+if "extra_args" not in C["mafft"]:
+    sys.exit("[致命] config.yaml.mafft 需提供 extra_args")
+if "extra_args" not in C["trimal"]:
+    sys.exit("[致命] config.yaml.trimal 需提供 extra_args")
+
+for k in ["bin", "seed", "extra_args_concat", "extra_args_gene"]:
+    if k not in C["iqtree"]:
+        sys.exit(f"[致命] config.yaml.iqtree 缺少键：{k}")
+
+for k in ["mincov", "line_width", "partition_model", "sort_loci"]:
+    if k not in C["concat"]:
+        sys.exit(f"[致命] config.yaml.concat 缺少键：{k}")
+
+# ASTRAL 可选配置（若提供 enable: true，则强制需要 jar_env/xmx）
+AST = C.get("astral", {"enable": False})
+if AST.get("enable", False):
+    for k in ["jar_env", "xmx"]:
+        if k not in AST:
+            sys.exit(f"[致命] astral.enable=true 时，config.yaml.astral 需包含：{k}")
+
+# ========== 读取配置到局部变量（不设默认，全部来自 config.yaml） ==========
+SPECIES = [str(s["id"]) for s in C["species"]]
+PROTEOME = {str(s["id"]): str(s["path"]) for s in C["species"]}
+
+DIR = C["dirs"]
+TH  = C["threads"]
+
+BUSCO = C["busco"]
+MAFFT = C["mafft"]
+TRIMAL = C["trimal"]
+IQ = C["iqtree"]
+CONCAT = C["concat"]
+
+# 统一命名（所有目录来自 config.yaml）
+CONCAT_MATRIX   = f"{DIR['concat']}/supermatrix.aa.fas"
+PARTITIONS_TXT  = f"{DIR['concat']}/partitions.txt"
+IQTREE_CONC_DIR = f"{DIR['trees']}/concat/iqtree"
+CONCAT_TREEFILE = f"{IQTREE_CONC_DIR}/supermatrix.aa.fas.treefile"
+ASTRAL_DIR      = f"{DIR['trees']}/astral"
+ASTRAL_GENE_TREES  = f"{ASTRAL_DIR}/gene_trees.tre"
+ASTRAL_SPECIESTREE = f"{ASTRAL_DIR}/species_tree_astral.nwk"
+
+# 最终目标
+TARGETS = [CONCAT_TREEFILE]
+if AST.get("enable", False):
+    TARGETS.append(ASTRAL_SPECIESTREE)
+
+rule all:
+    input: TARGETS
+
+# ========== 规则定义（核心逻辑，不含任何默认值） ==========
+
+# BUSCO：每个物种蛋白（-m proteins）
+rule busco_proteins:
+    input:
+        proteome=lambda wc: PROTEOME[wc.sp]
+    output:
+        directory(f"{DIR['busco']}/{{sp}}")
+    threads: TH["busco"]
+    message: "BUSCO: {input.proteome} → {output}"
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p {output}
+        cd {output}
+        busco \
+          -i {input.proteome} \
+          -l {BUSCO[lineage]} \
+          -m {BUSCO[mode]} \
+          -o run_{wildcards.sp} \
+          {BUSCO[extra_args]}
+        """
+
+# 收集 single-copy BUSCO → 每个位点一个多FASTA
+rule collate_single_copy_busco:
+    input:
+        expand(f"{DIR['busco']}/{{sp}}", sp=SPECIES)
+    output:
+        directory(DIR["loci"]),
+        touch(f"{DIR['loci']}/.done")
+    threads: 1
+    message: "整合 BUSCO 单拷贝 → {output}"
+    run:
+        from pathlib import Path
+        Path(DIR["loci"]).mkdir(parents=True, exist_ok=True)
+
+        def find_sc_dir(sp_dir: Path):
+            cands = sorted(sp_dir.glob("run_*/busco_sequences/single_copy_busco_sequences"))
+            if cands: return cands[0]
+            cands = sorted(sp_dir.glob("**/busco_sequences/single_copy_busco_sequences"))
+            return cands[0] if cands else None
+
+        loci_map = {}
+        for sp in SPECIES:
+            sp_dir = Path(f"{DIR['busco']}/{sp}")
+            sc_dir = find_sc_dir(sp_dir)
+            if sc_dir is None:
+                print(f"[警告] {sp} 未找到 single_copy_busco_sequences", file=sys.stderr)
+                continue
+            for faa in sc_dir.glob("*.faa"):
+                locus = faa.stem
+                loci_map.setdefault(locus, {})[sp] = str(faa)
+
+        n = 0
+        for locus, sp2faa in sorted(loci_map.items()):
+            out = Path(f"{DIR['loci']}/{locus}.faa")
+            with out.open("w", encoding="utf-8") as w:
+                for sp in SPECIES:
+                    if sp in sp2faa:
+                        txt = Path(sp2faa[sp]).read_text()
+                        lines = [l.strip() for l in txt.splitlines() if l.strip()]
+                        header, seq = lines[0], "".join(l for l in lines[1:] if not l.startswith(">"))
+                        w.write(f">{sp}|{locus}\n{seq}\n")
+            n += 1
+        print(f"[INFO] 生成 {n} 个 loci → {DIR['loci']}", file=sys.stderr)
+
+# MAFFT 比对
+rule mafft_align:
+    input:
+        f=f"{DIR['loci']}/{{locus}}.faa",
+        ok=f"{DIR['loci']}/.done"
+    output:
+        f=f"{DIR['align']}/{{locus}}.aln.faa"
+    threads: TH["mafft"]
+    message: "MAFFT: {input.f} → {output.f}"
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p {DIR[align]}
+        mafft {MAFFT[extra_args]} --thread {threads} {input.f} > {output.f}
+        """
+
+# trimAl 修剪
+rule trimal_trim:
+    input:
+        f=f"{DIR['align']}/{{locus}}.aln.faa"
+    output:
+        f=f"{DIR['trim']}/{{locus}}.trim.faa"
+    threads: TH["trimal"]
+    message: "trimAl: {input.f} → {output.f}"
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p {DIR[trim]}
+        trimal -in {input.f} -out {output.f} {TRIMAL[extra_args]}
+        """
+
+# 拼接超矩阵 + 分区（严格按 config.yaml 控制）
+rule concat_and_partitions:
+    input:
+        trims=lambda wc: sorted([str(p) for p in Path(DIR["trim"]).glob("*.trim.faa")]) if CONCAT["sort_loci"] else [str(p) for p in Path(DIR["trim"]).glob("*.trim.faa")]
+    output:
+        matrix=CONCAT_MATRIX,
+        parts=PARTITIONS_TXT
+    threads: 1
+    message: "拼接超矩阵 + 分区（mincov={CONCAT[mincov]}, model={CONCAT[partition_model]}） → {output.matrix}"
+    run:
+        from pathlib import Path
+        Path(DIR["concat"]).mkdir(parents=True, exist_ok=True)
+
+        def read_fasta(fp):
+            d = {}
+            name, buf = None, []
+            for line in open(fp, "r", encoding="utf-8"):
+                line = line.strip()
+                if not line: continue
+                if line.startswith(">"):
+                    if name: d[name] = "".join(buf)
+                    name, buf = line[1:].split()[0], []
+                else:
+                    buf.append(line)
+            if name: d[name] = "".join(buf)
+            return d
+
+        kept = []
+        for fp in input.trims:
+            fa = read_fasta(fp)
+            present = set(k.split("|")[0] for k in fa.keys())
+            if len(present) >= int(CONCAT["mincov"]):
+                kept.append(fp)
+
+        concat = {sp: "" for sp in SPECIES}
+        parts, cursor = [], 1
+        for fp in kept:
+            locus = Path(fp).stem.replace(".trim", "")
+            fa = read_fasta(fp)
+            lens = {len(seq) for seq in fa.values()}
+            if len(lens) != 1:
+                raise ValueError(f"{fp} 序列长度不一致：{lens}")
+            L = lens.pop()
+            for sp in SPECIES:
+                keys = [k for k in fa.keys() if k.split("|")[0] == sp]
+                concat[sp] += (fa[keys[0]] if keys else "-" * L)
+            parts.append((locus, cursor, cursor + L - 1))
+            cursor += L
+
+        wrap = int(CONCAT["line_width"])
+        with open(output.matrix, "w", encoding="utf-8") as w:
+            for sp in SPECIES:
+                w.write(f">{sp}\n")
+                s = concat[sp]
+                for i in range(0, len(s), wrap):
+                    w.write(s[i:i+wrap] + "\n")
+
+        with open(output.parts, "w", encoding="utf-8") as w:
+            for locus, a, b in parts:
+                w.write(f"{CONCAT['partition_model']}, {locus} = {a}-{b}\n")
+
+# IQ-TREE（超矩阵）
+# ---------- IQ-TREE（超矩阵）----------
+rule iqtree_concat:
+    input:
+        matrix = CONCAT_MATRIX,
+        parts  = PARTITIONS_TXT
+    output:
+        treefile = CONCAT_TREEFILE
+    threads: TH["iqtree_concat"]
+    message: "IQ-TREE（concat，-p+MFP）：{input.matrix} + {input.parts} → {output.treefile}"
+    shell:
+        r"""
+        set -euo pipefail
+
+        # 0) 在切换目录之前先把“项目相对路径”解析成“绝对路径”
+        S=$(readlink -f {input.matrix})
+        P=$(readlink -f {input.parts})
+
+        # 1) 进入 IQ-TREE 专用工作目录
+        mkdir -p {IQTREE_CONC_DIR}
+        cd {IQTREE_CONC_DIR}
+
+        # 2) 跑 IQ-TREE（所有输出固定到当前目录，文件前缀为 supermatrix.aa.fas）
+        {IQ[bin]} \
+          -s "$S" \
+          -p "$P" \
+          -nt {threads} \
+          -seed {IQ[seed]} \
+          {IQ[extra_args_concat]} \
+          -pre supermatrix.aa.fas
+        """
+
+# 基因树（供 ASTRAL）
+rule iqtree_gene:
+    input:
+        f=f"{DIR['trim']}/{{locus}}.trim.faa"
+    output:
+        f=f"{DIR['trees']}/gene/{{locus}}.treefile"
+    threads: TH["iqtree_gene"]
+    message: "IQ-TREE（gene）: {input.f} → {output.f}"
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p {DIR[trees]}/gene
+        {IQ[bin]} \
+          -s {input.f} \
+          -nt {threads} \
+          -seed {IQ[seed]} \
+          {IQ[extra_args_gene]} \
+          -pre {DIR[trees]}/gene/{{wildcards.locus}}
+        """
+
+# ASTRAL（可选）
+rule astral_species_tree:
+    input:
+        trees=lambda wc: sorted([str(p) for p in Path(f"{DIR['trees']}/gene").glob("*.treefile")])
+    output:
+        f=ASTRAL_SPECIESTREE
+    threads: TH["astral"]
+    message: "ASTRAL: 基因树 → 物种树 {output.f}"
+    run:
+        from pathlib import Path, subprocess
+        Path(ASTRAL_DIR).mkdir(parents=True, exist_ok=True)
+        with open(ASTRAL_GENE_TREES, "w", encoding="utf-8") as w:
+            for fp in input.trees:
+                w.write(Path(fp).read_text().strip() + "\n")
+        if not AST.get("enable", False):
+            raise RuntimeError("astral.enable=false，但 astral_species_tree 被调度。请关闭目标或开启开关。")
+        jar = os.environ.get(AST["jar_env"], "")
+        if not jar or not Path(jar).exists():
+            raise RuntimeError(f"未设置或找不到 {AST['jar_env']}（astral.jar）")
+        import subprocess
+        subprocess.check_call(["java", f"-Xmx{AST['xmx']}", "-jar", jar, "-i", ASTRAL_GENE_TREES, "-o", output.f])
