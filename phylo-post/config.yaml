@@ -1,0 +1,60 @@
+post:
+  outdir: results  # 输出目录（即 phylo-post/results）
+
+  inputs:
+    # Orthofinder 的氨基酸比对结果目录（含 *.trim.faa）
+    aa_align_dir: ../phylo/results/trim_norm_sco_species
+    # 若未配置 results_txt，会自动扫描最新 Orthogroups.tsv
+    results_txt: ../phylo/results/orthofinder/latest_results.txt
+    # IQ-TREE 输出的物种树
+    species_tree_ml: ../phylo/results/trees/concat/iqtree/supermatrix.contree
+
+  outgroup: Nematostella_vectensis
+
+  codon:
+    cds_dir: ../phylo/data/cds
+    min_taxa: 6
+    min_codon_len: 300
+    max_gap_frac: 0.5
+    drop_internal_stop: true
+
+  env:
+    binaries:
+      pal2nal: pal2nal
+
+  selection:
+    cafe_significant_tsv:
+
+  codeml:
+    enable: true
+    bin: codeml
+    mode: stem
+    foreground:
+      - Sinonovacula_constricta
+      - Sinonovacula_rivularis
+
+  mcmctree:
+    enable: true
+    calibrations: ../phylo/data/mcmctree/calibrations.tsv
+    clock: 2
+    root_age_Ma: 600
+    bd_parameters: [1, 1, 0.1]
+    rgene_gamma: [2, 20]
+    sigma2_gamma: [2, 20]
+    ncatG: 4
+    burnin: 20000
+    sampfreq: 10
+    nsample: 20000
+
+  threads:
+    select_og_targets: 2
+    build_sco_gene_map: 2
+    relabel_msa_headers_to_geneid_subset: 2
+    pal2nal_incremental_with_qc: 4
+    root_species_tree: 1
+    prune_tree_mark_fg: 2
+    codeml_run_pair: 8
+    codeml_aggregate: 1
+    mcmc_validate_calibrations: 1
+    mcmc_scaffold: 1
+

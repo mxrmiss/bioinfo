@@ -1,0 +1,168 @@
+# -*- coding: utf-8 -*-
+# =============================================================
+# Snakefile —— phylo-post（后分析主流程 · 只读本地 config.yaml）
+# =============================================================
+import os
+from pathlib import Path
+import yaml
+
+CFG_PATH = "config.yaml"  # ← 仅此处修改：本地配置
+if not os.path.exists(CFG_PATH):
+    raise FileNotFoundError(f"[ERR] 未找到配置文件: {CFG_PATH}")
+with open(CFG_PATH, "r", encoding="utf-8") as f:
+    CFG = yaml.safe_load(f) or {}
+POST = CFG.get("post", {}) or {}
+
+def need(d, key_path: str):
+    cur = d
+    for k in key_path.split("."):
+        if not isinstance(cur, dict) or k not in cur:
+            raise SystemExit(f"[ERR] config.yaml 缺少 post.{key_path}")
+        cur = cur[k]
+    return cur
+
+def threads_of(rule_key: str) -> int:
+    th = need(POST, f"threads.{rule_key}")
+    if not isinstance(th, int) or th < 1:
+        raise SystemExit(f"[ERR] post.threads.{rule_key} 必须为 >=1 的整数")
+    return th
+
+# ---------- 路径常量（改：直接使用配置值，不再强拼 ../phylo） ----------
+OUTDIR          = need(POST, "outdir")
+AA_ALIGN_DIR    = os.path.normpath(need(POST, "inputs.aa_align_dir"))
+RESULTS_TXT     = os.path.normpath(need(POST, "inputs.results_txt"))
+CDS_DIR         = os.path.normpath(need(POST, "codon.cds_dir"))
+TREE_ML         = os.path.normpath(need(POST, "inputs.species_tree_ml"))
+OUTGROUP        = need(POST, "outgroup")
+CODEML_ENABLE   = bool(need(POST, "codeml.enable"))
+CODEML_BIN      = need(POST, "codeml.bin")
+CALIB_PATH      = os.path.normpath(need(POST, "mcmctree.calibrations"))
+MCMC_ENABLE     = bool(need(POST, "mcmctree.enable"))
+CAFE_SIG_PATH   = POST.get("selection",{}).get("cafe_significant_tsv")
+FG_SPECIES      = need(POST, "codeml.foreground")
+FG_MODE         = need(POST, "codeml.mode")
+
+MIN_TAXA        = int(need(POST, "codon.min_taxa"))
+MIN_CODON_NT    = int(need(POST, "codon.min_codon_len"))
+MAX_GAP_FRAC    = float(need(POST, "codon.max_gap_frac"))
+DROP_INTERNAL   = bool(need(POST, "codon.drop_internal_stop"))
+
+# ---------- 输出统一在 phylo-post/results 下 ----------
+TARGETS_DIR     = f"{OUTDIR}/targets"
+REPORTS_DIR     = f"{OUTDIR}/reports"
+TREE_DIR        = f"{OUTDIR}/tree"
+PROT_GENEID_DIR = f"{OUTDIR}/prot_msa_geneid"
+CODON_DIR       = f"{OUTDIR}/codon_sco"
+CODEML_DIR      = f"{OUTDIR}/codeml"
+CODEML_TREES    = f"{CODEML_DIR}/trees"
+CODEML_RAW      = f"{CODEML_DIR}/raw"
+LOG_DIR         = f"{OUTDIR}/logs"
+MCMC_DIR        = f"{OUTDIR}/mcmctree"
+
+OG_LIST         = f"{TARGETS_DIR}/og_targets.list"
+OG_MAP_TSV      = f"{OUTDIR}/codon_sco/og_species_to_gene.tsv"
+ROOTED_TREE     = f"{TREE_DIR}/supermatrix.rooted.contree"
+CODON_QC_TSV    = f"{REPORTS_DIR}/codon_qc.tsv"
+CODON_DROP_TSV  = f"{REPORTS_DIR}/codon_drop.tsv"
+FDR_GENES_TSV   = f"{CODEML_DIR}/D_fdr_genes.tsv"
+BEB_SITES_TSV   = f"{CODEML_DIR}/D_beb_sites.tsv"
+CALIB_CHECK_TSV = f"{MCMC_DIR}/calibrations.check.tsv"
+MCMC_SCAFFOLD   = f"{MCMC_DIR}/scaffold/mcmctree.ctl"
+
+ALL_TARGETS = [OG_LIST, OG_MAP_TSV, ROOTED_TREE, CODON_QC_TSV, CODON_DROP_TSV]
+if CODEML_ENABLE:
+    ALL_TARGETS += [FDR_GENES_TSV, BEB_SITES_TSV]
+if MCMC_ENABLE:
+    ALL_TARGETS += [CALIB_CHECK_TSV, MCMC_SCAFFOLD]
+
+rule all:
+    input: ALL_TARGETS
+
+rule select_og_targets:
+    threads: threads_of("select_og_targets")
+    output: OG_LIST
+    run:
+        import subprocess
+        Path(TARGETS_DIR).mkdir(parents=True, exist_ok=True)
+        subprocess.run(["python", "scripts/select_og_targets.py"], check=True)
+
+rule build_sco_gene_map:
+    threads: threads_of("build_sco_gene_map")
+    input: OG_LIST
+    output: OG_MAP_TSV
+    run:
+        import subprocess
+        Path(os.path.dirname(output[0])).mkdir(parents=True, exist_ok=True)
+        subprocess.run(["python", "scripts/build_sco_gene_map.py"], check=True)
+
+rule relabel_msa_headers_to_geneid_subset:
+    threads: threads_of("relabel_msa_headers_to_geneid_subset")
+    input: OG_LIST, OG_MAP_TSV
+    output: directory(PROT_GENEID_DIR)
+    run:
+        import subprocess
+        Path(PROT_GENEID_DIR).mkdir(parents=True, exist_ok=True)
+        subprocess.run(["python", "scripts/relabel_msa_headers_to_geneid_subset.py"], check=True)
+
+rule pal2nal_incremental_with_qc:
+    threads: threads_of("pal2nal_incremental_with_qc")
+    input: PROT_GENEID_DIR
+    output: CODON_QC_TSV, CODON_DROP_TSV
+    run:
+        import subprocess
+        Path(REPORTS_DIR).mkdir(parents=True, exist_ok=True)
+        Path(CODON_DIR).mkdir(parents=True, exist_ok=True)
+        subprocess.run(["python", "scripts/pal2nal_incremental.py"], check=True)
+
+rule root_species_tree:
+    threads: threads_of("root_species_tree")
+    output: ROOTED_TREE
+    run:
+        import subprocess
+        Path(TREE_DIR).mkdir(parents=True, exist_ok=True)
+        subprocess.run(["python", "scripts/root_tree.py"], check=True)
+
+rule prune_tree_mark_fg:
+    threads: threads_of("prune_tree_mark_fg")
+    input: ROOTED_TREE, CODON_QC_TSV
+    output: directory(CODEML_TREES)
+    run:
+        import subprocess
+        Path(CODEML_TREES).mkdir(parents=True, exist_ok=True)
+        subprocess.run(["python", "scripts/tree_prune_mark_fg.py"], check=True)
+
+rule codeml_run_pair:
+    threads: threads_of("codeml_run_pair")
+    input: CODEML_TREES
+    output: directory(CODEML_RAW)
+    run:
+        import subprocess
+        Path(CODEML_RAW).mkdir(parents=True, exist_ok=True)
+        subprocess.run(["python", "scripts/codeml_runner.py"], check=True)
+
+rule codeml_aggregate:
+    threads: threads_of("codeml_aggregate")
+    input: CODEML_RAW
+    output: FDR_GENES_TSV, BEB_SITES_TSV
+    run:
+        import subprocess
+        subprocess.run(["python", "scripts/codeml_aggregate.py"], check=True)
+
+rule mcmc_validate_calibrations:
+    threads: threads_of("mcmc_validate_calibrations")
+    input: ROOTED_TREE
+    output: CALIB_CHECK_TSV
+    run:
+        import subprocess, os
+        Path(os.path.dirname(output[0])).mkdir(parents=True, exist_ok=True)
+        subprocess.run(["python", "scripts/mcmctree_validate_calibrations.py"], check=True)
+
+rule mcmc_scaffold:
+    threads: threads_of("mcmc_scaffold")
+    input: CALIB_CHECK_TSV
+    output: MCMC_SCAFFOLD
+    run:
+        import subprocess
+        Path(os.path.dirname(output[0])).mkdir(parents=True, exist_ok=True)
+        subprocess.run(["python", "scripts/mcmctree_scaffold.py"], check=True)
+
