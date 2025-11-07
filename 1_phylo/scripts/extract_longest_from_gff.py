@@ -64,11 +64,6 @@ TOOLS = ["awk", "gzip", "seqkit", GFFREAD_BIN, AGAT_KEEP_LONGEST, AGAT_FIX_DUPS,
 
 MATCH_HEADER = ["species","gff_file","genome_file","cov_frac","status","pep_kept","cds_kept","note","timestamp"]
 
-# ========================== 【新增】pep↔cds 映射输出参数（可关） ==========================
-WRITE_PEP2CDS = True                                   # 是否写出蛋白-转录本映射
-PEP2CDS_PER_SPECIES_DIR = "data/maps/pep2cds_by_species"  # 每物种分片
-PEP2CDS_TSV = "data/maps/pep2cds.tsv"                  # 合并后的总表
-
 # ========================== 运行辅助函数 ==========================
 def need(cmd: str):
     """检查依赖命令是否存在；不存在则抛错"""
@@ -298,74 +293,6 @@ END{
 def _count_cds_lines(p: Path) -> int:
     return safe_int_last_line(bash_out(f"awk -F'\t' '$3==\"CDS\"{{c++}} END{{print c+0}}' '{p}'"))
 
-# ========================== 【新增】写 pep↔cds 映射（每物种分片） ==========================
-def _iter_fasta_ids(path: Path):
-    """遍历 FASTA 的 ID（只取第一个空格前的 token）"""
-    with open(path, 'r', encoding='utf-8', errors='ignore') as f:
-        for line in f:
-            if line.startswith('>'):
-                yield line[1:].strip().split()[0]
-
-def _split_species_id(token: str, sp_fallback: str) -> Tuple[str, str]:
-    """若 ID 形如 Species|GeneID，则拆出物种与基因；否则物种回退为当前物种"""
-    if '|' in token:
-        sp, pid = token.split('|', 1)
-        return sp.strip(), pid.strip()
-    return sp_fallback, token
-
-# ========================== 【新增，仅新增】统一 ID 的“合同化清洗”函数 ==========================
-def _sanitize_id_contract(x: str) -> str:
-    """
-    与下游契约一致的 ID 清洗规则：
-    - 保留竖线 '|'（例如 gnl|WGS_AMQN|CAPTEDRAFT... 依然合法）
-    - 仅允许 [A-Za-z0-9._:-|]，其它字符替换为 '_'
-    - 去首尾空白
-    """
-    return re.sub(r"[^A-Za-z0-9._:\-\|]", "_", x.strip())
-
-def write_pep2cds_for_species(sp: str, cds_fa: Path, pep_fa: Path, out_dir: Path) -> int:
-    """
-    根据“最终 CDS 与最终蛋白”顺序一一对应关系写出映射分片：
-    species  protein_id  cds_id
-    """
-    ids_cds = list(_iter_fasta_ids(cds_fa))
-    ids_pep = list(_iter_fasta_ids(pep_fa))
-
-    # 建立基于 ID 的安全映射，而不是按行号硬配：
-    # 思路：蛋白是从 CDS 翻译而来，ID 理应一致或仅差物种前缀；
-    #      有些 CDS 可能被翻译后太短而被过滤掉，因此蛋白列表是CDS列表的子集；
-    #      我们按“ID是否匹配”逐条输出，避免顺序错配。
-    cds_clean_to_raw: Dict[str, str] = {}
-    for raw_cds_id in ids_cds:
-        sp_c, cds_clean = _split_species_id(raw_cds_id, sp)
-        if cds_clean not in cds_clean_to_raw:
-            cds_clean_to_raw[cds_clean] = raw_cds_id
-
-    out_dir.mkdir(parents=True, exist_ok=True)
-    out_tsv = out_dir / f"{sp}.tsv"
-    newfile = not out_tsv.exists() or out_tsv.stat().st_size == 0
-
-    written = 0
-    with open(out_tsv, 'a', encoding='utf-8') as w:
-        if newfile:
-            w.write('species\tprotein_id\tcds_id\n')
-        for pep_raw_id in ids_pep:
-            sp_p, pep_clean = _split_species_id(pep_raw_id, sp)
-            # 只在我们能找到同名CDS时写入，避免错配
-            if pep_clean in cds_clean_to_raw:
-                cds_raw_id = cds_clean_to_raw[pep_clean]
-                sp_c2, cds_clean2 = _split_species_id(cds_raw_id, sp)
-
-                # ----------【仅新增两行】在写出前进行“合同化清洗”----------
-                pep_clean = _sanitize_id_contract(pep_clean)
-                cds_clean2 = _sanitize_id_contract(cds_clean2)
-                # -------------------------------------------------------
-
-                w.write(f"{sp}\t{pep_clean}\t{cds_clean2}\n")
-                written += 1
-
-    return written
-
 # ========================== 单物种处理（供并行调用） ==========================
 def process_one_species(args) -> Dict[str, str]:
     """
@@ -469,14 +396,6 @@ def process_one_species(args) -> Dict[str, str]:
     npep = translate_cds_to_protein(out_cds, out_pep)
     if npep == 0:
         raise RuntimeError(f"[FATAL] {sp}: translated protein count is 0 after QC.")
-
-    # 【新增】写出 pep↔cds 映射分片（不影响既有输出）
-    if WRITE_PEP2CDS:
-        try:
-            write_pep2cds_for_species(sp, out_cds, out_pep, Path(PEP2CDS_PER_SPECIES_DIR))
-            print(f"[MAP] {sp}: pep2cds written.")
-        except Exception as e:
-            print(f"[WARN] {sp}: write pep2cds failed: {e}")
 
     # 8) 清理物种临时文件（不触碰 annotation/）
     for patt in ["*.fna","*.fa","*.fasta","*.cds.fna","*.protein.faa","*.gtf","*.tsv",
@@ -641,31 +560,6 @@ def main():
 
     # 写 match 表
     write_match_table(Path(MATCH_TSV), [rows_out[k] for k in sorted(rows_out)])
-
-    # 【新增】合并每物种 pep↔cds 分片为全局映射（不影响既有产物）
-    if WRITE_PEP2CDS:
-        try:
-            parts_dir = Path(PEP2CDS_PER_SPECIES_DIR)
-            all_parts = sorted(parts_dir.glob('*.tsv'))
-            if all_parts:
-                Path(PEP2CDS_TSV).parent.mkdir(parents=True, exist_ok=True)
-                with open(PEP2CDS_TSV, 'w', encoding='utf-8') as w:
-                    w.write('species\tprotein_id\tcds_id\n')
-                    for p in all_parts:
-                        with open(p, 'r', encoding='utf-8', errors='ignore') as r:
-                            header = True
-                            for line in r:
-                                if header and line.lower().startswith('species\tprotein_id\tcds_id'):
-                                    header = False
-                                    continue
-                                header = False
-                                w.write(line)
-                print(f"[OUT] pep2cds: {PEP2CDS_TSV}")
-            else:
-                print("[WARN] pep2cds switch on but no per-species parts found.")
-        except Exception as e:
-            print(f"[WARN] merge pep2cds failed: {e}")
-
     print(f"[OUT] Proteomes: {OUT_PEP_DIR}/*.faa")
     print(f"[OUT] CDS      : {OUT_CDS_DIR}/*.fna")
     print(f"[OUT] Species  : {SPECIES_LIST}")
@@ -679,3 +573,4 @@ if __name__ == "__main__":
         # 主进程兜底报错（例如依赖缺失）
         print(str(e), file=sys.stderr)
         sys.exit(1)
+

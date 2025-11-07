@@ -1,510 +1,228 @@
 # -*- coding: utf-8 -*-
 # =============================================================
-# Snakefile —— 贝类系统发育分析流程（仅优化注释版）
-# ⚠️ 本版仅做“最小必要改动”以接入 extract_longest_from_gff.py：
-#   1) 删除与该脚本功能重复的蛋白 QC 规则链（filter_one_proteome / filter_all_proteomes）
-#   2) 新增 rule: build_proteomes_from_gff —— 仅调用脚本，不做依赖检测
-#   3) orthofinder 输入目录改为严格读取 config.input.proteome_dir（默认 data/proteomes）
-#   4) 其他规则与参数保持原状，未触动
+# Snakefile —— 工具优先 · 零猜测 · 哨兵式依赖 · 屏幕+日志双写
 # =============================================================
 
-from pathlib import Path
-import os, glob
-
-# 读取主配置文件（保持路径不变）
+import os
 configfile: "config.yaml"
 
-# ---------------------------
-# 配置读取与常量派生
-# ---------------------------
-INP = config.get("input", {})
-OF  = config.get("orthofinder", {})
-ST  = config.get("species_tree", {})
-IQC = ST.get("concat", {}) if isinstance(ST, dict) else {}
-REP = config.get("reports", {}).get("matrix", {})
-SCO_ONLY = bool(IQC.get("use_strict_sco", False))
+P = config["paths"]
+BIN = config.get("binaries", {})
+LOG_DIR = "logs"
+SCRIPTS = "scripts"
 
-# 蛋白质数据输入目录推断（优先级：proteome_dir > raw > filtered > 默认）
-# ⚠️ 本次改动：后续 OrthoFinder 只使用 DATA_PROTEOMES
-DATA_PROTEOMES = (
-    INP.get("proteome_dir")
-    or INP.get("raw_proteome_dir")
-    or INP.get("filtered_proteome_dir")
-    or "data/proteomes"
-)
-
-# -------- OrthoFinder 运行参数（来源 config.orthofinder）--------
-OF_THREADS       = int(OF.get("threads", 16))                 # 序列搜索线程
-OF_ANALYSIS_THR  = int(OF.get("analysis_threads", 8))         # MSA/基因树分析线程
-OF_SEARCH        = str(OF.get("search_engine", "diamond"))    # 搜索引擎（diamond/blast 等）
-OF_MSA_AND_TREES = bool(OF.get("msa_and_trees", True))        # 是否让 OF 自己做 MSA/树
-OF_GENE_TREE_ENG = OF.get("gene_tree_engine", None)           # 基因树引擎（fasttree/iqtree 等）
-
-# -------- IQ-TREE 运行参数（来源 config.species_tree.concat）--------
-IQTREE_ENABLED   = bool(IQC.get("enabled", True))
-IQTREE_THREADS   = int(IQC.get("iqtree_threads", OF_THREADS))
-IQP = IQC.get("iqtree_params", {}) if isinstance(IQC, dict) else {}
-IQTREE_MODEL = str(IQP.get("model", "MFP+MERGE"))
-IQTREE_BOOT  = int(IQP.get("bootstrap", 1000))
-IQTREE_ALRT  = int(IQP.get("alrt", 1000))
-IQTREE_EXTRA = str(IQP.get("extra_args", "")).strip()
-IQTREE_MODEL_FLAG = f"-m {IQTREE_MODEL}" if IQTREE_MODEL else ""
-IQTREE_BOOT_FLAG  = f"-B {IQTREE_BOOT}" if IQTREE_BOOT > 0 else ""
-IQTREE_ALRT_FLAG  = f"-alrt {IQTREE_ALRT}" if IQTREE_ALRT > 0 else ""
-IQTREE_EXTRA_FLAG = IQTREE_EXTRA
-
-# -------- QC 参数（来源 config.qc）--------
-QC = config.get("qc", {})
-QC_ENABLED   = bool(QC.get("enable", False))
-QC_MINLEN    = QC.get("min_len", 50)
-QC_MINENT    = QC.get("min_entropy", 2.2)
-QC_MAXX      = QC.get("max_x_frac", 0.05)
-QC_ALLOWSTOP = bool(QC.get("allow_stop", False))
-
-# -------- 报告参数（来源 config.reports.matrix）--------
-REPORT_ENABLED = bool(REP.get("enable", False))
-REPORT_DIR     = REP.get("outdir", "results/reports")
-
-# -------- 外部二进制路径（来源 config.env.binaries）--------
-ENV  = config.get("env", {})
-BIN  = ENV.get("binaries", {}) if isinstance(ENV, dict) else {}
-BIN_DIAMOND = BIN.get("diamond", "diamond")
-BIN_MAFFT   = BIN.get("mafft", "mafft")
-BIN_IQTREE  = BIN.get("iqtree2", BIN.get("iqtree", "iqtree"))
-BIN_TRIMAL  = BIN.get("trimal", "trimal")
-BIN_PYTHON  = BIN.get("python", "python")
-
-# ===========================
-# 线程控制给 extract_longest_from_gff.py
-# （不改脚本，仅通过环境变量 N_WORKERS 传入）
-# ===========================
-EXTRACT = config.get("extract", {})
-EXTRACT_WORKERS = int(EXTRACT.get("workers", 16))  # 皇上可在 config.yaml 调整
-
-# ---------------------------
-# 路径常量（统一管理输出位置）
-# ---------------------------
-RESULTS_DIR    = "results"
-LOG_DIR        = "logs"
-SCRIPTS_DIR    = "scripts"
-
-OF_WORKDIR     = f"{RESULTS_DIR}/orthofinder"
-OF_RESULT_TXT  = f"{RESULTS_DIR}/orthogroups/RESULTS_PATH.txt"
-SCO_LIST       = f"{RESULTS_DIR}/orthogroups/sco.list"
-
-TRIM_DIR       = f"{RESULTS_DIR}/trim"
-TRIM_DIR_NORM  = f"{RESULTS_DIR}/trim_norm"
-TRIM_DIR_COLLAPSE          = "results/trim_norm_collapse"
-TRIM_DIR_COLLAPSE_SPECIES  = "results/trim_norm_collapse_species"
-TRIM_DIR_SCO_SPECIES       = "results/trim_norm_sco_species"
-SCO_KEEP_LIST              = f"{RESULTS_DIR}/orthogroups/sco.keep.list"
-
-CONCAT_PREFIX  = f"{RESULTS_DIR}/concat/supermatrix"
-CONCAT_FAS     = f"{CONCAT_PREFIX}.aa.fas"
-PARTITIONS_TXT = f"{RESULTS_DIR}/concat/partitions.txt"
-
-IQTREE_DIR     = f"{RESULTS_DIR}/trees/concat/iqtree"
-IQTREE_PREFIX  = f"{IQTREE_DIR}/supermatrix"
-IQTREE_TREE    = f"{IQTREE_PREFIX}.treefile"
-
-# ---------------------------
-# 汇总目标（根据开关动态追加）
-# ---------------------------
-ALL_TARGETS = [
-    f"{OF_WORKDIR}/.done",
-    OF_RESULT_TXT,
-    SCO_LIST,
-    f"{TRIM_DIR}/.done",
-    f"{TRIM_DIR_NORM}/.done",
-]
-if IQTREE_ENABLED:
-    ALL_TARGETS.append(IQTREE_TREE)
-if REPORT_ENABLED:
-    ALL_TARGETS.append(f"{REPORT_DIR}/matrix.tsv")
+# 哨兵与关键文件
+PROT_DONE   = os.path.join("data/proteomes", ".from_gff.done")
+HEADERS_DONE = os.path.join("data/proteomes", ".headers_norm.done") 
+OF_DONE     = os.path.join(P["orthofinder_results_dir"], ".OF_DONE")
+SCO_LIST    = os.path.join(P["reports_dir"], "ogs_selected.list")
+SCO_DONE    = os.path.join(P["reports_dir"], ".ogs_selected.done")
+TRIM_DONE   = os.path.join(P["msa_trim_dir"], ".done")
+NORM_DONE   = os.path.join(P["normalize_dir"], ".norm.done")
+COLL_DONE   = os.path.join(P["collapse_dir"], ".done")
+SPC_DONE    = os.path.join(P["species_collapse_dir"], ".done")
+SCOLIST     = os.path.join(P["reports_dir"], "sco_filelist.txt")
+SCOL_DONE   = os.path.join(P["reports_dir"], ".sco_filelist.done")
+SUPER_FASTA = os.path.join(P["supermatrix_dir"], "supermatrix.faa")
+SUPER_DONE  = os.path.join(P["supermatrix_dir"], ".supermatrix.done")
+TREE_NWK    = os.path.join(P["trees_dir"], "species_tree.nwk")
+IQ_DONE     = os.path.join(P["trees_dir"], ".iqtree.done")
+MATRIX_TSV  = os.path.join(P["reports_dir"], "matrix.tsv")
+MATRIX_DONE = os.path.join(P["reports_dir"], ".matrix.done")
+PUB_DONE    = os.path.join(P["publish_dir"], ".publish.done")
 
 rule all:
-    input: ALL_TARGETS
+    input:
+        PUB_DONE,
+        MATRIX_DONE,
+        IQ_DONE,
+        SUPER_DONE
 
-# =============================================================
-# 0) 从 GFF/基因组构建蛋白与 CDS —— 调用现有脚本（不改脚本）
-#     - 不进行工具检测；仅设置 N_WORKERS 并串联 DAG
-#     - 输出以“存在性 + 哨兵文件”保证依赖
-# =============================================================
+# 若想重跑此步，需要删除/data/proteomes/下的隐藏文件夹.from_gff.done
 rule build_proteomes_from_gff:
-    output:
-        sentinel = touch("data/proteomes/.from_gff.done")
-    log:
-        f"{LOG_DIR}/build_proteomes_from_gff.log"
+    output: sentinel=PROT_DONE
+    log: f"{LOG_DIR}/build_proteomes_from_gff.log"
     params:
-        py     = BIN_PYTHON,
-        script = f"{SCRIPTS_DIR}/extract_longest_from_gff.py",
-        # 线程通过环境变量传入，脚本内部读取 N_WORKERS
-        nwork  = EXTRACT_WORKERS,
-        outdir = "data/proteomes"
+        py = BIN.get("python","python"),
+        proteome_dir = config["input"]["proteome_dir"],
+        cds_dir = config["input"]["cds_dir"],
+        script = f"{SCRIPTS}/extract_longest_from_gff.py"
     shell:
-        r"""
-        set -euo pipefail
-        mkdir -p {params.outdir} data/cds {LOG_DIR}
-        export N_WORKERS={params.nwork}
-        # 直接运行脚本（使用系统 PATH 中的 AGAT/gffread/seqkit）
+        r'''set -euo pipefail
+        mkdir -p "$(dirname {log})" "{params.proteome_dir}" "{params.cds_dir}"
         {params.py} {params.script} 2>&1 | tee -a {log}
-        # 基本存在性检查（最小侵入，不改脚本）后打标记
-        n=$(ls -1 {params.outdir}/*.faa 2>/dev/null | wc -l || echo 0)
-        if [ "$n" -eq 0 ]; then
-          echo "[ERR] No *.faa produced in {params.outdir}" | tee -a {log}; exit 11
-        fi
         touch {output.sentinel}
-        """
+        '''
 
-# =============================================================
-# ⚠️ 删除：蛋白质过滤（QC）模块（与 extract_longest_from_gff.py 重复）
-#    - 原 rules: filter_one_proteome / filter_all_proteomes
-#    - 现已移除，避免“双重清洗”
-#    （其余规则不动）
-# =============================================================
+rule rename_proteome_headers:
+    # 将 data/proteomes/*.fa* 表头统一为 `Species|SeqID`（仅改头，不改序列）
+    input: PROT_DONE
+    output: sentinel=HEADERS_DONE
+    log: f"{LOG_DIR}/rename_proteome_headers.log"
+    params:
+        py = BIN.get("python","python"),
+        script = f"{SCRIPTS}/rename_proteome_headers.py"
+    shell:
+        r'''set -euo pipefail
+        mkdir -p "$(dirname {log})"
+        {params.py} {params.script} 2>&1 | tee -a {log}
+        touch {output.sentinel}
+        '''
 
-## =============================================================
-# 1) OrthoFinder 主流程
-#    - 输入：改为依赖 build_proteomes_from_gff 的产物（哨兵）
-#    - 目录：严格使用 DATA_PROTEOMES（来自 config.input.proteome_dir 或默认 data/proteomes）
-## =============================================================
-rule orthofinder:
-    input:
-        "data/proteomes/.from_gff.done"
-    output:
-        done_flag   = touch(f"{OF_WORKDIR}/.done"),
-        results_txt = OF_RESULT_TXT
+rule orthofinder_run:
+    input: HEADERS_DONE
+    output: sentinel=OF_DONE
     log: f"{LOG_DIR}/orthofinder.log"
-    threads: OF_THREADS
     params:
-        search_engine    = OF_SEARCH,
-        msa_and_trees    = OF_MSA_AND_TREES,
-        gene_tree_engine = OF_GENE_TREE_ENG,
-        analysis_threads = OF_ANALYSIS_THR,
-        proteome_dir     = DATA_PROTEOMES
+        py = BIN.get("python","python"),
+        script = f"{SCRIPTS}/00_of_run.py"
     shell:
-        r"""
-        set -euo pipefail
-        mkdir -p {OF_WORKDIR} {RESULTS_DIR}/orthogroups {LOG_DIR}
-        cd {OF_WORKDIR}
+        r'''set -euo pipefail
+        mkdir -p "$(dirname {log})"
+        {params.py} {params.script} 2>&1 | tee -a {log}
+        touch {output.sentinel}
+        '''
 
-        export OMP_NUM_THREADS={threads}
-        export OPENBLAS_NUM_THREADS=1
-        export MKL_NUM_THREADS=1
-        export NUMEXPR_NUM_THREADS=1
-        export OF_DIAMOND_OPTS="--threads {threads}"
-        OUTDIR="run_of"
-        if [ -d "$OUTDIR" ]; then
-          OUTDIR="${{OUTDIR}}_r$(date +%Y%m%d-%H%M%S)"
-          echo "[WARN] output dir exists, switch to: $OUTDIR" | tee -a ../../{log}
-        fi
-
-        echo "[INFO] Run OrthoFinder → $OUTDIR (input={params.proteome_dir})" | tee -a ../../{log}
-        cmd=(orthofinder -f ../../{params.proteome_dir} \
-                         -S "{params.search_engine}" -t {threads} -a {params.analysis_threads} -o "$OUTDIR")
-        if [ "{params.msa_and_trees}" = "True" ]; then
-            cmd+=(-M msa)
-        fi
-        if [ -n "{params.gene_tree_engine}" ] && [ "{params.gene_tree_engine}" != "None" ]; then
-            cmd+=(-T "{params.gene_tree_engine}")
-        fi
-        "${{cmd[@]}}" 2>&1 | tee -a ../../{log}
-
-        RESDIR=$(find "$OUTDIR" -maxdepth 1 -type d -name "Results_*" -print -quit)
-        if [ -z "$RESDIR" ]; then
-          echo "[ERR] 未找到 Results_* 目录" | tee -a ../../{log}; exit 2
-        fi
-        if [ ! -f "$RESDIR/Orthogroups/Orthogroups.tsv" ]; then
-          echo "[ERR] 缺少 Orthogroups.tsv 于 $RESDIR/Orthogroups/" | tee -a ../../{log}; exit 3
-        fi
-        realpath "$RESDIR" > ../../{output.results_txt}
-        touch ../../{output.done_flag}
-        """
-
-# =============================================================
-# 2) 提取 OG 列表
-# =============================================================
-rule extract_sco_list:
-    input:  OF_RESULT_TXT
-    output: SCO_LIST
-    log:    f"{LOG_DIR}/extract_sco_list.log"
-    params:
-        py     = BIN_PYTHON,
-        script = f"{SCRIPTS_DIR}/extract_sco_list.py",
-        resfile= OF_RESULT_TXT
-    shell:
-        r"""
-        set -euo pipefail
-        mkdir -p {RESULTS_DIR}/orthogroups {LOG_DIR}
-        {params.py} {params.script} \
-          --results-file {params.resfile} \
-          --out {output} \
-          2>> {log}
-        """
-
-# =============================================================
-# 2.5) 严格SCO白名单
-# =============================================================
 rule build_sco_keep_list:
-    input:
-        OF_RESULT_TXT
-    output:
-        SCO_KEEP_LIST
-    log:
-        f"{LOG_DIR}/build_sco_keep_list.log"
+    input: OF_DONE
+    output: SCO_LIST, SCO_DONE
+    log: f"{LOG_DIR}/build_sco_keep_list.log"
     params:
-        py     = BIN_PYTHON,
-        script = f"{SCRIPTS_DIR}/build_sco_keep_list.py",
-        resfile= OF_RESULT_TXT
+        py = BIN.get("python","python"),
+        script = f"{SCRIPTS}/01_build_sco_keep_list.py",
+        reports_dir = P["reports_dir"]
     shell:
-        r"""
-        set -euo pipefail
-        mkdir -p {RESULTS_DIR}/orthogroups {LOG_DIR}
-        {params.py} {params.script} --results-file {params.resfile} --out {output} >> {log} 2>&1
-        """
+        r'''set -euo pipefail
+        mkdir -p "$(dirname {log})" "{params.reports_dir}"
+        {params.py} {params.script} 2>&1 | tee -a {log}
+        '''
 
-# =============================================================
-# 3) MSA 裁剪（批处理）
-# =============================================================
 rule prepare_trimmed_alignment:
-    input:
-        SCO_LIST,
-        f"{OF_WORKDIR}/.done",
-        OF_RESULT_TXT
-    output:
-        touch(f"{TRIM_DIR}/.done")
+    input: SCO_DONE
+    output: TRIM_DONE
     log: f"{LOG_DIR}/prepare_trimmed_alignment.log"
-    threads: OF_ANALYSIS_THR
     params:
-        py      = BIN_PYTHON,
-        script  = f"{SCRIPTS_DIR}/prepare_trimmed_alignment.py",
-        trimal  = BIN_TRIMAL,
-        resfile = OF_RESULT_TXT,
-        oglist  = SCO_LIST,
-        outdir  = TRIM_DIR
+        py = BIN.get("python","python"),
+        script = f"{SCRIPTS}/02_prepare_trimmed_alignment.py",
+        outdir = P["msa_trim_dir"]
     shell:
-        r"""
-        set -euo pipefail
-        mkdir -p {params.outdir} {LOG_DIR}
-        {params.py} {params.script} \
-          --results-file {params.resfile} \
-          --og-list {params.oglist} \
-          --outdir {params.outdir} \
-          --trimal {params.trimal} \
-          2>> {log}
-        touch {output}
-        """
+        r'''set -euo pipefail
+        mkdir -p "$(dirname {log})" "{params.outdir}"
+        {params.py} {params.script} 2>&1 | tee -a {log}
+        '''
 
-# =============================================================
-# 3.5) 表头规范化（>SpeciesID|SeqID）
-# =============================================================
 rule normalize_all_msas:
-    input:
-        f"{TRIM_DIR}/.done"
-    output:
-        touch(f"{TRIM_DIR_NORM}/.done")
-    log:
-        f"{LOG_DIR}/normalize_all_msas.log"
+    input: TRIM_DONE
+    output: NORM_DONE, os.path.join(P["reports_dir"], "header_map.tsv")
+    log: f"{LOG_DIR}/normalize_msas.log"
     params:
-        py     = BIN_PYTHON,
-        script = f"{SCRIPTS_DIR}/normalize_msas.py",
-        indir  = TRIM_DIR,
-        outdir = TRIM_DIR_NORM,
-        pdir   = DATA_PROTEOMES
+        py = BIN.get("python","python"),
+        script = f"{SCRIPTS}/03_normalize_msas.py",
+        outdir = P["normalize_dir"],
+        reports_dir = P["reports_dir"]
     shell:
-        r"""
-        set -euo pipefail
-        mkdir -p {params.outdir} {LOG_DIR}
-        export LC_ALL=C
-        {params.py} {params.script} \
-          --indir {params.indir} \
-          --outdir {params.outdir} \
-          --proteome-dir {params.pdir} \
-          2>> {log}
-        touch {output}
-        """
+        r'''set -euo pipefail
+        mkdir -p "$(dirname {log})" "{params.outdir}" "{params.reports_dir}"
+        {params.py} {params.script} 2>&1 | tee -a {log}
+        '''
 
-# =============================================================
-# 3.7) isoform 收敛（每物种×每 locus 保留最长序列）
-# =============================================================
 rule collapse_isoforms:
-    input:
-        f"{TRIM_DIR_NORM}/.done"
-    output:
-        touch(f"{TRIM_DIR_COLLAPSE}/.done")
+    input: NORM_DONE
+    output: COLL_DONE, os.path.join(P["reports_dir"], "og_species_protein.tsv")
+    log: f"{LOG_DIR}/collapse_isoforms.log"
     params:
-        py     = BIN_PYTHON,
-        script = f"{SCRIPTS_DIR}/collapse_isoforms.py",
-        indir  = TRIM_DIR_NORM,
-        outdir = TRIM_DIR_COLLAPSE
+        py = BIN.get("python","python"),
+        script = f"{SCRIPTS}/04_collapse_isoforms.py",
+        outdir = P["collapse_dir"],
+        reports_dir = P["reports_dir"]
     shell:
-        r"""
-        set -euo pipefail
-        mkdir -p {params.outdir}
-        {params.py} {params.script} \
-          --indir {params.indir} \
-          --outdir {params.outdir}
-        """
+        r'''set -euo pipefail
+        mkdir -p "$(dirname {log})" "{params.outdir}" "{params.reports_dir}"
+        {params.py} {params.script} 2>&1 | tee -a {log}
+        '''
 
-# =============================================================
-# 3.8) 表头收敛为“仅物种名”（>Species）
-# =============================================================
 rule collapse_headers_to_species:
-    input:
-        f"{TRIM_DIR_COLLAPSE}/.done"
-    output:
-        touch(f"{TRIM_DIR_COLLAPSE_SPECIES}/.done")
-    log:
-        f"{LOG_DIR}/collapse_headers_to_species.log"
+    input: COLL_DONE
+    output: SPC_DONE
+    log: f"{LOG_DIR}/collapse_headers_to_species.log"
     params:
-        py     = BIN_PYTHON,
-        script = f"{SCRIPTS_DIR}/collapse_headers_to_species.py",
-        indir  = TRIM_DIR_COLLAPSE,
-        outdir = TRIM_DIR_COLLAPSE_SPECIES
+        py = BIN.get("python","python"),
+        script = f"{SCRIPTS}/05_collapse_headers_to_species.py",
+        outdir = P["species_collapse_dir"]
     shell:
-        r"""
-        set -euo pipefail
-        mkdir -p {params.outdir} {LOG_DIR}
-        {params.py} {params.script} \
-          --indir {params.indir} \
-          --outdir {params.outdir} \
-          2>> {log}
-        touch {output}
-        """
+        r'''set -euo pipefail
+        mkdir -p "$(dirname {log})" "{params.outdir}"
+        {params.py} {params.script} 2>&1 | tee -a {log}
+        '''
 
-# =============================================================
-# 3.9) 仅SCO白名单过滤
-# =============================================================
 rule filter_alignments_by_sco:
-    input:
-        base_done = f"{TRIM_DIR_COLLAPSE_SPECIES}/.done",
-        keep_list = SCO_KEEP_LIST
-    output:
-        touch(f"{TRIM_DIR_SCO_SPECIES}/.done")
-    log:
-        f"{LOG_DIR}/filter_alignments_by_sco.log"
+    input: SPC_DONE, SCO_DONE
+    output: SCOLIST, SCOL_DONE
+    log: f"{LOG_DIR}/filter_alignments_by_sco.log"
     params:
-        py     = BIN_PYTHON,
-        script = f"{SCRIPTS_DIR}/filter_alignments_by_sco.py",
-        indir  = TRIM_DIR_COLLAPSE_SPECIES,
-        outdir = TRIM_DIR_SCO_SPECIES,
-        keep   = SCO_KEEP_LIST
+        py = BIN.get("python","python"),
+        script = f"{SCRIPTS}/06_filter_alignments_by_sco.py",
+        reports_dir = P["reports_dir"]
     shell:
-        r"""
-        set -euo pipefail
-        mkdir -p {TRIM_DIR_SCO_SPECIES} {LOG_DIR}
-        {params.py} {params.script} --indir {params.indir} --keep-list {params.keep} --outdir {params.outdir} >> {log} 2>&1
-        touch {output}
-        """
+        r'''set -euo pipefail
+        mkdir -p "$(dirname {log})" "{params.reports_dir}"
+        {params.py} {params.script} 2>&1 | tee -a {log}
+        '''
 
-# =============================================================
-# 4) 超矩阵拼接
-# =============================================================
 rule concat_supermatrix:
-    input:
-        f"{OF_WORKDIR}/.done",
-        OF_RESULT_TXT,
-        SCO_LIST,
-        f"{TRIM_DIR}/.done",
-        f"{TRIM_DIR_NORM}/.done",
-        f"{TRIM_DIR_COLLAPSE}/.done",
-        (f"{TRIM_DIR_SCO_SPECIES}/.done" if SCO_ONLY else f"{TRIM_DIR_COLLAPSE_SPECIES}/.done")
-    output:
-        CONCAT_FAS,
-        PARTITIONS_TXT
+    input: SCOL_DONE
+    output: SUPER_FASTA, SUPER_DONE
+    log: f"{LOG_DIR}/concat_supermatrix.log"
     params:
-        script  = f"{SCRIPTS_DIR}/concat_supermatrix_safe.py",
-        py      = BIN_PYTHON,
-        minlen  = config.get("species_tree", {}).get("concat", {}).get("min_align_len", 0),
-        mintaxa = config.get("species_tree", {}).get("concat", {}).get("min_taxa_per_locus", 0),
-        topn    = config.get("species_tree", {}).get("concat", {}).get("top_n_partitions", 0),
-        normdir = (TRIM_DIR_SCO_SPECIES if SCO_ONLY else TRIM_DIR_COLLAPSE_SPECIES)
-    threads: OF_ANALYSIS_THR
+        py = BIN.get("python","python"),
+        script = f"{SCRIPTS}/07_concat_supermatrix.py",
+        outdir = P["supermatrix_dir"]
     shell:
-        r"""
-        set -euo pipefail
-        mkdir -p results/concat
-        echo "[INFO] 使用 MSA 来源目录(仅物种名): {params.normdir}"
-        {params.py} {params.script} \
-          --trim-dir {params.normdir} \
-          --out-prefix {CONCAT_PREFIX} \
-          --datatype aa \
-          --min-align-len {params.minlen} \
-          --min-taxa-per-locus {params.mintaxa} \
-          --top-n {params.topn}
-        """
+        r'''set -euo pipefail
+        mkdir -p "$(dirname {log})" "{params.outdir}"
+        {params.py} {params.script} 2>&1 | tee -a {log}
+        '''
 
-# =============================================================
-# 5) IQ-TREE 物种树（超矩阵）
-# =============================================================
 rule iqtree_concat_tree:
-    input:
-        fasta = CONCAT_FAS,
-        part  = PARTITIONS_TXT
-    output:
-        IQTREE_TREE
-    log:
-        f"{LOG_DIR}/iqtree_concat_tree.log"
-    threads:
-        IQTREE_THREADS
+    input: SUPER_DONE
+    output: TREE_NWK, IQ_DONE
+    log: f"{LOG_DIR}/iqtree_concat_tree.log"
     params:
-        iqtree = BIN_IQTREE,
-        pre    = IQTREE_PREFIX,
-        model  = IQTREE_MODEL_FLAG,
-        boot   = IQTREE_BOOT_FLAG,
-        alrt   = IQTREE_ALRT_FLAG,
-        extra  = IQTREE_EXTRA_FLAG
+        py = BIN.get("python","python"),
+        script = f"{SCRIPTS}/08_iqtree_concat.py",
+        outdir = P["trees_dir"]
     shell:
-        r"""
-        set -euo pipefail
-        mkdir -p {IQTREE_DIR}
-        export OMP_NUM_THREADS={threads}
-        export OPENBLAS_NUM_THREADS=1
-        export MKL_NUM_THREADS=1
-        export NUMEXPR_NUM_THREADS=1
+        r'''set -euo pipefail
+        mkdir -p "$(dirname {log})" "{params.outdir}"
+        {params.py} {params.script} 2>&1 | tee -a {log}
+        '''
 
-        if [ ! -s {input.fasta} ]; then
-          echo "[ERR] supermatrix 为空：{input.fasta}" | tee -a {log}; exit 31
-        fi
-        if [ ! -s {input.part} ]; then
-          echo "[ERR] partitions 为空：{input.part}" | tee -a {log}; exit 32
-        fi
-
-        {params.iqtree} \
-          -s {input.fasta} \
-          -p {input.part} \
-          {params.model} \
-          {params.boot} {params.alrt} \
-          -T {threads} \
-          -pre {params.pre} \
-          {params.extra} \
-          2>&1 | tee -a {log}
-
-        if [ ! -s {params.pre}.treefile ]; then
-          echo "[ERR] IQ-TREE 未生成 treefile" | tee -a {log}; exit 33
-        fi
-        """
-
-# =============================================================
-# 7) 覆盖度报告
-# =============================================================
 rule report_matrix:
-    """生成超矩阵覆盖度报告（物种×分区的存在情况）"""
-    input:
-        CONCAT_FAS
-    output:
-        f"{REPORT_DIR}/matrix.tsv"
-    log:
-        f"{LOG_DIR}/report_matrix.log"
+    input: IQ_DONE
+    output: MATRIX_TSV, MATRIX_DONE
+    log: f"{LOG_DIR}/report_matrix.log"
     params:
-        py     = BIN_PYTHON,
-        script = f"{SCRIPTS_DIR}/report_matrix.py"
-    run:
-        Path(REPORT_DIR).mkdir(parents=True, exist_ok=True)
-        if not REPORT_ENABLED:
-            shell(": > {output} && echo '[INFO] 覆盖度报告关闭，生成空文件' >> {log}")
-        else:
-            shell("{params.py} {params.script} {input} > {output} 2>> {log}")
-        if not Path(output[0]).exists() or Path(output[0]).stat().st_size == 0:
-            shell("echo '[ERR] 覆盖度报告文件为空' >> {log}; exit 51")
+        py = BIN.get("python","python"),
+        script = f"{SCRIPTS}/09_report_matrix.py",
+        outdir = P["reports_dir"]
+    shell:
+        r'''set -euo pipefail
+        mkdir -p "$(dirname {log})" "{params.outdir}"
+        {params.py} {params.script} 2>&1 | tee -a {log}
+        '''
+
+rule publish_aphylo_ready:
+    input: MATRIX_DONE
+    output: PUB_DONE
+    log: f"{LOG_DIR}/publish_aphylo_ready.log"
+    params:
+        py = BIN.get("python","python"),
+        script = f"{SCRIPTS}/10_publish_aphylo_ready.py",
+        outdir = P["publish_dir"]
+    shell:
+        r'''set -euo pipefail
+        mkdir -p "$(dirname {log})" "{params.outdir}"
+        {params.py} {params.script} 2>&1 | tee -a {log}
+        touch {output}
+        '''
 
