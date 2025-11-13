@@ -1,3 +1,0 @@
-KeyError in file /home/mxrmiss/project/aphylo/Snakefile, line 30:
-'log'
-  File "/home/mxrmiss/project/aphylo/Snakefile", line 30, in <module>
