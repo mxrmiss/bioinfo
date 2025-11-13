@@ -36,7 +36,7 @@ rule all:
         PUB_DONE,
         MATRIX_DONE,
         IQ_DONE,
-        SUPER_DONE
+        SUPER_DONE,
 
 # 若想重跑此步，需要删除/data/proteomes/下的隐藏文件夹.from_gff.done
 rule build_proteomes_from_gff:

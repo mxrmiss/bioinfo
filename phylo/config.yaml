@@ -58,6 +58,7 @@ species_tree:
     min_taxa_per_locus: 15
     top_n_partitions: 1000
 
+
 binaries:
   python: python
   trimal: trimal
@@ -66,6 +67,6 @@ binaries:
   iqtree: iqtree3
 
 publish:
-  include_ultrametric_tree: true
+  include_ultrametric_tree: false
   # 10脚本没有的前缀可以在下面设置
   # db_prefix_allowlist: ["ab"]

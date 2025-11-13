@@ -1,0 +1,89 @@
+# -*- coding: utf-8 -*-
+# =============================================================
+# APhylo — config-aligned Snakefile（在 aphylo 根运行；脚本在 ./scripts）
+# =============================================================
+configfile: "config.yaml"
+
+SCRIPTS_DIR = "scripts"
+
+# Sentinels based on config.paths (resolve at runtime)
+def sentinel(path_key: str, name: str):
+    import os
+    return f"{config['paths'][path_key]}/{name}"
+
+S01 = sentinel("iface_dir", ".iface.done")
+S02 = sentinel("bt_dir", ".inputs.done")
+S03 = sentinel("bt_dir", ".pal2nal.done")
+S04 = sentinel("codon_qc_dir", ".qc.done")
+S05 = sentinel("codeml_raw_dir", ".fgsets.done")
+S06 = sentinel("codeml_raw_dir", ".codeml.done")
+S07 = sentinel("codeml_agg_dir", ".aggregate.done")
+S08 = sentinel("cafe_run_dir", ".prep.done")
+S09 = sentinel("cafe_run_dir", ".cafe.done")
+S10 = sentinel("cafe_agg_dir", ".agg.done")
+S11 = sentinel("joint_dir", ".integration.done")
+S12 = sentinel("joint_dir", ".report.done")
+
+rule all:
+    input: S12
+
+rule iface_check_publish:
+    output: S01
+    shell: f"set -euo pipefail; python {SCRIPTS_DIR}/01_iface_check_publish.py"
+
+rule build_codon_inputs:
+    input: S01
+    output: S02
+    shell: f"set -euo pipefail; python {SCRIPTS_DIR}/02_build_codon_inputs.py"
+
+rule pal2nal_and_colmask_sync:
+    input: S02
+    output: S03
+    shell: f"set -euo pipefail; python {SCRIPTS_DIR}/03_pal2nal_like_and_colmask_sync.py"
+
+rule qc_codon_alignments:
+    input: S03
+    output: S04
+    shell: f"set -euo pipefail; python {SCRIPTS_DIR}/04_qc_codon_alignments.py"
+
+rule define_foregrounds:
+    input: S04
+    output: S05
+    shell: f"set -euo pipefail; python {SCRIPTS_DIR}/05_define_foregrounds.py"
+
+rule codeml_batch_branchsite:
+    input: S05
+    output: S06
+    threads: config.get("codeml", {}).get("threads", 1)
+    shell: f"set -euo pipefail; python {SCRIPTS_DIR}/06_codeml_batch_branchsite.py"
+
+rule codeml_aggregate:
+    input: S06
+    output: S07
+    shell: f"set -euo pipefail; python {SCRIPTS_DIR}/07_codeml_aggregate.py"
+
+rule cafe5_prepare_inputs:
+    input: S07
+    output: S08
+    shell: f"set -euo pipefail; python {SCRIPTS_DIR}/08_cafe5_prepare_inputs.py"
+
+rule cafe5_run_models:
+    input: S08
+    output: S09
+    threads: config.get("cafe5", {}).get("threads", 4)
+    shell: f"set -euo pipefail; python {SCRIPTS_DIR}/09_cafe5_run_models.py"
+
+rule cafe5_aggregate:
+    input: S09
+    output: S10
+    shell: f"set -euo pipefail; python {SCRIPTS_DIR}/10_cafe5_aggregate.py"
+
+rule joint_integration:
+    input: S10
+    output: S11
+    shell: f"set -euo pipefail; python {SCRIPTS_DIR}/11_joint_integration.py"
+
+rule build_final_report:
+    input: S11
+    output: S12
+    shell: f"set -euo pipefail; python {SCRIPTS_DIR}/12_build_final_report.py"

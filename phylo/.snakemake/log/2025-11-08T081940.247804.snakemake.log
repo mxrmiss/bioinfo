@@ -1,0 +1,43 @@
+Building DAG of jobs...
+Using shell: /usr/bin/bash
+Provided cores: 19
+Rules claiming more threads will be scaled down.
+Job stats:
+job                     count
+--------------------  -------
+all                         1
+publish_aphylo_ready        1
+total                       2
+
+Select jobs to execute...
+
+[Sat Nov  8 08:19:40 2025]
+rule publish_aphylo_ready:
+    input: results/reports/.matrix.done
+    output: results/publish/aphylo_ready/.publish.done
+    log: logs/publish_aphylo_ready.log
+    jobid: 1
+    reason: Missing output files: results/publish/aphylo_ready/.publish.done
+    resources: tmpdir=/tmp
+
+set -euo pipefail
+        mkdir -p "$(dirname logs/publish_aphylo_ready.log)" "results/publish/aphylo_ready"
+        python scripts/10_publish_aphylo_ready.py 2>&1 | tee -a logs/publish_aphylo_ready.log
+        touch results/publish/aphylo_ready/.publish.done
+        
+[Sat Nov  8 08:19:43 2025]
+Finished job 1.
+1 of 2 steps (50%) done
+Select jobs to execute...
+
+[Sat Nov  8 08:19:43 2025]
+localrule all:
+    input: results/publish/aphylo_ready/.publish.done, results/reports/.matrix.done, results/trees/.iqtree.done, results/supermatrix/.supermatrix.done
+    jobid: 0
+    reason: Input files updated by another job: results/publish/aphylo_ready/.publish.done
+    resources: tmpdir=/tmp
+
+[Sat Nov  8 08:19:43 2025]
+Finished job 0.
+2 of 2 steps (100%) done
+Complete log: .snakemake/log/2025-11-08T081940.247804.snakemake.log
