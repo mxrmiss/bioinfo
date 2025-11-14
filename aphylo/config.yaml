@@ -61,14 +61,34 @@ codeml:
       tips: ["Sinonovacula_constricta"]         # 论文：高盐前景
 
 cafe5:
-  enable: true
-  threads: 30
-  gamma_k: 3                # -k（Gamma 类别数）；若不需要 Gamma，可设为 1 或 null
-  pvalue: 0.05              # -P
-  max_autofix_rounds: 3     # 最大自动纠错轮次，建议3次
-  models:
-    - "global"              # 全树单一 lambda
-    # - "two_rate:TargetClade"  # 可选：在 TargetClade vs 背景 两段 λ
+  enable: true            # 总开关；false 则整步跳过并直接写 .cafe.done
+  threads: 30             # CAFE5 并行线程数，对应参数 -c
+  gamma_k: 3              # Gamma 类别数（-k）；为 null/空则不加 -k
+  pvalue: 0.05            # 家族显著性阈值（-P）；为 null/空则不加 -P
+  models: ["global"]      # 目前只跑全树单一 λ；保持 ["global"] 即可
+  max_autofix_rounds: 3   # 自动自救轮数：解析日志“极端家族”→剔除→重跑；0 关闭
+
+  # —— 教程增强 1：两阶段大拷贝家族（≥阈值的家族单独跑，后用固定 λ 补回）——
+  two_stage_large:
+    enable: true           # 开启两阶段逻辑；false 则不拆分，按原流程跑
+    copy_threshold: 100    # 任一物种拷贝数 ≥ 此值 → 归入 large 集
+    keep_strategy: "split" # 预留口径标记；保持 "split"
+    primary_tag: "primary" # 主集合子目录名（勿改）
+    large_tag: "large"     # 大拷贝子集子目录名（勿改）
+
+  # —— 教程增强 2：误差模型（-e）——
+  error_model:
+    mode: "off"           # off=不用；estimate=估计误差模型；use=直接使用外部模型文件
+    file: null            # mode=use 时指定误差模型文件路径；其余保持 null
+    apply_to:             # 误差模型应用到哪些子集（可选 primary/large）
+      - "primary"
+      - "large"
+
+  # —— 教程增强 3：多 λ（-y 分簇树）——
+  multi_lambda:
+    enable: false         # true 时在 primary 额外跑一份 multi-λ
+    y_tree: null          # 分簇树文件路径（文本树，定义哪些分支共享同一 λ）
+    compare_with_global: true  # 同时保留 global-λ 结果以便对比
 
 report:
   fdr_alpha: 0.05
@@ -109,4 +129,3 @@ mcmctree:
   fallback_work_dirs:                   # 备选工作目录（可为空）
     - "results/06_cafe/mcmctree"
   qc_dirname: "qc_report"               # 质检子目录名
-
