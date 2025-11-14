@@ -83,7 +83,7 @@ def copy_file(src: Path, dst: Path):
 
 # ------------------------- CAFE5 辅助 -------------------------
 
-OG_RE = re.compile(r'\b(OG\d{7,})\b', re-I)  # 匹配如 OG0000123
+OG_RE = re.compile(r'\b(OG\d{7,})\b', re.I)  # 匹配如 OG0000123
 
 def read_family_as_rows(path: Path) -> Tuple[List[str], List[List[str]]]:
     lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
