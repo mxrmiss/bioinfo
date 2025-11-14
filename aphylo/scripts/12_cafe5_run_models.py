@@ -28,16 +28,16 @@
          ├─ family.primary.tsv
          ├─ family.large.tsv
          ├─ primary_global/
-         ├─ large/                  （若 large 非空才跑）
+         │     ├─ Gamma_*.txt/tre…
+         │     └─ run.log
+         ├─ large/                  （若 large 非空才跑，同样有 run.log）
          ├─ flags/high_fail_ogs.list
          ├─ sentinels/
-         └─ run.log                 （主流程日志）
+         └─ （模型级别 .done 哨兵）
   5) 全部模型成功后，在 cafe_run_dir 下写入 .cafe.done 哨兵。
 
 注意：
   - 不接受命令行参数，所有参数集中在 config.yaml 顶部。
-  - 本脚本只修复路径与 CAFE5 调用逻辑，不对 error_model/multi_lambda 做复杂操作，
-    但会安全地忽略这些配置（即它们存在也不会报错）。
 """
 
 from __future__ import annotations
@@ -88,12 +88,6 @@ def ensure_dir(p: Path) -> Path:
     """确保目录存在。"""
     p.mkdir(parents=True, exist_ok=True)
     return p
-
-
-def rm_tree(p: Path):
-    """安全删除整个目录树。"""
-    if p.is_dir():
-        shutil.rmtree(p)
 
 
 def get_logger(name: str, logfile: Path, level: int = logging.INFO) -> logging.Logger:
@@ -200,17 +194,18 @@ def split_family_primary_large(
 
 # ======================== CAFE5 调用与解析 ========================
 
+# 注意：Python 的 re 不支持 \R，这里用 (?:\r?\n) 匹配换行
 EXTREME_BLOCK_RE = re.compile(
-    r"Families with largest size differentials:\R"
-    r"((?:.*?OG\d+:\s*\d+\R?)+)",
+    r"Families with largest size differentials:\s*(?:\r?\n)"
+    r"((?:.*OG\d+:\s*\d+(?:\r?\n))+)",
     flags=re.M,
 )
 
 OG_KV_RE = re.compile(r"(OG\d+)\s*:\s*(\d+)")
 
 FAIL_BLOCK_RE = re.compile(
-    r"The following families had failure rates >20% of the time:\R"
-    r"((?:.*?OG\d+\s+had\s+\d+\s+failures\R?)+)",
+    r"The following families had failure rates >20% of the time:\s*(?:\r?\n)"
+    r"((?:.*OG\d+\s+had\s+\d+\s+failures(?:\r?\n))+)",
     flags=re.M,
 )
 
@@ -231,7 +226,9 @@ def run_cafe_once(
     """
     跑一次 CAFE5，返回 stdout 文本，用于后续解析极端家族 / 高失败率等。
 
-    关键：family_tsv 与 tree_nwk 一律使用绝对路径，避免 cwd 更改导致找不到文件。
+    关键：
+      - family_tsv 与 tree_nwk 一律使用绝对路径，避免 cwd 更改导致找不到文件。
+      - 同时把原始输出追加写入 cwd/run.log，方便 13 脚本做 QC。
     """
     ensure_dir(cwd)
     family_abs = family_tsv.resolve()
@@ -262,6 +259,16 @@ def run_cafe_once(
         errors="replace",
     )
     out = proc.stdout or ""
+
+    # 写 run.log（追加）
+    runlog = cwd / "run.log"
+    with runlog.open("a", encoding="utf-8") as fh:
+        fh.write(f"================ MODEL={label} =================\n")
+        fh.write(out)
+        if not out.endswith("\n"):
+            fh.write("\n")
+
+    # 同时打到主 logger
     for ln in out.splitlines():
         log.info(f"[{label}] {ln}")
 
@@ -456,11 +463,10 @@ def main():
     two_stage_enable = bool(two_stage_cfg.get("enable", False))
     copy_threshold = int(two_stage_cfg.get("copy_threshold", 100))
 
-    # 其它增强（先读出来，虽然本脚本暂时不深入使用）
+    # 其它增强（本脚本目前不深入使用，预留）
     error_cfg = cafe_cfg.get("error_model", {}) or {}
     multi_cfg = cafe_cfg.get("multi_lambda", {}) or {}
 
-    project_root = Path(".").resolve()
     cafe_run_dir = Path(paths["cafe_run_dir"]).resolve()
     logs_dir = Path(paths["logs_dir"]).resolve()
 
@@ -470,7 +476,6 @@ def main():
     tree_nwk = input_dir / "utree_for_cafe.nwk"
 
     if not cafe_enable:
-        # 若关闭，则写 .cafe.done 后退出
         ensure_dir(cafe_run_dir)
         (cafe_run_dir / ".cafe.done").write_text(
             "cafe5 disabled in config\n", encoding="utf-8"
@@ -560,7 +565,9 @@ def main():
 
         # LARGE 阶段（只有在 two_stage 模式 + large 非空时才跑）
         high_fail_large: List[str] = []
-        n_large_data = sum(1 for _ in large_tsv.read_text(encoding="utf-8").splitlines()) - 1
+        n_large_data = sum(
+            1 for _ in large_tsv.read_text(encoding="utf-8").splitlines()
+        ) - 1
         if two_stage_enable and n_large_data > 0:
             logger.info(
                 f"[MODEL {model}] 检测到 large 集合 {n_large_data} 行，启动 LARGE 阶段。"
@@ -574,7 +581,7 @@ def main():
                 pvalue=pvalue,
                 cwd=large_dir,
                 log=logger,
-                label_prefix=f"MODEL={model} LARGE-GLOBAL",
+                label_prefix=f"MODEL={model} PRIMARY-GLOBAL-LARGE",
                 max_autofix_rounds=max_autofix_rounds,
                 model_dir=model_dir,
             )
