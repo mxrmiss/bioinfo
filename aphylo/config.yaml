@@ -62,9 +62,10 @@ codeml:
 
 cafe5:
   enable: true
-  threads: 8
+  threads: 30
   gamma_k: 3                # -k（Gamma 类别数）；若不需要 Gamma，可设为 1 或 null
   pvalue: 0.05              # -P
+  max_autofix_rounds: 3     # 最大自动纠错轮次，建议3次
   models:
     - "global"              # 全树单一 lambda
     # - "two_rate:TargetClade"  # 可选：在 TargetClade vs 背景 两段 λ

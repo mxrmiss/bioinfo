@@ -1,25 +1,35 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+
 """
-08_cafe5_prepare_inputs.py — 准备 CAFE5 输入（保持 I/O 契约不变）
-更新要点（与既有流水线风格一致，零破坏）：
-1) 移除 family.tsv 的 Total 列；日志分别报告“原始列数(含 Total)”与“有效列数(剔除 Total)”，避免误判为脚本出错。
-2) 统一物种别名（config.species.alias_map），并清理 TimeTree 叶名中的引号编号尾缀（如 '13'、'35''34'…），两侧一致化。
-3) 仅保留“树∩矩阵”的物种列，按树叶顺序重排；别名合并产生重复时逐行求和。
-4) 若树中存在但矩阵缺失的物种：明确报错，列出缺失清单；不补零以避免伪信号。
-5) 输出：将清洗后的 family.tsv 与“清洁树”副本写入 paths.cafe_run_dir/input/；原始发布文件不改；完成后落 .prep.done。
+11_cafe5_prepare_inputs.py —— 为 CAFE5 准备 family.tsv & 超时钟树
+
+核心职责：
+  1) 读取原始基因家族矩阵（OrthoFinder 等产生的 TSV）；
+  2) 按超时钟树中的物种叶节点顺序，清洗并重排 family：
+       - 删除 Total 等汇总列；
+       - 物种名按 alias_map 归一；
+       - 只保留树上出现的物种；
+  3) 输出符合 CAFE5 要求的 family.tsv：
+       - 第 1 列：Desc（描述列，占位，用 "null"）
+       - 第 2 列：Orthogroup/FamilyID（家族 ID）
+       - 后续列：各物种拷贝数（顺序与树一致）；
+  4) 写出“清洁树”：叶名按 alias_map & TimeTree 尾缀清理到标准写法；
+  5) 写入 .prep.done 哨兵。
 """
+
 from __future__ import annotations
-import sys, io, logging, re
+import sys, io, re, logging
 from pathlib import Path
-from typing import Dict, Any, List, Tuple, Iterable
+from typing import Dict, Any, List, Tuple, Iterable, Optional
 import yaml
 
 DEFAULT_CONFIG = "config.yaml"
 
-# ================= 基础工具 =================
+# ====================== 通用工具：配置、日志、保障 ======================
+
 def _expand_publish_placeholders(obj, publish_dir: str):
-    """展开 config 中的 <publish_dir> 占位符（保持既有风格）。"""
+    """把对象中出现的 <publish_dir> 占位符替换为真路径。"""
     if isinstance(obj, str):
         return obj.replace("<publish_dir>", publish_dir)
     if isinstance(obj, list):
@@ -29,7 +39,7 @@ def _expand_publish_placeholders(obj, publish_dir: str):
     return obj
 
 def load_config(config_path: str = DEFAULT_CONFIG) -> Dict[str, Any]:
-    """读取主配置；若存在 publish_dir，则展开 inputs.* 中的占位符。"""
+    """加载 config.yaml，并展开 publish_dir 占位符。"""
     p = Path(config_path)
     if not p.exists():
         raise FileNotFoundError(f"[ERR] 未找到配置文件：{p}")
@@ -40,61 +50,70 @@ def load_config(config_path: str = DEFAULT_CONFIG) -> Dict[str, Any]:
     return cfg
 
 def ensure_dir(p: Path) -> Path:
+    """确保目录存在。"""
     p.mkdir(parents=True, exist_ok=True)
     return p
 
 def need_file(p: Path, what: str) -> Path:
+    """确保文件存在，否则报错。"""
     p = Path(p)
     if not p.is_file():
         raise FileNotFoundError(f"[ERR] 缺少文件：{what} -> {p}")
     return p
 
 def get_logger(name: str, logfile: Path, level: int = logging.INFO) -> logging.Logger:
-    """文件 + 屏幕双通道日志；与 aphylo 其他脚本风格一致。"""
+    """日志写文件 + 同步屏幕；并保持 stdout/stderr 实时刷新。"""
     ensure_dir(logfile.parent)
     lg = logging.getLogger(name); lg.setLevel(level); lg.handlers.clear()
     fmt = logging.Formatter("[%(asctime)s] %(levelname)s - %(message)s", "%Y-%m-%d %H:%M:%S")
     fh = logging.FileHandler(logfile, encoding="utf-8"); fh.setFormatter(fmt); fh.setLevel(level)
     sh = logging.StreamHandler(stream=sys.stdout);     sh.setFormatter(fmt); sh.setLevel(level)
     lg.addHandler(fh); lg.addHandler(sh)
+
     class _Flush(io.TextIOBase):
         def __init__(self, s): self.s = s
-        def write(self, x): self.s.write(x); self.s.flush(); return len(x)
+        def write(self, x): 
+            self.s.write(x); self.s.flush(); 
+            return len(x)
     sys.stdout = _Flush(sys.stdout); sys.stderr = _Flush(sys.stderr)
     return lg
 
 def banner(logger: logging.Logger, text: str):
+    """在日志中打印 banner。"""
     bar = "=" * max(10, len(text) + 2)
     logger.info(bar); logger.info(f" {text} "); logger.info(bar)
 
 def write_done(path: Path):
+    """写哨兵文件（空文件即可）。"""
     path.parent.mkdir(parents=True, exist_ok=True)
     Path(path).touch()
 
-# ================= 业务工具 =================
+# ====================== 专用工具：树和物种名处理 ======================
+
 def extract_tree_leaves(nwk_text: str) -> List[str]:
     """
-    解析 Newick 叶节点名称（轻量实现）：
-    1) 去掉分支长度(:0.123)；2) 去括号/空白/分号；3) 按逗号切分；4) 过滤空串；5) 去重保持顺序。
+    从 Newick 字符串中提取叶节点标签（保持首次出现顺序，去重）。
+    不依赖复杂解析；通过删除分支长度与括号等，再按逗号拆分。
     """
+    # 去掉 :branch_length 部分
     s = re.sub(r":[0-9eE+\-\.]+", "", nwk_text)
+    # 去掉括号、分号和空白
     s = re.sub(r"[\(\)\s;]", "", s)
     toks = [t for t in s.split(",") if t]
     seen, leaves = set(), []
     for t in toks:
         if t not in seen:
-            seen.add(t); leaves.append(t)
+            seen.add(t)
+            leaves.append(t)
     return leaves
 
 def normalize_timetree_suffix(name: str) -> str:
     """
     清理 TimeTree 叶名的引号编号尾缀：
-    例：Crassostrea_gigas'13' -> Crassostrea_gigas
-        Pomacea_canaliculata'35''34''43' -> Pomacea_canaliculata
+      例：Crassostrea_gigas'13' -> Crassostrea_gigas
+          Pomacea_canaliculata'35''34''43' -> Pomacea_canaliculata
     """
-    # 去除结尾处重复出现的 '数字'
     name2 = re.sub(r"(?:'[0-9]+')+$", "", name)
-    # 去除可能残留的单引号
     name2 = name2.replace("'", "")
     return name2
 
@@ -119,15 +138,20 @@ def build_alias_resolver(alias_cfg: Dict[str, Any]):
             a2c[str(v)] = str(v)
     return lambda x: a2c.get(x, x)
 
+# ====================== 专用工具：TSV 读取 ======================
+
 def parse_tsv_header(path: Path) -> List[str]:
-    """读取 TSV 第一行并拆分为列名列表（不去除首列）。"""
+    """读取 TSV 第一行并拆分为列名列表。"""
     first = path.read_text(encoding="utf-8").splitlines()[0]
     return first.rstrip("\n\r").split("\t")
 
 def iter_tsv_rows(path: Path):
-    """逐行读取 TSV（跳过首行），返回 (row_id, [counts...])。"""
+    """
+    逐行读取 TSV（跳过首行），返回 (row_id, [counts...])。
+    row_id 一般是 Orthogroup / FamilyID。
+    """
     with path.open("r", encoding="utf-8") as f:
-        _ = f.readline()
+        _ = f.readline()  # 跳过表头
         for line in f:
             line = line.rstrip("\n\r")
             if not line:
@@ -136,28 +160,33 @@ def iter_tsv_rows(path: Path):
             yield parts[0], parts[1:]
 
 def safe_int(x: str) -> int:
-    """计数字段安全转 int，异常按 0 处理（并不改变数据规模）。"""
+    """计数字段安全转 int，异常按 0 处理（不改变总体尺度）。"""
     try:
         return int(x)
     except Exception:
         return 0
 
-# ================= 主流程 =================
+# ====================== 主流程 ======================
+
 def main():
-    cfg = load_config()
-    paths = cfg["paths"]; inputs = cfg["inputs"]; cafe = cfg.get("cafe5", {})
+    cfg   = load_config()
+    paths = cfg["paths"]
+    inputs = cfg["inputs"]
+    cafe  = cfg.get("cafe5", {})
+
     logs_dir = Path(paths["logs_dir"])
+    # 为避免动皇上的路径，这里沿用旧命名（08），只是文件名不影响后续流程
     LOG_FILE = logs_dir / "08_cafe5_prepare_inputs.log"
     log = get_logger("aphylo.08", LOG_FILE)
     banner(log, "APhylo 08 — CAFE5 输入准备")
 
-    # 允许关闭本步
+    # 若关闭 CAFE5，直接写 prep.done 并退出
     if not cafe.get("enable", True):
         log.info("cafe5.enable=false —— 跳过本步")
         write_done(Path(paths["cafe_run_dir"]) / ".prep.done")
         return
 
-    # 定位输入
+    # ------- 1. 定位输入 -------
     fam_key = "family" if "family" in inputs else ("family_tsv" if "family_tsv" in inputs else None)
     if not fam_key:
         raise KeyError("[ERR] 缺少 inputs.family（或 family_tsv）")
@@ -166,102 +195,113 @@ def main():
 
     outdir = ensure_dir(Path(paths["cafe_run_dir"]) / "input")
 
-    # 别名与标准化器
+    # ------- 2. 构建物种别名解析器 -------
     alias_map = (cfg.get("species") or {}).get("alias_map", {})
     resolve = build_alias_resolver(alias_map)
 
-    # ---------- 解析并标准化树叶集合 ----------
+    # ------- 3. 解析并标准化树叶集合 -------
     tree_text = Path(utree).read_text(encoding="utf-8")
     leaf_order_raw = extract_tree_leaves(tree_text)
-    # 清理 TimeTree 尾缀 + 去引号 + 别名标准化
-    leaf_order = [resolve(normalize_timetree_suffix(x.strip())) for x in leaf_order_raw]
+    leaf_order: List[str] = []
+    for x in leaf_order_raw:
+        canon = resolve(normalize_timetree_suffix(x.strip()))
+        leaf_order.append(canon)
     leaf_set = set(leaf_order)
 
-    # ---------- 读取家族矩阵表头并清洗列名 ----------
+    if not leaf_order:
+        raise ValueError("[ERR] 超时钟树中未解析到任何叶节点，请检查 ultrametric_tree")
+
+    log.info(f"[TREE] 叶节点数：{len(leaf_order)}；示例：{', '.join(leaf_order[:5])}")
+
+    # ------- 4. 读取 family 表头并清洗列名 -------
     header = parse_tsv_header(family)  # 例如 ["Orthogroup", sp1, sp2, ..., "Total"]
+    if not header or len(header) < 2:
+        raise ValueError("[ERR] family.tsv 表头列数异常（<2）")
+
     firstcol = header[0]
-    # 兼容 OrthoFinder 的少量变体：Orthogroups -> Orthogroup
-    if firstcol not in ("Orthogroup", "OG", "Orthogroups"):
-        raise ValueError(f"[ERR] family.tsv 首列应为 Orthogroup（或 Orthogroups/OG），当前为：{firstcol}")
-    if firstcol == "Orthogroups":
-        header[0] = "Orthogroup"
+    if firstcol not in ("Orthogroup", "Orthogroups", "OG", "Family", "FamilyID"):
+        log.warning(f"[WARN] 非典型家族ID列名：{firstcol}，将仍按“家族ID列”处理。")
 
-    raw_species_all = header[1:]  # 含 Total
-    # 剔除 Total（大小写无关；去前后空白）
-    dropped_total = [c for c in raw_species_all if c.strip().lower() == "total"]
-    species_wo_total = [c for c in raw_species_all if c.strip().lower() != "total"]
+    # 剩余列视为物种列 + 可能的 Total 列
+    data_cols_raw = header[1:]
 
-    # 应用别名映射（矩阵侧）
-    renamed_pairs = []  # (old, new)
-    species_norm = []
-    for c in species_wo_total:
-        c0 = c.strip()
-        c1 = resolve(c0)
-        if c1 != c0:
-            renamed_pairs.append((c0, c1))
-        species_norm.append(c1)
+    # 去掉常见的 Total 列名
+    total_like = {"Total", "TotalGenes", "Total_Genes", "Total_genes"}
+    data_cols_no_total: List[str] = [c for c in data_cols_raw if c not in total_like]
 
-    # 统计信息（更准确的口径）
-    log.info(f"[Info] 原始物种列数（含 Total，不含 Orthogroup）: {len(raw_species_all)}")
-    log.info(f"[Info] 有效物种列数（剔除 Total 后）: {len(species_norm)}")
-    if dropped_total:
-        log.info(f"[Clean] 移除汇总列: {dropped_total}")
-    if renamed_pairs:
-        log.info(f"[Clean] 别名标准化（矩阵列）{len(renamed_pairs)} 项，示例前 5 条: {renamed_pairs[:5]}")
+    if not data_cols_no_total:
+        raise ValueError("[ERR] 除家族ID外未检测到任何物种列，请检查 family.tsv 表头。")
 
-    # 记录矩阵中“树外”的列（将被丢弃，不进入 CAFE）
-    extra_in_matrix = [c for c in species_norm if c not in leaf_set]
-    if extra_in_matrix:
-        log.info(f"[Clean] 丢弃树外物种列（不进入 CAFE）: {extra_in_matrix}")
+    # 对物种列做别名归一
+    col_canon: List[str] = [resolve(c.strip()) for c in data_cols_no_total]
 
-    kept_in_matrix = [c for c in species_norm if c in leaf_set]
+    # 映射：canonical_species -> 这些列的索引（可能多个列同属一个物种，后续会相加）
+    idx_by_sp: Dict[str, List[int]] = {}
+    for idx, sp in enumerate(col_canon):
+        idx_by_sp.setdefault(sp, []).append(idx)
 
-    # 缺失检查：树中存在但矩阵缺失（应用别名 + TimeTree 清理后）
-    missing_in_matrix = [s for s in leaf_order if s not in set(kept_in_matrix)]
-    if missing_in_matrix:
-        raise ValueError(f"[ERR] 超时钟树中的物种在 family.tsv 中缺失（请在 config.species.alias_map 补别名或检查发布包）：{missing_in_matrix}")
+    # ------- 5. 检查：树上的物种是否都在 family 中出现 -------
+    missing_in_family = sorted(leaf_set - set(col_canon))
+    if missing_in_family:
+        msg = ", ".join(missing_in_family[:10])
+        raise RuntimeError(
+            "[ERR] family.tsv 中缺少以下树上物种的列，请检查物种命名与 alias_map："
+            f"{msg}（共 {len(missing_in_family)} 个）"
+        )
 
-    # ---------- 构建目标列顺序：严格按树叶顺序 ----------
-    target_cols = list(leaf_order)
+    # 最终使用的物种列顺序：严格按树的叶顺序来（如果树上有但 family 中没有，前面已报错）
+    target_species: List[str] = [sp for sp in leaf_order if sp in idx_by_sp]
 
-    # 构建“标准名 -> 原始索引列表”（用于别名合并求和）
-    idx_map: Dict[str, List[int]] = {}
-    for idx, cname in enumerate(species_norm):
-        if cname in leaf_set:  # 仅收集树内物种
-            idx_map.setdefault(cname, []).append(idx)
+    log.info(f"[FAMILY] 原始物种列数：{len(data_cols_no_total)}；"
+             f"树上物种数：{len(leaf_order)}；"
+             f"最终使用物种列数：{len(target_species)}")
 
-    # ---------- 逐行清洗并输出新 family.tsv ----------
-    out_family = Path(outdir) / Path(family).name
+    # ------- 6. 写出新的 family.tsv（带 Desc 列） -------
+    out_family = outdir / Path(family).name
+    n_rows = 0
+    kept_rows = 0
+
     with out_family.open("w", encoding="utf-8") as w:
-        # 写新的表头：Orthogroup + 按树顺序排列的物种列
-        w.write("Orthogroup\t" + "\t".join(target_cols) + "\n")
-        for og, row_vals in iter_tsv_rows(family):
-            # row_vals 与 species_wo_total 对齐；聚合到 target_cols
-            # 为所有目标物种准备 0
-            agg: Dict[str, int] = {sp: 0 for sp in target_cols}
-            # 对于每个标准物种，把映射到它的所有原始列求和
-            for sp, id_list in idx_map.items():
+        # 表头：Desc + 家族ID列名统一用 Orthogroup（仅列名，内部不改 ID）
+        w.write("Desc\tOrthogroup\t" + "\t".join(target_species) + "\n")
+
+        for og, vals_all in iter_tsv_rows(family):
+            n_rows += 1
+            # 与 data_cols_no_total 对齐：只取前 len(data_cols_no_total) 个值
+            if len(vals_all) < len(data_cols_no_total):
+                # 不足时右侧补零（非常保守的做法）
+                vals = vals_all + ["0"] * (len(data_cols_no_total) - len(vals_all))
+            else:
+                vals = vals_all[:len(data_cols_no_total)]
+
+            # 每个物种的拷贝数 = 属于该物种的所有列之和
+            counts_per_sp: List[str] = []
+            for sp in target_species:
+                idx_list = idx_by_sp[sp]
                 s = 0
-                for j in id_list:
-                    if j < len(row_vals):
-                        s += safe_int(row_vals[j])
-                agg[sp] = s
-            # 按目标顺序写出
-            w.write(og + "\t" + "\t".join(str(agg[sp]) for sp in target_cols) + "\n")
+                for idx in idx_list:
+                    s += safe_int(vals[idx])
+                counts_per_sp.append(str(s))
 
-    # ---------- 写入“清洁树”副本到 input/（不改原文件） ----------
-    # 仅清理 TimeTree 尾缀与引号，其余保持原状；别名标准化仅用于匹配，不改树文本
-    # 出于可追溯性，这里只做“去引号编号”的清洁版副本，文件名与原名保持一致
-    leaves_cleaned_text = tree_text
-    # 清除所有叶名中的 '数字' 尾缀（多次重复也清除）
-    leaves_cleaned_text = re.sub(r"(?:'[0-9]+')+", "", leaves_cleaned_text)
-    out_tree = Path(outdir) / Path(utree).name
-    out_tree.write_text(leaves_cleaned_text, encoding="utf-8")
+            # 不做额外过滤，所有 OG 原样写出
+            w.write("null\t" + str(og) + "\t" + "\t".join(counts_per_sp) + "\n")
+            kept_rows += 1
 
-    # ---------- 总结与收尾 ----------
-    log.info(f"[OK] 输出家族矩阵：{out_family}")
-    log.info(f"[OK] 输出超时钟树：{out_tree}（已移除 TimeTree 引号编号尾缀）")
-    log.info(f"[Summary] 目标物种数量：{len(target_cols)}；被丢弃的矩阵列数量（含 Total 与树外列）：{len(dropped_total) + len(extra_in_matrix)}")
+    log.info(f"[OUT] 写出 family：{out_family} （共 {kept_rows} 行；原始 {n_rows} 行）")
+
+    # ------- 7. 写出“清洁树”到 input 目录 -------
+    clean_tree = tree_text
+    for raw in leaf_order_raw:
+        canon = resolve(normalize_timetree_suffix(raw.strip()))
+        if raw != canon:
+            # 简单替换：在超时钟树中用标准名替换原始叶标（一般不会产生歧义）
+            clean_tree = clean_tree.replace(raw, canon)
+
+    out_tree = outdir / "utree_for_cafe.nwk"
+    out_tree.write_text(clean_tree, encoding="utf-8")
+    log.info(f"[OUT] 写出清洁树：{out_tree}")
+
+    # ------- 8. 写 sentinel -------
     write_done(Path(paths["cafe_run_dir"]) / ".prep.done")
     log.info("[DONE] CAFE5 输入准备完成")
 
@@ -269,5 +309,6 @@ if __name__ == "__main__":
     try:
         main()
     except Exception as e:
-        sys.stderr.write(str(e) + "\n"); sys.exit(2)
+        sys.stderr.write(str(e) + "\n")
+        sys.exit(2)
 
