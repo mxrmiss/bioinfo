@@ -2,67 +2,71 @@
 # -*- coding: utf-8 -*-
 
 """
-12_cafe5_run_models.py —— CAFE5 教程增强版（两阶段 / 极端家族修剪 / 失败率统计，流式输出版）
+12_cafe5_run_models.py —— 运行 CAFE5（教程增强版：两阶段 large / 自动剔除极端家族 / 标记高失败 OG）
 
-功能总览（与 config.yaml.cafe5 对应）：
-  1) 读取 config.yaml 中的 cafe5 & paths 配置。
-  2) 从 results/06_cafe/input/ 读取：
-       - family.tsv            （第一列为 Desc = OG ID）
-       - utree_for_cafe.nwk    （超时树）
-  3) 可选“教程增强”：
-       - two_stage_large.enable:
-           按 copy_threshold 拆分为 primary 与 large 两个 family 表。
-       - autofix_rounds:
-           每个集合做若干轮“极端家族自动删除”：
-             * 解析 CAFE5 日志中的
-                 “Families with largest size differentials:”
-               区块，拿到 OG 列表；
-             * 从 family 表中删掉这些 OG，生成 family.autofix*.tsv；
-             * 直到 CAFE5 不再提示 “You may want to try removing...”
-               或达到 max_rounds。
-       - 解析高失败率家族：
-             “The following families had failure rates >20% of the time:”
-         输出 flags/high_fail_ogs.list。
-  4) 针对每个模型（默认只有 "global"）创建目录：
-       results/06_cafe/models/<model>/
-         ├─ family.primary.tsv
-         ├─ family.large.tsv
-         ├─ primary_global/
-         │     ├─ Gamma_*.txt/tre…
-         │     └─ run.log
-         ├─ large/                  （若 large 非空才跑，同样有 run.log）
-         ├─ flags/high_fail_ogs.list
-         ├─ sentinels/
-         └─ （模型级别 .done 哨兵）
-  5) 全部模型成功后，在 cafe_run_dir 下写入 .cafe.done 哨兵。
+核心特性：
+  1) 支持 config.cafe5.models 中的多个模型（目前皇上一般只用 "global"）；
+  2) 自动拆分 large 家族（copy 数 >= copy_threshold）：
+       - primary 部分：family.primary.tsv  -> primary_global/ 目录
+       - large   部分：family.large.tsv    -> large/ 目录
+  3) 自动多轮剔除极端家族：
+       - 检测日志中的 "Failed to initialize any reasonable values" +
+         "Families with largest size differentials" 区块，
+         每轮删除若干 OG，最多 max_autofix_rounds 轮；
+       - 被删除的家族写入：
+           flags/extreme_ogs_roundN.list
+           autofix_removed_roundN.tsv
+       - 每轮的测试运行放在 _roundN_tmp/ 目录，最终稳定结果放在 primary_global/。
+  4) 记录高失败率 OG：
+       - 解析 "The following families had failure rates >20% of the time" 区域，
+         收集 OG 列表，写入 flags/high_fail_ogs.list（供 13 脚本使用）。
+  5) 日志：
+       - 主日志：paths.logs_dir/12_cafe5_run_models.log
+       - 流式输出：CAFE5 的输出逐行同步到屏幕和日志（不会“憋大招”）。
+  6) 输出路径已缩短：
+       - CAFE5 调用统一使用 "-o ."，产物直接落在 primary_global/ 或 large/ 下，
+         不再多出一层 results/ 子目录。
 
-注意：
-  - 不接受命令行参数，所有参数集中在 config.yaml 顶部。
+配置约定（config.yaml 中 cafe5 小节）：
+  cafe5:
+    enable: true
+    threads: 30
+    gamma_k: 3          # -k
+    pvalue:  0.05       # -P
+    models:
+      - "global"
+
+    # 自动修正轮数（可选，默认 0 表示不自动修正）
+    max_autofix_rounds: 3
+
+    # 两阶段：拆分 large 家族（可选）
+    two_stage_large:
+      enable: true
+      copy_threshold: 100      # 某物种 copy >= 该值 → 认为是 large 家族
+      keep_strategy: "split"   # 目前只实现 split；其它值等价于 split
+      primary_tag: "primary"   # 仅用于日志标签
+      large_tag:   "large"
+
+其它配置（paths、binaries 部分）与之前脚本保持一致。
 """
 
 from __future__ import annotations
-
-import os
 import sys
 import io
+import logging
+import subprocess
 import re
 import shutil
-import subprocess
-import logging
-import datetime
 from pathlib import Path
 from typing import Dict, Any, List, Tuple, Optional
 
 import yaml
 
-
-# ======================== 通用工具 ========================
-
 DEFAULT_CONFIG = "config.yaml"
 
+# ====================== 通用工具：配置、路径、日志 ======================
 
 def _expand_publish_placeholders(obj, publish_dir: str):
-    """把 <publish_dir> 占位符替换成真实路径。"""
     if isinstance(obj, str):
         return obj.replace("<publish_dir>", publish_dir)
     if isinstance(obj, list):
@@ -73,7 +77,7 @@ def _expand_publish_placeholders(obj, publish_dir: str):
 
 
 def load_config(config_path: str = DEFAULT_CONFIG) -> Dict[str, Any]:
-    """读取 YAML 配置，并展开 publish_dir 占位符。"""
+    """读取 config.yaml，并展开 <publish_dir> 占位符。"""
     p = Path(config_path)
     if not p.exists():
         raise FileNotFoundError(f"[ERR] 未找到配置文件：{p}")
@@ -85,34 +89,57 @@ def load_config(config_path: str = DEFAULT_CONFIG) -> Dict[str, Any]:
 
 
 def ensure_dir(p: Path) -> Path:
-    """确保目录存在。"""
     p.mkdir(parents=True, exist_ok=True)
     return p
 
 
+def need_dir(p: Path, what: str) -> Path:
+    p = Path(p)
+    if not p.is_dir():
+        raise FileNotFoundError(f"[ERR] 缺少目录：{what} -> {p}")
+    return p
+
+
+def need_file(p: Path, what: str) -> Path:
+    p = Path(p)
+    if not p.is_file():
+        raise FileNotFoundError(f"[ERR] 缺少文件：{what} -> {p}")
+    return p
+
+
+def clean_dir(p: Path):
+    """清空目录（保留目录本身）。"""
+    if p.is_dir():
+        for child in p.iterdir():
+            if child.is_dir():
+                shutil.rmtree(child)
+            else:
+                try:
+                    child.unlink()
+                except FileNotFoundError:
+                    pass
+    p.mkdir(parents=True, exist_ok=True)
+
+
 def get_logger(name: str, logfile: Path, level: int = logging.INFO) -> logging.Logger:
-    """同时打日志到文件 + 终端。"""
+    """日志写文件 + 同步屏幕，并将 stdout/stderr 包装成自动 flush。"""
     ensure_dir(logfile.parent)
-    logger = logging.getLogger(name)
-    logger.setLevel(level)
-    logger.handlers.clear()
+    lg = logging.getLogger(name)
+    lg.setLevel(level)
+    lg.handlers.clear()
 
     fmt = logging.Formatter(
-        "[%(asctime)s] %(levelname)s - %(message)s",
-        "%Y-%m-%d %H:%M:%S",
+        "[%(asctime)s] %(levelname)s - %(message)s", "%Y-%m-%d %H:%M:%S"
     )
-
     fh = logging.FileHandler(logfile, encoding="utf-8")
     fh.setFormatter(fmt)
     fh.setLevel(level)
-    logger.addHandler(fh)
-
     sh = logging.StreamHandler(stream=sys.stdout)
     sh.setFormatter(fmt)
     sh.setLevel(level)
-    logger.addHandler(sh)
+    lg.addHandler(fh)
+    lg.addHandler(sh)
 
-    # 让 print 也立即 flush
     class _Flush(io.TextIOBase):
         def __init__(self, s):
             self.s = s
@@ -124,514 +151,482 @@ def get_logger(name: str, logfile: Path, level: int = logging.INFO) -> logging.L
 
     sys.stdout = _Flush(sys.stdout)
     sys.stderr = _Flush(sys.stderr)
-    return logger
+    return lg
 
 
-def banner(log: logging.Logger, text: str):
+def banner(logger: logging.Logger, text: str):
     bar = "=" * max(10, len(text) + 2)
-    log.info(bar)
-    log.info(f" {text} ")
-    log.info(bar)
+    logger.info(bar)
+    logger.info(f" {text} ")
+    logger.info(bar)
 
 
-# ======================== family.tsv 处理 ========================
+def write_done(path: Path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    Path(path).touch()
+
+
+# ====================== CAFE5 辅助：日志解析 ======================
+
+def parse_extreme_ogs_from_text(text: str) -> List[str]:
+    """
+    从 CAFE5 输出中解析“极端家族”（Families with largest size differentials 块）。
+    逻辑：取最后一个块，将其中的 OG0000012: 460 之类提取出来。
+    """
+    blocks = re.findall(
+        r"Families with largest size differentials:\s*\n((?:.*OG\d+:\s*\d+\s*\n)+)",
+        text,
+        flags=re.I,
+    )
+    if not blocks:
+        return []
+    last = blocks[-1]
+    ogs: List[str] = []
+    for m in re.finditer(r"(OG\d+)\s*:\s*(\d+)", last):
+        ogs.append(m.group(1))
+    return ogs
+
+
+def parse_high_fail_ogs_from_text(text: str) -> List[str]:
+    """
+    从输出中解析“失败率 >20%”的家族列表，返回 OG ID 列表。
+    """
+    lines = text.splitlines()
+    res: List[str] = []
+    flag = False
+    for ln in lines:
+        if "The following families had failure rates >20% of the time" in ln:
+            flag = True
+            continue
+        if not flag:
+            continue
+        if not ln.strip():
+            # 空行结束该块
+            break
+        m = re.search(r"(OG\d+)\s+had\s+(\d+)\s+failures", ln)
+        if m:
+            res.append(m.group(1))
+    return res
+
+
+def run_cafe_streaming(
+    cmd: List[str],
+    work_dir: Path,
+    log: logging.Logger,
+    model_tag: str,
+    round_tag: str = "",
+) -> str:
+    """
+    以流式方式运行 CAFE5：
+      - 实时将 stdout 写入 logger（屏幕 + 日志）；
+      - 将所有输出累积为字符串返回，用于后续正则解析。
+    """
+    tag = f"[MODEL={model_tag}{(' ' + round_tag) if round_tag else ''}]"
+    log.info(f"{tag} CMD: " + " ".join(map(str, cmd)))
+
+    proc = subprocess.Popen(
+        cmd,
+        cwd=str(work_dir),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+        universal_newlines=True,
+    )
+
+    stdout_lines: List[str] = []
+    log.info(f"{tag} ---- CAFE5 输出开始 ----")
+
+    assert proc.stdout is not None
+    for line in proc.stdout:
+        line = line.rstrip("\n")
+        stdout_lines.append(line)
+        log.info(f"{tag} {line}")
+
+    proc.wait()
+    log.info(f"{tag} ---- CAFE5 输出结束 ----")
+
+    text = "\n".join(stdout_lines)
+
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"[ERR] CAFE5 退出码 {proc.returncode}：模型 {model_tag}；请查看日志。"
+        )
+
+    return text
+
+
+# ====================== CAFE5 辅助：family 拆分与修正 ======================
 
 def split_family_primary_large(
     family_tsv: Path,
-    out_primary: Path,
-    out_large: Path,
+    mdir: Path,
     copy_threshold: int,
+    keep_strategy: str,
     log: logging.Logger,
-) -> Tuple[int, int]:
+    model: str,
+) -> Tuple[Path, Optional[Path]]:
     """
-    按“单物种最大拷贝数阈值”拆分 family.tsv 为 primary 与 large 两个集合。
+    根据 copy_threshold 拆分 family.tsv 为 primary / large 两份，
+    并写入模型目录下：
+      - family.primary.tsv
+      - family.large.tsv （若有 large 家族）
+    返回 (primary_path, large_path_or_None)。
+    """
+    keep_strategy = (keep_strategy or "split").lower()
+    tag = f"[MODEL {model}]"
 
-    约定：
-      - 第一列为 Desc = OG ID（字符串），从第二列开始都是各物种拷贝数。
-      - copy_threshold: 若某行任一物种基因数 >= 阈值，则划入 large 集合。
-    """
-    txt = family_tsv.read_text(encoding="utf-8").rstrip("\n").splitlines()
+    txt = family_tsv.read_text(encoding="utf-8").splitlines()
     if not txt:
         raise RuntimeError(f"[ERR] family.tsv 为空：{family_tsv}")
 
     header = txt[0]
+    rows = txt[1:]
+
     primary_lines = [header]
     large_lines = [header]
+    large_n = 0
 
-    for ln in txt[1:]:
+    for ln in rows:
         if not ln.strip():
             continue
-        cols = ln.rstrip("\n").split("\t")
-        if len(cols) <= 1:
-            primary_lines.append(ln)
-            continue
+        parts = ln.rstrip("\n").split("\t")
+        # 皇上确认：首列一定是 Desc（OG ID），后面都是拷贝数（整数或 0）
         counts = []
-        for c in cols[1:]:
-            c = c.strip()
-            if c in ("", ".", "NA", "NaN", "-", "?"):
-                continue
-            try:
-                counts.append(int(c))
-            except ValueError:
-                # 非数字一律忽略，不参与 max
-                continue
-        max_cnt = max(counts) if counts else 0
-        if max_cnt >= copy_threshold:
-            large_lines.append(ln)
+        for x in parts[1:]:
+            x = x.strip()
+            if not x:
+                counts.append(0)
+            else:
+                try:
+                    counts.append(int(x))
+                except Exception:
+                    counts.append(0)
+        max_copy = max(counts) if counts else 0
+
+        if max_copy >= copy_threshold:
+            large_lines.append(ln.rstrip("\n"))
+            large_n += 1
         else:
-            primary_lines.append(ln)
+            primary_lines.append(ln.rstrip("\n"))
 
-    out_primary.write_text("\n".join(primary_lines) + "\n", encoding="utf-8")
-    out_large.write_text("\n".join(large_lines) + "\n", encoding="utf-8")
+    primary_path = mdir / "family.primary.tsv"
+    primary_path.write_text("\n".join(primary_lines) + "\n", encoding="utf-8")
 
-    n_primary = max(0, len(primary_lines) - 1)
-    n_large = max(0, len(large_lines) - 1)
+    large_path: Optional[Path] = None
+    if keep_strategy == "split" and large_n > 0:
+        large_path = mdir / "family.large.tsv"
+        large_path.write_text("\n".join(large_lines) + "\n", encoding="utf-8")
+
     log.info(
-        f"[SPLIT] 阈值 {copy_threshold}: primary={n_primary} 行, large={n_large} 行"
+        f"{tag} 拆分完成：primary {len(primary_lines)-1} 行，large {large_n} 行；"
+        f"阈值 copy_threshold={copy_threshold}"
     )
-    return n_primary, n_large
+    return primary_path, large_path
 
 
-# ======================== CAFE5 调用与解析 ========================
-
-# 注意：Python 的 re 不支持 \R，这里用 (?:\r?\n) 匹配换行
-EXTREME_BLOCK_RE = re.compile(
-    r"Families with largest size differentials:\s*(?:\r?\n)"
-    r"((?:.*OG\d+:\s*\d+(?:\r?\n))+)",
-    flags=re.M,
-)
-
-OG_KV_RE = re.compile(r"(OG\d+)\s*:\s*(\d+)")
-
-FAIL_BLOCK_RE = re.compile(
-    r"The following families had failure rates >20% of the time:\s*(?:\r?\n)"
-    r"((?:.*OG\d+\s+had\s+\d+\s+failures(?:\r?\n))+)",
-    flags=re.M,
-)
-
-FAIL_LINE_RE = re.compile(r"(OG\d+)\s+had\s+(\d+)\s+failures")
-
-
-def run_cafe_once(
-    cafe_bin: str,
-    family_tsv: Path,
-    tree_nwk: Path,
-    threads: int,
-    gamma_k: int,
-    pvalue: float,
-    cwd: Path,
-    log: logging.Logger,
-    label: str,
-) -> str:
-    """
-    跑一次 CAFE5（流式输出版）：
-
-      - family_tsv 与 tree_nwk 一律用绝对路径，避免 cwd 更改导致找不到文件；
-      - 使用 subprocess.Popen 行行读取，实时把 CAFE5 输出：
-          * 打到屏幕（logger）
-          * 写入 cwd/run.log
-      - 同时累积所有 stdout 文本，供后续解析极端家族 / 高失败率使用。
-    """
-    ensure_dir(cwd)
-    family_abs = family_tsv.resolve()
-    tree_abs = tree_nwk.resolve()
-
-    cmd = [
-        cafe_bin,
-        "-i",
-        str(family_abs),
-        "-t",
-        str(tree_abs),
-        "-c",
-        str(threads),
-        "-k",
-        str(gamma_k),
-        "-P",
-        str(pvalue),
-    ]
-    log.info(f"[CMD][{label}] {' '.join(cmd)} (cwd={cwd})")
-
-    # 提前打开 run.log（追加）
-    runlog = cwd / "run.log"
-    fh = runlog.open("a", encoding="utf-8")
-    fh.write(f"================ MODEL={label} =================\n")
-    fh.flush()
-
-    # 流式读取 CAFE5 输出
-    proc = subprocess.Popen(
-        cmd,
-        cwd=str(cwd),
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        bufsize=1,
-    )
-
-    stdout_lines: List[str] = []
-
-    assert proc.stdout is not None
-    for line in proc.stdout:
-        # 去掉尾部换行，避免 log 叠两层换行
-        clean = line.rstrip("\n")
-        stdout_lines.append(clean)
-
-        # 写 run.log（保留原始行）
-        fh.write(line)
-        fh.flush()
-
-        # 同步打到总日志 / 屏幕
-        log.info(f"[{label}] {clean}")
-
-    proc.wait()
-    fh.write("\n")  # 分隔一下不同轮次
-    fh.close()
-
-    if proc.returncode != 0:
-        raise RuntimeError(f"[ERR] CAFE5 运行失败（{label}），退出码 {proc.returncode}")
-
-    return "\n".join(stdout_lines)
-
-
-def parse_extreme_ogs(stdout_text: str) -> List[str]:
-    """
-    从 CAFE5 输出中解析“极端家族” OG 列表（取最后一个块）。
-    """
-    blocks = EXTREME_BLOCK_RE.findall(stdout_text)
-    if not blocks:
-        return []
-    last_blk = blocks[-1]
-    ogs: List[str] = []
-    for m in OG_KV_RE.finditer(last_blk):
-        ogs.append(m.group(1))
-    return ogs
-
-
-def drop_ogs_from_family(
-    in_tsv: Path,
-    out_tsv: Path,
-    removed_list_tsv: Path,
-    og_ids: List[str],
-    log: logging.Logger,
+def remove_ogs_from_family(
+    src_family: Path,
+    dst_family: Path,
+    ogs_to_drop: List[str],
 ) -> int:
     """
-    从 family.tsv 中删除指定 OG（按第一列 Desc 精确匹配），并写出新表与删除列表。
-    返回删除的行数。
+    从 family TSV 中删除指定 OG（首列为 Desc），返回删除的行数。
     """
-    if not og_ids:
-        return 0
-    og_set = set(og_ids)
-
-    txt = in_tsv.read_text(encoding="utf-8").rstrip("\n").splitlines()
+    og_set = set(ogs_to_drop)
+    txt = src_family.read_text(encoding="utf-8").splitlines()
     if not txt:
-        raise RuntimeError(f"[ERR] family 文件为空：{in_tsv}")
-
+        return 0
     header = txt[0]
-    kept = [header]
-    removed = [header]
+    rows = txt[1:]
 
-    n_removed = 0
-    for ln in txt[1:]:
+    kept = [header]
+    removed = 0
+    for ln in rows:
         if not ln.strip():
             continue
-        cols = ln.split("\t")
-        desc = cols[0].strip() if cols else ""
-        if desc in og_set:
-            removed.append(ln)
-            n_removed += 1
-        else:
-            kept.append(ln)
-
-    out_tsv.write_text("\n".join(kept) + "\n", encoding="utf-8")
-    removed_list_tsv.write_text("\n".join(removed) + "\n", encoding="utf-8")
-    log.info(
-        f"[FILTER] {in_tsv.name}: 解析到 {len(og_ids)} 个极端 OG，实际删除 {n_removed} 行，写入 {out_tsv.name}"
-    )
-    return n_removed
-
-
-def parse_high_fail_ogs(stdout_text: str) -> List[str]:
-    """
-    解析“失败率 >20%”的 OG 列表（最后一个块）。
-    """
-    blocks = FAIL_BLOCK_RE.findall(stdout_text)
-    if not blocks:
-        return []
-    last_blk = blocks[-1]
-    ogs: List[str] = []
-    for m in FAIL_LINE_RE.finditer(last_blk):
-        ogs.append(m.group(1))
-    return ogs
-
-
-def ensure_gamma_results(out_dir: Path):
-    """
-    确认 Gamma_* 结果文件存在，否则视为 CAFE5 异常结束。
-    """
-    gamma = out_dir / "Gamma_results.txt"
-    if not gamma.is_file():
-        raise RuntimeError(f"[ERR] 未找到 Gamma_results.txt：{gamma}")
-
-
-def run_with_autofix(
-    cafe_bin: str,
-    family_tsv: Path,
-    tree_nwk: Path,
-    threads: int,
-    gamma_k: int,
-    pvalue: float,
-    cwd: Path,
-    log: logging.Logger,
-    label_prefix: str,
-    max_autofix_rounds: int,
-    model_dir: Path,
-) -> Tuple[str, List[str]]:
-    """
-    针对一个 family 表执行多轮 CAFE5 + 自动极端家族剔除。
-
-    返回：
-      - 最后一轮 CAFE5 的 stdout
-      - 高失败率 OG 列表（来自最后一轮）
-    """
-    current_tsv = family_tsv
-    stdout_last = ""
-    high_fail_ogs: List[str] = []
-
-    for rnd in range(1, max_autofix_rounds + 1):
-        label = f"{label_prefix} ROUND-{rnd}"
-        log.info(f"[{label}] ---- CAFE5 输出开始 ----")
-        stdout_last = run_cafe_once(
-            cafe_bin=cafe_bin,
-            family_tsv=current_tsv,
-            tree_nwk=tree_nwk,
-            threads=threads,
-            gamma_k=gamma_k,
-            pvalue=pvalue,
-            cwd=cwd,
-            log=log,
-            label=label,
-        )
-        log.info(f"[{label}] ---- CAFE5 输出结束 ----")
-
-        # 尝试解析极端家族
-        extreme_ogs = parse_extreme_ogs(stdout_last)
-        need_suggest = (
-            "You may want to try removing the top few families" in stdout_last
-            or "Failed to initialize any reasonable values" in stdout_last
-        )
-
-        if need_suggest and extreme_ogs and rnd < max_autofix_rounds:
-            # 进行下一轮 autofix
-            new_tsv = model_dir / f"family.autofix{rnd}.tsv"
-            removed_tsv = model_dir / f"autofix_removed_round{rnd}.tsv"
-            n_removed = drop_ogs_from_family(
-                in_tsv=current_tsv,
-                out_tsv=new_tsv,
-                removed_list_tsv=removed_tsv,
-                og_ids=extreme_ogs,
-                log=log,
-            )
-            if n_removed == 0:
-                # 解析到了 OG，但 family 表中一个都删不掉，说明列格式有问题
-                raise RuntimeError(
-                    "[ERR] 解析到极端 OG，但在 family.tsv 中未命中任何行，请检查首列是否为 OG ID/分隔符是否为 TAB。"
-                )
-            log.info(
-                f"[CLEAN] 第 {rnd} 轮自动修正完成，进入下一轮。"
-            )
-            current_tsv = new_tsv
+        parts = ln.rstrip("\n").split("\t")
+        og = parts[0].strip()
+        if og in og_set:
+            removed += 1
             continue
-        else:
-            if need_suggest and rnd == max_autofix_rounds:
-                log.warning(
-                    f"[WARN] 已达到 max_autofix_rounds={max_autofix_rounds}，"
-                    f"仍然检测到 CAFE5 建议删除极端家族，请人工检查 family.tsv。"
-                )
+        kept.append(ln.rstrip("\n"))
+
+    dst_family.write_text("\n".join(kept) + "\n", encoding="utf-8")
+    return removed
+
+
+# ====================== 主流程：单模型运行（含多轮自动修正） ======================
+
+def run_model_with_autofix(
+    model: str,
+    cafe_bin: str,
+    tree_path: Path,
+    family_orig: Path,
+    out_root: Path,
+    threads: int,
+    gamma_k: Optional[int],
+    pvalue: Optional[float],
+    max_autofix_rounds: int,
+    log: logging.Logger,
+):
+    """
+    针对某一个 model（例如 "global"）：
+      - 以 family_orig 为起点，最多进行 max_autofix_rounds 轮自动剔除极端家族；
+      - 每轮运行 CAFE5，输出放到 _roundN_tmp/ 目录；
+      - 最终稳定轮结果移入 primary_global/；
+      - 解析 high-fail OG，写 flags/high_fail_ogs.list。
+    """
+    tag = f"[MODEL={model}]"
+    mdir = ensure_dir(out_root / model)
+    flags_dir = ensure_dir(mdir / "flags")
+    sentinels = ensure_dir(mdir / "sentinels")
+    primary_dir = ensure_dir(mdir / "primary_global")
+    large_dir = ensure_dir(mdir / "large")
+
+    # 开跑前：清空 primary_global / large / sentinels 目录（flags 保留历史标记）
+    clean_dir(primary_dir)
+    clean_dir(large_dir)
+    clean_dir(sentinels)
+
+    # 先根据 two_stage_large 把 family 拆成 primary / large
+    # 注意：family_orig 是 paths.cafe_run_dir/input/family.tsv
+    cfg = load_config()
+    cafe_cfg = cfg.get("cafe5", {}) or {}
+    two_stage = cafe_cfg.get("two_stage_large", {}) or {}
+    ts_enable = bool(two_stage.get("enable", False))
+    copy_threshold = int(two_stage.get("copy_threshold", 0) or 0)
+    keep_strategy = str(two_stage.get("keep_strategy", "split") or "split")
+
+    if ts_enable and copy_threshold > 0:
+        family_primary, family_large = split_family_primary_large(
+            family_orig,
+            mdir,
+            copy_threshold=copy_threshold,
+            keep_strategy=keep_strategy,
+            log=log,
+            model=model,
+        )
+    else:
+        # 不拆分，primary 就是原始 family，large 为空
+        family_primary = family_orig
+        (mdir / "family.primary.tsv").write_text(
+            family_orig.read_text(encoding="utf-8"), encoding="utf-8"
+        )
+        family_large = None
+        log.info(f"{tag} two_stage_large 关闭或阈值为 0，本轮不拆分 large 家族。")
+
+    # ---------------- 第一部分：primary + 自动剔除极端 OG ----------------
+
+    current_family = family_primary
+    extreme_total: List[str] = []
+
+    rounds = max(0, int(max_autofix_rounds or 0))
+    if rounds == 0:
+        rounds = 1  # 至少跑一轮（不做剔除）
+
+    final_success = False
+    last_stdout = ""
+
+    for r in range(1, rounds + 1):
+        round_tag = f"PRIMARY-GLOBAL ROUND-{r}"
+        tmp_dir = ensure_dir(mdir / f"_round{r}_tmp")
+        clean_dir(tmp_dir)
+
+        cmd = [
+            cafe_bin,
+            "-i",
+            str(current_family.resolve()),
+            "-t",
+            str(tree_path.resolve()),
+            "-c",
+            str(threads),
+            "-o",
+            ".",  # 结果直接写到 tmp_dir
+        ]
+        if gamma_k:
+            cmd += ["-k", str(gamma_k)]
+        if pvalue is not None:
+            cmd += ["-P", str(pvalue)]
+
+        log.info(f"{tag} [{round_tag}] CAFE5 启动准备")
+        stdout_text = run_cafe_streaming(cmd, tmp_dir, log, model_tag=model, round_tag=round_tag)
+        last_stdout = stdout_text
+
+        # 检查是否还有 “Failed to initialize any reasonable values”
+        if "Failed to initialize any reasonable values" not in stdout_text:
+            log.info(f"{tag} [{round_tag}] 未检测到初始化失败提示，视为稳定轮。")
+            # 将 tmp_dir 中的结果文件全部移入 primary_global/
+            clean_dir(primary_dir)
+            for p in tmp_dir.iterdir():
+                target = primary_dir / p.name
+                if target.exists():
+                    if target.is_dir():
+                        shutil.rmtree(target)
+                    else:
+                        target.unlink()
+                shutil.move(str(p), str(target))
+            final_success = True
             break
 
-    # 确认结果文件存在
-    ensure_gamma_results(cwd)
+        if r >= rounds:
+            # 已达最大修正轮数，仍然失败 → 报错
+            log.error(
+                f"{tag} [{round_tag}] 仍存在 'Failed to initialize any reasonable values'，"
+                f"且已达到最大自动修正轮数（{rounds}）。"
+            )
+            raise RuntimeError(
+                f"[ERR] 模型 {model} 自动修正用尽仍失败，请检查 family.tsv/树/物种匹配情况。"
+            )
 
-    # 最后一轮解析高失败率 OG
-    high_fail_ogs = parse_high_fail_ogs(stdout_last)
+        # 解析极端 OG 并生成下一轮 family
+        ogs = parse_extreme_ogs_from_text(stdout_text)
+        if not ogs:
+            log.error(
+                f"{tag} [{round_tag}] 检测到初始化失败，但未能解析出任何极端家族 OG。"
+            )
+            raise RuntimeError(
+                f"[ERR] 模型 {model} 无法从日志中提取极端 OG，请检查 CAFE5 输出。"
+            )
+
+        extreme_total.extend(ogs)
+        (flags_dir / f"extreme_ogs_round{r}.list").write_text(
+            "\n".join(ogs) + "\n", encoding="utf-8"
+        )
+
+        next_family = mdir / f"family.autofix{r}.tsv"
+        removed = remove_ogs_from_family(current_family, next_family, ogs_to_drop=ogs)
+        log.info(
+            f"{tag} [FILTER] {next_family.name}: 从 {current_family.name} 删除 {removed} 行 OG，得到 {next_family.name}"
+        )
+        (mdir / f"autofix_removed_round{r}.tsv").write_text(
+            "OG\n" + "\n".join(ogs) + "\n", encoding="utf-8"
+        )
+
+        current_family = next_family
+        log.info(
+            f"{tag} [CLEAN] 第 {r} 轮自动修正完成，进入下一轮。"
+        )
+
+    if not final_success:
+        raise RuntimeError(
+            f"[ERR] 模型 {model} 未能获得稳定 primary_global 结果，请检查日志。"
+        )
+
+    # ---------------- 第二部分：标记高失败家族（primary） ----------------
+
+    high_fail_ogs = parse_high_fail_ogs_from_text(last_stdout)
     if high_fail_ogs:
-        log.info(f"[QC] 检测到高失败率家族 {len(high_fail_ogs)} 个。")
+        (flags_dir / "high_fail_ogs.list").write_text(
+            "\n".join(high_fail_ogs) + "\n", encoding="utf-8"
+        )
+        log.info(
+            f"{tag} 标记 high-fail 家族 {len(high_fail_ogs)} 个（failure rate >20%），"
+            f"写入 {flags_dir/'high_fail_ogs.list'}"
+        )
+    else:
+        log.info(f"{tag} 未检测到 high-fail 家族（failure rate >20% 区块缺失或为空）。")
 
-    return stdout_last, high_fail_ogs
+    # ---------------- 第三部分：large 家族（若存在） ----------------
+
+    if (mdir / "family.large.tsv").is_file():
+        family_large = mdir / "family.large.tsv"
+        if family_large.stat().st_size > 0:
+            clean_dir(large_dir)
+            round_tag = "LARGE"
+            cmd = [
+                cafe_bin,
+                "-i",
+                str(family_large.resolve()),
+                "-t",
+                str(tree_path.resolve()),
+                "-c",
+                str(threads),
+                "-o",
+                ".",  # 直接输出到 large_dir
+            ]
+            if gamma_k:
+                cmd += ["-k", str(gamma_k)]
+            if pvalue is not None:
+                cmd += ["-P", str(pvalue)]
+
+            log.info(f"{tag} [{round_tag}] 开始对 large 家族单独跑 CAFE5")
+            _ = run_cafe_streaming(cmd, large_dir, log, model_tag=model, round_tag=round_tag)
+            log.info(f"{tag} [{round_tag}] large 家族 CAFE5 完成。")
+        else:
+            log.info(f"{tag} large 家族文件为空，跳过第二阶段。")
+    else:
+        log.info(f"{tag} 未检测到 large 家族文件 family.large.tsv，跳过第二阶段。")
+
+    # sentinel：标记该 model 已完成
+    (sentinels / "primary_global.done").write_text("ok\n", encoding="utf-8")
+    log.info(f"{tag} primary_global & large 全部完成。")
 
 
-# ======================== 主逻辑 ========================
+# ====================== 入口函数 ======================
 
 def main():
     cfg = load_config()
     paths = cfg["paths"]
     cafe_cfg = cfg.get("cafe5", {}) or {}
 
-    cafe_enable = bool(cafe_cfg.get("enable", True))
-    threads = int(cafe_cfg.get("threads", 4))
-    gamma_k = int(cafe_cfg.get("gamma_k", 3))
-    pvalue = float(cafe_cfg.get("pvalue", 0.05))
-    models = cafe_cfg.get("models", ["global"]) or ["global"]
-    max_autofix_rounds = int(cafe_cfg.get("autofix_rounds", 1))
+    logs_dir = Path(paths["logs_dir"])
+    log = get_logger("aphylo.12", logs_dir / "12_cafe5_run_models.log")
+    banner(log, "APhylo 12 — CAFE5（教程增强版）")
 
-    two_stage_cfg = cafe_cfg.get("two_stage_large", {}) or {}
-    two_stage_enable = bool(two_stage_cfg.get("enable", False))
-    copy_threshold = int(two_stage_cfg.get("copy_threshold", 100))
-
-    # 其它增强（本脚本目前不深入使用，预留）
-    error_cfg = cafe_cfg.get("error_model", {}) or {}
-    multi_cfg = cafe_cfg.get("multi_lambda", {}) or {}
-
-    cafe_run_dir = Path(paths["cafe_run_dir"]).resolve()
-    logs_dir = Path(paths["logs_dir"]).resolve()
-
-    # 输入路径
-    input_dir = cafe_run_dir / "input"
-    family_tsv = input_dir / "family.tsv"
-    tree_nwk = input_dir / "utree_for_cafe.nwk"
-
-    if not cafe_enable:
-        ensure_dir(cafe_run_dir)
-        (cafe_run_dir / ".cafe.done").write_text(
-            "cafe5 disabled in config\n", encoding="utf-8"
-        )
+    # 若关闭 CAFE5，直接写 done
+    if not cafe_cfg.get("enable", True):
+        log.info("cafe5.enable = false —— 跳过本步。")
+        write_done(Path(paths["cafe_run_dir"]) / ".cafe.done")
         return
 
-    if not family_tsv.is_file():
-        raise FileNotFoundError(f"[ERR] family.tsv 不存在：{family_tsv}")
-    if not tree_nwk.is_file():
-        raise FileNotFoundError(f"[ERR] utree_for_cafe.nwk 不存在：{tree_nwk}")
+    threads = int(cafe_cfg.get("threads", 4) or 4)
+    gamma_k = cafe_cfg.get("gamma_k", None)
+    gamma_k = int(gamma_k) if gamma_k not in (None, "", "null") else None
+    pvalue = cafe_cfg.get("pvalue", None)
+    pvalue = float(pvalue) if pvalue not in (None, "", "null") else None
+    models = cafe_cfg.get("models", ["global"]) or ["global"]
+    max_autofix_rounds = int(cafe_cfg.get("max_autofix_rounds", 3) or 3)
 
-    # 日志
-    logger = get_logger("aphylo.12", logs_dir / "12_cafe5_run_models.log")
-    banner(logger, "APhylo 12 — CAFE5（教程增强版，流式输出）")
+    cafe_bin = cfg.get("binaries", {}).get("cafe5", "cafe5")
 
-    logger.info(f"[IN] family: {family_tsv}")
-    logger.info(f"[IN] tree:   {tree_nwk}")
-    logger.info(f"[CFG] threads = {threads}, gamma_k = {gamma_k}, pvalue = {pvalue}")
-    logger.info(f"[CFG] models = {models}")
-    logger.info(f"[CFG] max_autofix_rounds = {max_autofix_rounds}")
-    logger.info(
-        f"[CFG] two_stage_large.enable = {two_stage_enable}, "
-        f"copy_threshold = {copy_threshold}"
-    )
+    # 输入：family.tsv + utree_for_cafe.nwk
+    cafe_run_dir = Path(paths["cafe_run_dir"])
+    input_dir = need_dir(cafe_run_dir / "input", "CAFE 输入目录")
 
-    cafe_bin = shutil.which("cafe5") or shutil.which("cafexp")
-    if not cafe_bin:
-        raise RuntimeError("[ERR] 未在 PATH 中找到 cafe5/cafexp 可执行文件")
+    tsvs = sorted(input_dir.glob("*.tsv"))
+    if not tsvs:
+        raise FileNotFoundError("[ERR] CAFE 输入目录中未找到 family TSV（*.tsv）")
+    family = need_file(tsvs[0], "CAFE family.tsv")
 
-    models_root = cafe_run_dir / "models"
-    ensure_dir(models_root)
+    nwks = sorted(input_dir.glob("*.nwk"))
+    if not nwks:
+        raise FileNotFoundError("[ERR] CAFE 输入目录中未找到树文件（*.nwk）")
+    tree = need_file(nwks[0], "CAFE 超时钟树")
 
-    # 每个模型单独跑
+    log.info(f"[IN] family: {family.resolve()}")
+    log.info(f"[IN] tree:   {tree.resolve()}")
+    log.info(f"[CFG] max_autofix_rounds = {max_autofix_rounds}")
+
+    models_root = ensure_dir(cafe_run_dir / "models")
+
     for model in models:
-        model_dir = models_root / model
-        logger.info("")
-        logger.info(f"================ [MODEL {model}] 开始 ================")
-
-        # 若已有旧目录，重命名为备份，避免内容混在一起
-        if model_dir.exists():
-            ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-            backup = model_dir.with_name(f"{model_dir.name}.bak_{ts}")
-            logger.warning(f"[MODEL {model}] 检测到旧目录，重命名为 {backup}")
-            model_dir.rename(backup)
-        ensure_dir(model_dir)
-
-        # 预先准备 primary / large family 表
-        primary_tsv = model_dir / "family.primary.tsv"
-        large_tsv = model_dir / "family.large.tsv"
-
-        if two_stage_enable:
-            n_primary, n_large = split_family_primary_large(
-                family_tsv=family_tsv,
-                out_primary=primary_tsv,
-                out_large=large_tsv,
-                copy_threshold=copy_threshold,
-                log=logger,
-            )
-        else:
-            # 不拆分：全部写入 primary，large 只保留表头
-            txt = family_tsv.read_text(encoding="utf-8")
-            primary_tsv.write_text(txt, encoding="utf-8")
-            header = txt.splitlines()[0] if txt else ""
-            large_tsv.write_text((header + "\n") if header else "", encoding="utf-8")
-            logger.info("[SPLIT] two_stage_large.disable: 全部家族归入 primary。")
-
-        # 清理 / 创建子目录
-        primary_dir = ensure_dir(model_dir / "primary_global")
-        large_dir = ensure_dir(model_dir / "large")
-        flags_dir = ensure_dir(model_dir / "flags")
-        sentinels_dir = ensure_dir(model_dir / "sentinels")
-
-        # PRIMARY 阶段
-        stdout_primary, high_fail_primary = run_with_autofix(
+        run_model_with_autofix(
+            model=str(model),
             cafe_bin=cafe_bin,
-            family_tsv=primary_tsv,
-            tree_nwk=tree_nwk,
+            tree_path=tree,
+            family_orig=family,
+            out_root=models_root,
             threads=threads,
             gamma_k=gamma_k,
             pvalue=pvalue,
-            cwd=primary_dir,
-            log=logger,
-            label_prefix=f"MODEL={model} PRIMARY-GLOBAL",
             max_autofix_rounds=max_autofix_rounds,
-            model_dir=model_dir,
+            log=log,
         )
 
-        # LARGE 阶段（只有在 two_stage 模式 + large 非空时才跑）
-        high_fail_large: List[str] = []
-        n_large_data = sum(
-            1 for _ in large_tsv.read_text(encoding="utf-8").splitlines()
-        ) - 1
-        if two_stage_enable and n_large_data > 0:
-            logger.info(
-                f"[MODEL {model}] 检测到 large 集合 {n_large_data} 行，启动 LARGE 阶段。"
-            )
-            stdout_large, high_fail_large = run_with_autofix(
-                cafe_bin=cafe_bin,
-                family_tsv=large_tsv,
-                tree_nwk=tree_nwk,
-                threads=threads,
-                gamma_k=gamma_k,
-                pvalue=pvalue,
-                cwd=large_dir,
-                log=logger,
-                label_prefix=f"MODEL={model} PRIMARY-GLOBAL-LARGE",
-                max_autofix_rounds=max_autofix_rounds,
-                model_dir=model_dir,
-            )
-        else:
-            logger.info(
-                f"[MODEL {model}] 未检测到 large 数据或 two_stage_large.disable，跳过 LARGE 阶段。"
-            )
-
-        # 写出高失败率 OG 汇总
-        high_fail_all = sorted(set(high_fail_primary) | set(high_fail_large))
-        hf_file = flags_dir / "high_fail_ogs.list"
-        if high_fail_all:
-            hf_file.write_text("\n".join(high_fail_all) + "\n", encoding="utf-8")
-            logger.info(
-                f"[MODEL {model}] 写出高失败率家族列表：{hf_file} （{len(high_fail_all)} 个 OG）"
-            )
-        else:
-            hf_file.write_text("", encoding="utf-8")
-            logger.info(f"[MODEL {model}] 未检测到高失败率家族，写入空文件：{hf_file}")
-
-        # 模型级别 sentinel
-        (sentinels_dir / f"{model}.done").write_text(
-            f"{model} finished at {datetime.datetime.now()}\n",
-            encoding="utf-8",
-        )
-        logger.info(f"[MODEL {model}] 完成。")
-
-    # 全局 sentinel
-    (cafe_run_dir / ".cafe.done").write_text(
-        f"CAFE5 finished at {datetime.datetime.now()}\n",
-        encoding="utf-8",
-    )
-    logger.info("")
-    logger.info("[GLOBAL] 收工，全部模型完成，写出 .cafe.done。")
+    # 全部模型完成，写全局 done
+    write_done(cafe_run_dir / ".cafe.done")
+    log.info("[DONE] 所有 CAFE5 模型运行完成。")
 
 
 if __name__ == "__main__":
