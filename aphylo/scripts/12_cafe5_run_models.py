@@ -209,7 +209,9 @@ def main():
 
     cafe_bin = str(bins.get("cafe5", "cafe5"))
     threads  = int(cafes.get("threads", 30))
-    k_cycles = int(cafes.get("k_cycles", 3))
+    # —— 改动 1：支持把 k_cycles: 0 视为 Base（不传 -k） ——
+    _raw_k = cafes.get("k_cycles", None)
+    k_cycles = int(_raw_k) if str(_raw_k).strip() not in ("", "None", "none", "0") else None
     p_alpha  = float(cafes.get("p_alpha", 0.05))
     models   = cafes.get("models", ["global"])
 
@@ -250,7 +252,8 @@ def main():
     print("="*60)
     print(f"[IN] family: {family_tsv}")
     print(f"[IN] tree  : {utree_nwk}")
-    print(f"[CFG] threads={threads}, k={k_cycles}, P={p_alpha}, models={models}")
+    # —— 改动 2：k 为 None 时显示 Base ——
+    print(f"[CFG] threads={threads}, k={'Base' if k_cycles is None else k_cycles}, P={p_alpha}, models={models}")
     if large_enable:
         print(f"[CFG] two-stage large: enable, copy_threshold={large_copy_thr}")
     else:
@@ -307,10 +310,14 @@ def main():
                 "-i", str(cur_family),
                 "-t", str(utree_nwk),
                 "-c", str(threads),
-                "-k", str(k_cycles),
+                # （原来这里有 -k；见改动 3）
                 "-P", str(p_alpha),
                 "-o", str(out_primary)
             ]
+            # —— 改动 3（part A）：仅当 k_cycles 有效时才追加 -k ——
+            if k_cycles is not None:
+                cmd += ["-k", str(k_cycles)]
+
             # 误差模型（仅当 enable & apply_to 包含 primary）
             em_use_this_round = (em_enable and em_mode in ("use","estimate") and em_apply in ("primary","both"))
             err_model_path_for_run: Optional[Path] = None
@@ -396,10 +403,14 @@ def main():
                 "-i", str(large_tsv),
                 "-t", str(utree_nwk),
                 "-c", str(threads),
-                "-k", str(k_cycles),
+                # （原来这里有 -k；见改动 3）
                 "-P", str(p_alpha),
                 "-o", str(out_large)
             ]
+            # —— 改动 3（part B）：仅当 k_cycles 有效时才追加 -k ——
+            if k_cycles is not None:
+                cmdL += ["-k", str(k_cycles)]
+
             # 固定 λ（若 primary 成功获得）
             if lambda_fixed is not None:
                 cmdL += ["-l", f"{lambda_fixed}"]
