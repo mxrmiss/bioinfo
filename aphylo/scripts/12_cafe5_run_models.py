@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 """
-12_cafe5_run_models.py —— CAFE5 教程增强版（两阶段 / 极端家族修剪 / 失败率统计）
+12_cafe5_run_models.py —— CAFE5 教程增强版（两阶段 / 极端家族修剪 / 失败率统计，流式输出版）
 
 功能总览（与 config.yaml.cafe5 对应）：
   1) 读取 config.yaml 中的 cafe5 & paths 配置。
@@ -224,11 +224,13 @@ def run_cafe_once(
     label: str,
 ) -> str:
     """
-    跑一次 CAFE5，返回 stdout 文本，用于后续解析极端家族 / 高失败率等。
+    跑一次 CAFE5（流式输出版）：
 
-    关键：
-      - family_tsv 与 tree_nwk 一律使用绝对路径，避免 cwd 更改导致找不到文件。
-      - 同时把原始输出追加写入 cwd/run.log，方便 13 脚本做 QC。
+      - family_tsv 与 tree_nwk 一律用绝对路径，避免 cwd 更改导致找不到文件；
+      - 使用 subprocess.Popen 行行读取，实时把 CAFE5 输出：
+          * 打到屏幕（logger）
+          * 写入 cwd/run.log
+      - 同时累积所有 stdout 文本，供后续解析极端家族 / 高失败率使用。
     """
     ensure_dir(cwd)
     family_abs = family_tsv.resolve()
@@ -249,7 +251,14 @@ def run_cafe_once(
     ]
     log.info(f"[CMD][{label}] {' '.join(cmd)} (cwd={cwd})")
 
-    proc = subprocess.run(
+    # 提前打开 run.log（追加）
+    runlog = cwd / "run.log"
+    fh = runlog.open("a", encoding="utf-8")
+    fh.write(f"================ MODEL={label} =================\n")
+    fh.flush()
+
+    # 流式读取 CAFE5 输出
+    proc = subprocess.Popen(
         cmd,
         cwd=str(cwd),
         stdout=subprocess.PIPE,
@@ -257,25 +266,32 @@ def run_cafe_once(
         text=True,
         encoding="utf-8",
         errors="replace",
+        bufsize=1,
     )
-    out = proc.stdout or ""
 
-    # 写 run.log（追加）
-    runlog = cwd / "run.log"
-    with runlog.open("a", encoding="utf-8") as fh:
-        fh.write(f"================ MODEL={label} =================\n")
-        fh.write(out)
-        if not out.endswith("\n"):
-            fh.write("\n")
+    stdout_lines: List[str] = []
 
-    # 同时打到主 logger
-    for ln in out.splitlines():
-        log.info(f"[{label}] {ln}")
+    assert proc.stdout is not None
+    for line in proc.stdout:
+        # 去掉尾部换行，避免 log 叠两层换行
+        clean = line.rstrip("\n")
+        stdout_lines.append(clean)
+
+        # 写 run.log（保留原始行）
+        fh.write(line)
+        fh.flush()
+
+        # 同步打到总日志 / 屏幕
+        log.info(f"[{label}] {clean}")
+
+    proc.wait()
+    fh.write("\n")  # 分隔一下不同轮次
+    fh.close()
 
     if proc.returncode != 0:
         raise RuntimeError(f"[ERR] CAFE5 运行失败（{label}），退出码 {proc.returncode}")
 
-    return out
+    return "\n".join(stdout_lines)
 
 
 def parse_extreme_ogs(stdout_text: str) -> List[str]:
@@ -489,7 +505,7 @@ def main():
 
     # 日志
     logger = get_logger("aphylo.12", logs_dir / "12_cafe5_run_models.log")
-    banner(logger, "APhylo 12 — CAFE5（教程增强版）")
+    banner(logger, "APhylo 12 — CAFE5（教程增强版，流式输出）")
 
     logger.info(f"[IN] family: {family_tsv}")
     logger.info(f"[IN] tree:   {tree_nwk}")
