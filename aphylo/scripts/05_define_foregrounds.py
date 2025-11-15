@@ -10,6 +10,8 @@
 约束：
   - 仅使用 terminals 模式（每个叶子的“外连分支”打 #1，允许多个 #1、允许非单系）。
   - 不做自动剪枝；树叶名需与 {FG}.list 中物种名逐字一致（大小写、下划线）。
+新增（可选）：
+  - codeml.add_phylip_header: 是否为 {FG}.nwk 首行写入 “N 1”。默认 False，开启后按叶子数写 N。
 """
 
 from __future__ import annotations
@@ -17,6 +19,7 @@ import sys, io, logging, re
 from pathlib import Path
 from typing import Dict, Any, List
 import yaml
+import subprocess  # 调用 gotree
 
 DEFAULT_CONFIG = "config.yaml"
 
@@ -63,6 +66,38 @@ def write_done(path: Path):
     path.parent.mkdir(parents=True, exist_ok=True)
     Path(path).touch()
 
+# ============== 利用 gotree 去除分支长度（供 CODEML 使用） ==============
+def clear_branch_lengths_with_gotree(nwk: str, logger: logging.Logger) -> str:
+    """
+    使用 `gotree brlen clear` 去除分支长度，只保留树拓扑。
+    输入和输出都是 Newick 字符串，不在磁盘上额外产生文件。
+    """
+    try:
+        proc = subprocess.run(
+            ["gotree", "brlen", "clear"],
+            input=nwk.encode("utf-8"),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False
+        )
+    except FileNotFoundError:
+        raise RuntimeError("[ERR] 未找到 gotree，可执行文件不在 PATH 中，请先安装/加载 gotree")
+
+    if proc.returncode != 0:
+        err_msg = proc.stderr.decode("utf-8", errors="ignore")
+        logger.error(err_msg.strip() or "[gotree] 无更多错误信息")
+        raise RuntimeError(f"[ERR] gotree brlen clear 失败，返回码 {proc.returncode}")
+
+    out = proc.stdout.decode("utf-8", errors="ignore").strip()
+    if not out:
+        raise RuntimeError("[ERR] gotree brlen clear 返回空输出，请检查输入物种树是否为合法 Newick 格式")
+
+    # 确保以分号结尾，给后续解析/软件一个稳定格式
+    out = out.strip()
+    if not out.endswith(";"):
+        out = out.rstrip(";") + ";"
+    return out
+
 # ================= Newick 处理（terminals-only 打标） =================
 def extract_leaf_names(nwk: str) -> List[str]:
     """
@@ -90,6 +125,35 @@ def label_terminals(nwk: str, tips: List[str]) -> str:
             raise KeyError(f"[ERR] 无法在树上定位叶子：{tip}（命名可能与树不一致）")
     return base
 
+# ============== 写入工具（可选 PHYLIP 头） ==============
+def write_nwk_with_optional_phylip_header(
+    out_path: Path,
+    nwk_line: str,
+    add_header: bool,
+    n_leaves: int,
+    logger: logging.Logger
+):
+    """
+    将 Newick 写入 out_path。
+    - add_header=True 时：首行写入 "N 1"，第二行写 Newick。
+    - 自动幂等：若文件首行已是数字数字（^\d+\s+\d+$），不重复加头。
+    """
+    ensure_dir(out_path.parent)
+
+    # 确保只有一个分号结尾并换行
+    nwk_line = (nwk_line.rstrip() if nwk_line else "")
+    if not nwk_line.endswith(";"):
+        nwk_line = nwk_line.rstrip(";") + ";"
+
+    content = nwk_line + "\n"
+
+    if add_header:
+        header = f"{int(n_leaves)} 1"
+        logger.info(f"[Info] PHYLIP header: {header}")
+        content = header + "\n" + content
+
+    out_path.write_text(content, encoding="utf-8")
+
 # ================= 主流程 =================
 def main():
     cfg = load_config()
@@ -105,7 +169,12 @@ def main():
 
     # 基准物种树（未打标）
     tree_path = need_file(Path(inputs["species_tree"]), "物种树 species_tree.nwk")
-    nwk = tree_path.read_text(encoding="utf-8").strip().rstrip(";") + ";"
+    raw_nwk = tree_path.read_text(encoding="utf-8").strip()
+    raw_nwk = raw_nwk.rstrip(";") + ";"  # 保证只有一个分号结尾
+
+    # 使用 gotree 去除分支长度，仅保留拓扑（更贴合 CODEML 教程做法）
+    log.info("[Info] 使用 gotree brlen clear 去除物种树分支长度，仅保留拓扑供 CODEML 使用")
+    nwk = clear_branch_lengths_with_gotree(raw_nwk, log)
 
     # 叶子集合 & 别名映射（可选）
     leaves = extract_leaf_names(nwk)
@@ -115,6 +184,11 @@ def main():
     fgs = codeml.get("foreground_sets", [])
     if not fgs:
         raise ValueError("[ERR] codeml.foreground_sets 为空（至少提供一个前景集合）")
+
+    # 是否写入 PHYLIP header（默认 False，不影响既有行为）
+    add_header: bool = bool(codeml.get("add_phylip_header", False))
+    if add_header:
+        log.info("[Info] 将为 {FG}.nwk 写入 PHYLIP 头（N 1）")
 
     # 逐前景生成 {FG}.list 与 {FG}.nwk（terminals-only 打标）
     for fg in fgs:
@@ -139,11 +213,20 @@ def main():
         # 写 {FG}.list（标准化后的叶名，一行一个）
         (sets_dir / f"{name}.list").write_text("\n".join(tips_mapped) + "\n", encoding="utf-8")
 
-        # 生成 terminals-only 打标树并写 {FG}.nwk
+        # 生成 terminals-only 打标树
         nwk_fg = label_terminals(nwk, tips_mapped)
-        (sets_dir / f"{name}.nwk").write_text(nwk_fg + "\n", encoding="utf-8")
 
-        log.info(f"前景集合：{name} → {len(tips_mapped)} tips；已生成 {name}.list 与 {name}.nwk（#1 打标完成）")
+        # 写 {FG}.nwk —— 按需加 PHYLIP header
+        out_nwk = sets_dir / f"{name}.nwk"
+        write_nwk_with_optional_phylip_header(
+            out_path=out_nwk,
+            nwk_line=nwk_fg,
+            add_header=add_header,
+            n_leaves=len(leaves),
+            logger=log
+        )
+
+        log.info(f"前景集合：{name} → {len(tips_mapped)} tips；已生成 {name}.list 与 {name}.nwk（#1 打标完成，分支长度已清除）")
 
     # 哨兵
     write_done(codeml_root / ".fgsets.done")

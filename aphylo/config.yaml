@@ -48,10 +48,11 @@ codon:
   stopcodon_action: "fail"   # fail | mask(NNN)
 
 codeml:
-  threads: 40                                   # 并行请用 `snakemake -j` 控制；脚本逐任务运行更稳
+  threads: 30                                   # 并行请用 `snakemake -j` 控制；脚本逐任务运行更稳
   alt_template: "templates/branch_site_alt.ctl"
   null_template: "templates/branch_site_null.ctl"
   ctl_template: "templates/branch_site.ctl"    # 固定模板文件（保留不影响）
+  add_phylip_header: true
 
   # —— 前景集合的唯一权威来源（保留） ——
   foreground_sets:
@@ -61,7 +62,7 @@ codeml:
       tips: ["Sinonovacula_constricta"]         # 论文：高盐前景
 
 cafes:
-  threads: 40                                          # -c
+  threads: 30                                          # -c
   k_cycles:                                           # -k
   p_alpha: 0.05                                        # -P
   models: ["global"]                                   # 目前只用 global
