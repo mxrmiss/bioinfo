@@ -48,7 +48,7 @@ codon:
   stopcodon_action: "fail"   # fail | mask(NNN)
 
 codeml:
-  threads: 30                                   # 并行请用 `snakemake -j` 控制；脚本逐任务运行更稳
+  threads: 40                                   # 并行请用 `snakemake -j` 控制；脚本逐任务运行更稳
   alt_template: "templates/branch_site_alt.ctl"
   null_template: "templates/branch_site_null.ctl"
   ctl_template: "templates/branch_site.ctl"    # 固定模板文件（保留不影响）
@@ -61,7 +61,7 @@ codeml:
       tips: ["Sinonovacula_constricta"]         # 论文：高盐前景
 
 cafes:
-  threads: 75                                          # -c
+  threads: 40                                          # -c
   k_cycles:                                           # -k
   p_alpha: 0.05                                        # -P
   models: ["global"]                                   # 目前只用 global
@@ -97,17 +97,12 @@ mcmctree:
   outgroups:   ["Nematostella_vectensis"]
 
   # -------- 工作目录与关键输入（10 步在该目录内就地运行）--------
-  work_dir: "results/06_cafe/mcmctree"   # = outdir（旧键保留兼容）
   outdir:   "results/06_cafe/mcmctree"
 
   # 由 09 产出、供 10 使用的序列文件（PHYLIP；建议仅写文件名，脚本会在 work_dir 内读取）
   seqfile:  "concat.clean.phy"
   # 由 08 产出、供 10 使用的两行树（第二行含 B(L,U) 校准、无分支长度；同样仅写文件名）
   treefile: "species_calib.nobl.trees"
-
-  # 为了与旧脚本/说明兼容，保留这两个“全路径键”（10 步不会用它们）
-  codon_phylip: "results/06_cafe/mcmctree/concat.clean.phy"
-  nobl_trees:   "results/06_cafe/mcmctree/species_calib.nobl.trees"
 
   # -------- 模板（10 步新用法）--------
   # 目录需放：mcmctree.ctl（usedata=3）与 mcmctree2.ctl（usedata=2）
