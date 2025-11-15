@@ -162,7 +162,7 @@ def main():
     log = get_logger("aphylo.07", LOG_FILE)
     banner(log, "APhylo 07 — codeml 汇总")
 
-    raw_root = need_dir(Path(paths["codeml_raw_dir"]) / "raw", "codeml 原始结果目录")
+    raw_root = need_dir(Path(paths["codeml_dir"]) / "raw", "codeml 原始结果目录")
     out_dir  = ensure_dir(Path(paths["codeml_agg_dir"]))
 
     rows_genes: List[List[str]] = []
