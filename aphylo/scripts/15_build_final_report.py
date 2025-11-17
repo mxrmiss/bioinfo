@@ -2,114 +2,107 @@
 # -*- coding: utf-8 -*-
 
 """
-15_build_final_report.py —— 最终报告打包（极简对口版）
-
-目标：把 PSG(07)、CAFE(13)、Integration(14) 的关键表格复制到
-paths.joint_dir/report/ 下，生成可交付的最小成品结构。
-
-只复制“存在的文件”；不做计算。
+12_build_final_report.py — 最终报告（写入 joint_dir/report/*）
 """
-
+# ===== APhylo utils (config, logging, sentinels) =====
 from __future__ import annotations
-
-# ============================ 可配置区 ============================
-CONFIG_PATH: str = "config.yaml"
-LOG_LEVEL: str = "INFO"
-LOG_FILE_BASENAME: str = "15_build_final_report.log"
-# ================================================================
-
-import sys, yaml, shutil, logging, traceback
+import sys, io, logging, subprocess, re
 from pathlib import Path
-from datetime import datetime
+from typing import Dict, Any, List, Tuple, Iterable
+import yaml
 
-# -------------------- 基础工具 --------------------
-def mkdir_p(p: Path) -> None:
-    p.mkdir(parents=True, exist_ok=True)
+DEFAULT_CONFIG = "config.yaml"
 
-def load_yaml(p: Path) -> dict:
-    with p.open("r", encoding="utf-8") as f:
-        return yaml.safe_load(f)
+def _expand_publish_placeholders(obj, publish_dir: str):
+    if isinstance(obj, str): return obj.replace("<publish_dir>", publish_dir)
+    if isinstance(obj, list): return [_expand_publish_placeholders(x, publish_dir) for x in obj]
+    if isinstance(obj, dict): return {k:_expand_publish_placeholders(v, publish_dir) for k,v in obj.items()}
+    return obj
 
-def copy_if_exists(src: Path, dst: Path, copied: list[str]) -> None:
-    if src.exists():
-        shutil.copy2(src, dst)
-        copied.append(dst.name)
-        logging.info(f"[OK] 复制：{src.name} -> {dst}")
+def load_config(config_path: str = DEFAULT_CONFIG) -> Dict[str, Any]:
+    p = Path(config_path)
+    if not p.exists(): raise FileNotFoundError(f"[ERR] 未找到配置文件：{p}")
+    cfg = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
+    pub = cfg.get("publish_dir")
+    if pub: cfg["inputs"] = _expand_publish_placeholders(cfg.get("inputs", {}), str(pub))
+    return cfg
 
-# -------------------- 主流程 --------------------
-def main() -> None:
-    # 1) 配置与路径
-    cfg_path = Path(CONFIG_PATH).resolve()
-    if not cfg_path.exists():
-        print(f"[ERR] 配置不存在：{cfg_path}", file=sys.stderr); sys.exit(2)
-    cfg = load_yaml(cfg_path)
-    paths = cfg.get("paths", {})
-    logs_dir = Path(paths.get("logs_dir", "logs")).resolve()
-    joint_dir = Path(paths.get("joint_dir", "results/08_joint")).resolve()
-    codeml_agg_dir = Path(paths.get("codeml_agg_dir", "results/05_cmlagg")).resolve()
-    cafe_agg_dir   = Path(paths.get("cafe_agg_dir",   "results/07_cafeagg")).resolve()
-    report_dir = joint_dir / "report"
-    tables_dir = report_dir / "tables"
-    figs_dir   = report_dir / "figs"
+def ensure_dir(p: Path):
+    p.mkdir(parents=True, exist_ok=True); return p
 
-    mkdir_p(logs_dir); mkdir_p(report_dir); mkdir_p(tables_dir); mkdir_p(figs_dir)
+def need_dir(p: Path, what: str):
+    p = Path(p)
+    if not p.is_dir(): raise FileNotFoundError(f"[ERR] 缺少目录：{what} -> {p}")
+    return p
 
-    # 2) 日志
-    logging.basicConfig(
-        level=getattr(logging, LOG_LEVEL.upper(), logging.INFO),
-        format="%(asctime)s [%(levelname)s] %(message)s",
-        handlers=[logging.FileHandler(logs_dir / LOG_FILE_BASENAME, encoding="utf-8"),
-                  logging.StreamHandler(sys.stdout)]
-    )
-    logging.info("========== APhylo 15 — 最终报告打包 ==========")
+def need_file(p: Path, what: str):
+    p = Path(p)
+    if not p.is_file(): raise FileNotFoundError(f"[ERR] 缺少文件：{what} -> {p}")
+    return p
 
-    # 3) 复制表格（存在即拷贝）
-    copied: list[str] = []
+def get_logger(name: str, logfile: Path, level: int = logging.INFO) -> logging.Logger:
+    ensure_dir(logfile.parent)
+    lg = logging.getLogger(name); lg.setLevel(level); lg.handlers.clear()
+    fmt = logging.Formatter("[%(asctime)s] %(levelname)s - %(message)s", "%Y-%m-%d %H:%M:%S")
+    fh = logging.FileHandler(logfile, encoding="utf-8"); fh.setFormatter(fmt); fh.setLevel(level)
+    sh = logging.StreamHandler(stream=sys.stdout);     sh.setFormatter(fmt); sh.setLevel(level)
+    lg.addHandler(fh); lg.addHandler(sh)
+    class _Flush(io.TextIOBase):
+        def __init__(self, s): self.s = s
+        def write(self, x): self.s.write(x); self.s.flush(); return len(x)
+    sys.stdout = _Flush(sys.stdout); sys.stderr = _Flush(sys.stderr)
+    return lg
 
-    # PSG (07)
-    copy_if_exists(codeml_agg_dir / "D_fdr_genes.tsv", tables_dir / "D_fdr_genes.tsv", copied)
-    copy_if_exists(codeml_agg_dir / "D_beb_sites.tsv", tables_dir / "D_beb_sites.tsv", copied)
+def banner(logger: logging.Logger, text: str):
+    bar = "=" * max(10, len(text)+2); logger.info(bar); logger.info(f" {text} "); logger.info(bar)
 
-    # CAFE (13)
-    copy_if_exists(cafe_agg_dir / "cafe_significant_families.tsv",        tables_dir / "cafe_significant_families.tsv", copied)
-    copy_if_exists(cafe_agg_dir / "cafe_significant_families_no_highfail.tsv", tables_dir / "cafe_significant_families_no_highfail.tsv", copied)
-    copy_if_exists(cafe_agg_dir / "cafe_branch_summary.tsv",               tables_dir / "cafe_branch_summary.tsv", copied)
-    copy_if_exists(cafe_agg_dir / "inputs_used.tsv",                       tables_dir / "inputs_used.tsv", copied)
+def write_done(path: Path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    Path(path).touch()
 
-    # Integration (14)
-    copy_if_exists(joint_dir / "integration_counts.tsv",   tables_dir / "integration_counts.tsv", copied)
-    copy_if_exists(joint_dir / "integration_intersect.tsv",tables_dir / "integration_intersect.tsv", copied)
-    copy_if_exists(joint_dir / "integration_union.tsv",    tables_dir / "integration_union.tsv", copied)
+def read_fasta(path: Path) -> List[Tuple[str, str]]:
+    recs=[]; name=None; seq=[]
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if line.startswith(">"):
+            if name is not None: recs.append((name, "".join(seq)))
+            name=line[1:].strip(); seq=[]
+        else:
+            seq.append(line.strip())
+    if name is not None: recs.append((name, "".join(seq)))
+    return recs
 
-    # 4) 写 README
-    readme = [
-        "# APhylo Report",
-        f"- Generated at: {datetime.now().isoformat(timespec='seconds')}",
-        "- Included tables:",
-    ] + [f"  - {name}" for name in sorted(copied)] + [
-        "",
-        "Directories:",
-        "  - tables/: key result tables from PSG (07), CAFE5 (13), and Integration (14).",
-        "  - figs/: placeholder for future figures.",
-        "",
-        "Notes:",
-        "  - Only existing files were copied.",
-        "  - Paths are defined in config.yaml under `paths:`.",
-    ]
-    (report_dir / "README.txt").write_text("\n".join(readme) + "\n", encoding="utf-8")
-    logging.info(f"[OK] 写出：{report_dir / 'README.txt'}")
+def write_fasta(path: Path, recs: Iterable[Tuple[str,str]]):
+    with path.open("w", encoding="utf-8") as w:
+        for h, s in recs:
+            w.write(f">{h}\n")
+            for i in range(0, len(s), 80):
+                w.write(s[i:i+80] + "\n")
+# ===== utils end =====
 
-    # 5) 哨兵
-    (joint_dir / ".report.done").write_text("ok\n", encoding="utf-8")
-    logging.info("[OK] .report.done 写入完成")
-    logging.info("========== APhylo 15 — 完成 ==========")
+from pathlib import Path
+
+def main():
+    cfg = load_config()
+    paths = cfg["paths"]
+    logs_dir = Path(paths["logs_dir"]); LOG_FILE = logs_dir / "12_build_final_report.log"
+    log = get_logger("aphylo.12", LOG_FILE)
+    banner(log, "APhylo 12 — 最终报告")
+
+    joint = need_dir(Path(paths["joint_dir"]), "联合整合目录")
+    rep   = ensure_dir(joint / "report")
+    tabs  = ensure_dir(rep / "tables")
+    figs  = ensure_dir(rep / "figs")
+
+    # copy core tables if present
+    for src in [Path(paths["codeml_agg_dir"])/"D_fdr_genes.tsv", Path(paths["codeml_agg_dir"])/"D_beb_sites.tsv", joint/"integration_example.tsv"]:
+        if Path(src).is_file():
+            (tabs/src.name).write_text(Path(src).read_text(encoding="utf-8"), encoding="utf-8")
+
+    (rep/"README.txt").write_text("APhylo Report (tables in tables/, figures in figs/)\n", encoding="utf-8")
+    write_done(joint/".report.done")
+    log.info("[DONE] 最终报告完成")
 
 if __name__ == "__main__":
-    try:
-        main()
-    except SystemExit:
-        raise
+    try: main()
     except Exception as e:
-        print(f"[FATAL] 未捕获异常：{e}", file=sys.stderr)
-        traceback.print_exc()
-        sys.exit(1)
+        sys.stderr.write(str(e) + "\n"); sys.exit(2)
