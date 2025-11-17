@@ -271,12 +271,16 @@ def main() -> int:
         cfg_seq = "concat.clean.phy"     # 仅用于日志回显
         cfg_tree = "species_calib.nobl.trees"
         paths_cfg = {}
+        # 默认模板目录（与当前项目根目录下的 templates/ 对应）
+        templates_dir = Path("templates")
     else:
         wd = resolve_workdir_from_config(cfg)
         work_dir = wd if wd is not None else DEFAULT_WORK_DIR
         mc = cfg.get("mcmctree", {}) if isinstance(cfg, dict) else {}
         cfg_seq = mc.get("seqfile", "concat.clean.phy")
         cfg_tree = mc.get("treefile", "species_calib.nobl.trees")
+        # 从 config.yaml:mcmctree.templates 读取模板目录，默认仍为 "templates"
+        templates_dir = Path(mc.get("templates", "templates"))
         paths_cfg = cfg.get("paths", {}) if isinstance(cfg, dict) else {}
         print(f"[init] 使用配置文件：{CONFIG_PATH}")
         print(f"[init] mcmctree.work_dir = {work_dir}")
@@ -338,6 +342,17 @@ def main() -> int:
             lf.write(f"[{ts()}] [ERR] mcmctree not found in PATH\n")
         return 2
     print(f"[init] 使用 mcmctree 可执行文件：{mctree}")
+
+    # 2.5) 若工作目录中缺少 ctl 模板，则从 templates_dir 自动拷贝
+    for name in (STAGE1_CTL_NAME, STAGE2_CTL_NAME):
+        src = templates_dir / name
+        dst = work_dir / name
+        if not dst.exists():
+            if src.exists():
+                shutil.copy2(src, dst)
+                print(f"[init] 已从模板目录复制 {src} -> {dst}")
+            else:
+                print(f"[WARN] 期望的模板文件不存在：{src}")
 
     # 3) 基本输入文件检查：模板 & 关键输入
     required = [

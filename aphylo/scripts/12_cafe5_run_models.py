@@ -2,351 +2,450 @@
 # -*- coding: utf-8 -*-
 
 """
-12_cafe5_run_models.py —— 运行 CAFE5（按 config.cafe5.models），固定使用 family.tsv 第2列作为 OG 列（第1列为 Desc）
-
-本版要点：
-  - 明确假设：family.tsv 第1列=Desc，第2列=Orthogroup（OG）；删除与命中检查都按“第2列”进行（不做列名判断）。
-  - 输出扁平化：CAFE5 加 `-o .`，产物直接落在 results/06_cafe/models/<model>/。
-  - 自动自救：遇到初始化失败/官方建议语，解析“largest differentials”区块，剔除这些 OG，生成 family.autofixN.tsv 并重跑；
-    轮数由 config.cafe5.max_autofix_rounds 控制（0=关闭）。
-  - 开跑前“卫生”：
-      * 归档旧产物到 _prev_run_YYYYmmdd-HHMMSS/（保留 run.log* 轮转）；
-      * run.log → run.log.YYYYmmdd-HHMMSS，并新建空 run.log 记录本批次。
-  - 成功判定：仅当返回码=0 且日志未出现初始化失败提示，才视为成功；
-  - 失败处理：自动修正用尽/删除命中=0 直接报错退出（不写 .cafe.done）。
-
-依赖 config.yaml:
-  paths.cafe_run_dir, paths.logs_dir
-  cafe5.enable, cafe5.threads, cafe5.gamma_k, cafe5.pvalue, cafe5.models, cafe5.max_autofix_rounds
-  binaries.cafe5  (可选，默认 'cafe5')
+12_cafe5_run_models.py —— CAFE5 批量模型（教程增强版·两阶段/误差/流式输出）
+要点：
+  - 所有参数从 config.yaml 读取（不接命令行）。
+  - family.tsv 首列固定为 Desc，OG 列为 Orthogroup（大小写均可）。
+  - primary 阶段：支持多轮“极端 OG 自动修正”（最多 N 轮）。
+  - large 阶段：只跑一次（按皇上新指令），可固定 primary 的 λ 复算；不做极端 OG 剔除。
+  - 可选误差模型（estimate/use/off），可选择只应用 primary 或 primary+large。
+  - 产物目录简洁：results/06_cafe/models/<model>/{primary_global|large}/
+  - 实时（流式）屏幕输出 + 写入 run.log；不自动删除旧 models（除非将 config 的 archive 开关打开）。
+兼容：Python 3.8+；CAFE5 可执行名从 config.binaries.cafe5 读取，默认 'cafe5'
 """
 
 from __future__ import annotations
-import sys, io, logging, subprocess, re, shutil
-from datetime import datetime
+import os, sys, re, io, shutil, time, datetime, subprocess
 from pathlib import Path
-from typing import Dict, Any, List, Tuple
+from typing import List, Tuple, Optional, Dict, Any
 import yaml
+
+# ------------------------- 基础工具 -------------------------
 
 DEFAULT_CONFIG = "config.yaml"
 
-# ====================== 通用工具 ======================
-
-def _expand_publish_placeholders(obj, publish_dir: str):
-    if isinstance(obj, str): return obj.replace("<publish_dir>", publish_dir)
-    if isinstance(obj, list): return [_expand_publish_placeholders(x, publish_dir) for x in obj]
-    if isinstance(obj, dict): return {k:_expand_publish_placeholders(v, publish_dir) for k,v in obj.items()}
+def _expand_publish_placeholders(obj, pub: str):
+    if isinstance(obj, str): return obj.replace("<publish_dir>", pub)
+    if isinstance(obj, list): return [_expand_publish_placeholders(x, pub) for x in obj]
+    if isinstance(obj, dict): return {k:_expand_publish_placeholders(v, pub) for k,v in obj.items()}
     return obj
 
-def load_config(config_path: str = DEFAULT_CONFIG) -> Dict[str, Any]:
-    p = Path(config_path)
-    if not p.exists(): raise FileNotFoundError(f"[ERR] 未找到配置文件：{p}")
+def load_config(path: str = DEFAULT_CONFIG) -> Dict[str, Any]:
+    p = Path(path)
+    if not p.exists():
+        raise FileNotFoundError(f"[ERR] 未找到配置文件：{p}")
     cfg = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
     pub = cfg.get("publish_dir")
-    if pub: cfg["inputs"] = _expand_publish_placeholders(cfg.get("inputs", {}), str(pub))
+    if pub:
+        cfg["inputs"] = _expand_publish_placeholders(cfg.get("inputs", {}), str(pub))
     return cfg
 
 def ensure_dir(p: Path) -> Path:
     p.mkdir(parents=True, exist_ok=True); return p
 
-def need_dir(p: Path, what: str) -> Path:
-    p = Path(p)
-    if not p.is_dir(): raise FileNotFoundError(f"[ERR] 缺少目录：{what} -> {p}")
-    return p
+def now_tag() -> str:
+    return datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
 
-def get_logger(name: str, logfile: Path, level: int = logging.INFO) -> logging.Logger:
+def tee_streamed(cmd: List[str], cwd: Path, logfile: Path, mirror: Optional[Path] = None) -> int:
+    """
+    实时把子进程 stdout/stderr 同步到屏幕与 logfile（UTF-8）
+    如提供 mirror，则同时镜像到集中日志（追加）。
+    返回进程退出码
+    """
     ensure_dir(logfile.parent)
-    lg = logging.getLogger(name); lg.setLevel(level); lg.handlers.clear()
-    fmt = logging.Formatter("[%(asctime)s] %(levelname)s - %(message)s", "%Y-%m-%d %H:%M:%S")
-    fh = logging.FileHandler(logfile, encoding="utf-8"); fh.setFormatter(fmt); fh.setLevel(level)
-    sh = logging.StreamHandler(stream=sys.stdout);     sh.setFormatter(fmt); sh.setLevel(level)
-    lg.addHandler(fh); lg.addHandler(sh)
-    class _Flush(io.TextIOBase):
-        def __init__(self, s): self.s = s
-        def write(self, x): self.s.write(x); self.s.flush(); return len(x)
-    sys.stdout = _Flush(sys.stdout); sys.stderr = _Flush(sys.stderr)
-    return lg
+    mfh = None
+    if mirror is not None:
+        ensure_dir(mirror.parent)
+        mfh = mirror.open("a", encoding="utf-8")
 
-def banner(log: logging.Logger, text: str):
-    bar = "=" * max(10, len(text)+2); log.info(bar); log.info(f" {text} "); log.info(bar)
+    with logfile.open("w", encoding="utf-8") as lf:
+        header = f"# CMD: {' '.join(cmd)}\n# CWD: {cwd}\n# START: {datetime.datetime.now()}\n\n"
+        lf.write(header); lf.flush()
+        if mfh: mfh.write(header); mfh.flush()
+        proc = subprocess.Popen(
+            cmd, cwd=str(cwd), stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            bufsize=1, universal_newlines=True, encoding="utf-8", errors="replace"
+        )
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            # 写屏 & 写盘（流式）
+            sys.stdout.write(line); sys.stdout.flush()
+            lf.write(line)
+            if mfh: mfh.write(line)
+        proc.wait()
+        footer = f"\n# END: {datetime.datetime.now()}\n# RET: {proc.returncode}\n"
+        lf.write(footer); lf.flush()
+        if mfh: mfh.write(footer); mfh.flush(); mfh.close()
+        return proc.returncode
 
-def write_done(path: Path):
-    path.parent.mkdir(parents=True, exist_ok=True); Path(path).touch()
+def copy_file(src: Path, dst: Path):
+    ensure_dir(dst.parent); shutil.copy2(src, dst)
 
-# ====================== CAFE5 相关工具 ======================
+# ------------------------- CAFE5 辅助 -------------------------
 
-FAILED_INIT_PAT = re.compile(r"Failed to initialize any reasonable values", re.I)
-ADVICE_PAT = re.compile(r"You may want to try removing the top few families with the largest difference", re.I)
-BLOCK_HEAD_PAT = re.compile(r"Families with largest size differentials\s*:", re.I)
-OG_LINE_PAT = re.compile(r"^\s*(OG\d+)\s*:\s*(\d+)\s*$", re.I)
+OG_RE = re.compile(r'\b(OG\d{7,})\b', re.I)  # 匹配如 OG0000123
 
-def detect_cafe_errors_fatal(stdout: str, model: str, log_file: Path) -> None:
-    """致命类“伪成功”错误（初始化失败交由外层处理）。"""
-    text = stdout or ""
-    if re.search(r"was not found in gene family", text, flags=re.I):
-        raise RuntimeError(f"[ERR] 输出含 'was not found in gene family' —— 树/矩阵物种不一致；模型：{model}")
-    if re.search(r"unrecognized option", text, flags=re.I) or re.search(r"Unrecognized parameter", text, flags=re.I):
-        raise RuntimeError(f"[ERR] 输出含 'unrecognized option/parameter' —— 版本不支持该参数；模型：{model}（详见 {log_file}）")
-    if re.search(r"Failed to open", text, flags=re.I):
-        raise RuntimeError(f"[ERR] 输出含 'Failed to open' —— family/tree 路径无效；模型：{model}（详见 {log_file}）")
+def read_family_as_rows(path: Path) -> Tuple[List[str], List[List[str]]]:
+    lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
+    if not lines: return [], []
+    header = re.split(r"\t", lines[0].rstrip("\n"))
+    body = [re.split(r"\t", ln.rstrip("\n")) for ln in lines[1:] if ln.strip()]
+    return header, body
 
-def need_autofix(stdout: str) -> bool:
-    """出现初始化失败或官方建议语 → 需要自动修正。"""
-    return bool(stdout and (FAILED_INIT_PAT.search(stdout) or ADVICE_PAT.search(stdout)))
+def write_family_from_rows(path: Path, header: List[str], body: List[List[str]]):
+    ensure_dir(path.parent)
+    with path.open("w", encoding="utf-8") as f:
+        f.write("\t".join(header) + "\n")
+        for r in body:
+            f.write("\t".join(map(str, r)) + "\n")
 
-def parse_extreme_ogs_from_stdout(stdout: str) -> List[str]:
-    """回溯解析‘largest differentials’区块，收集连续的 OGxxxx: NNN 行。"""
-    if not stdout: return []
-    lines = stdout.splitlines()
-    start_idx = -1
-    for i in range(len(lines)-1, -1, -1):
-        if BLOCK_HEAD_PAT.search(lines[i]): start_idx = i; break
-    if start_idx < 0: return []
-    ogs: List[str] = []
-    for j in range(start_idx+1, len(lines)):
-        m = OG_LINE_PAT.match(lines[j])
-        if not m: break
-        ogs.append(m.group(1))
-    # 去重保序
-    seen, uniq = set(), []
-    for og in ogs:
-        if og not in seen: seen.add(og); uniq.append(og)
-    return uniq
+def find_idx(header: List[str], oks: List[str]) -> int:
+    low = [h.strip().lower() for h in header]
+    for i,h in enumerate(low):
+        if h in oks: return i
+    return -1
 
-def extract_og_from_line_fields(line: str) -> str:
+def split_primary_large(family_tsv: Path, out_primary: Path, out_large: Path, copy_threshold: int) -> Tuple[int,int]:
     """
-    从 family 数据行中取“第2列”作为 OG：
-      - 按任意空白切分；
-      - 若不足2列，返回空串。
+    基于任意物种计数 >= copy_threshold 的行划为 large，否则划为 primary。
+    family.tsv 首列 Desc，第二列为 Orthogroup（大小写兼容）。
     """
-    fields = re.split(r"\s+", line.strip())
-    return fields[1] if len(fields) >= 2 else ""
+    head, body = read_family_as_rows(family_tsv)
+    if not head: raise RuntimeError(f"[ERR] 空的 family：{family_tsv}")
+    idx_og = find_idx(head, ["orthogroup","og","family"])
+    if idx_og < 0:
+        raise RuntimeError("[ERR] family.tsv 缺少 Orthogroup/OG 列")
+    # 非前两列的其余列应为物种计数列（整数）
+    prim, larg = [], []
+    for row in body:
+        counts = []
+        for x in row[2:]:
+            try: counts.append(int(x))
+            except: counts.append(0)
+        if any(c >= copy_threshold for c in counts):
+            larg.append(row)
+        else:
+            prim.append(row)
+    write_family_from_rows(out_primary, head, prim)
+    write_family_from_rows(out_large, head, larg)
+    return len(prim), len(larg)
 
-def count_hits_in_family_by_col2(family_path: Path, ogs: List[str]) -> int:
-    """统计 OG 列表在 family 的第2列中的命中数。"""
-    if not ogs: return 0
-    targets = set(ogs); hits = 0
-    with family_path.open("r", encoding="utf-8", errors="ignore") as fin:
-        _ = fin.readline()  # 跳过表头
-        for line in fin:
-            if not line.strip(): continue
-            og = extract_og_from_line_fields(line)
-            if og in targets: hits += 1
-    return hits
+def extract_lambda_from_results(results_txt: Path) -> Optional[float]:
+    if not results_txt.is_file(): return None
+    txt = results_txt.read_text(encoding="utf-8", errors="ignore")
+    m = re.search(r"Lambda\s*:\s*([0-9.eE+-]+)", txt)
+    if m:
+        try: return float(m.group(1))
+        except: return None
+    return None
 
-def filter_family_drop_ogs_by_col2(in_family: Path, ogs: List[str], out_family: Path, log: logging.Logger):
+def parse_extreme_from_runlog(logfile: Path) -> List[str]:
     """
-    从 family 文件剔除指定 OG（固定按第2列匹配），写出新矩阵。
-    - 识别列：第2列（第1列为 Desc）；
-    - 写回：保留原始行文本，不改变文件格式。
+    从 run.log 的最后一个 “Families with largest size differentials:” 块中提取 OG 列表
+    兼容多轮输出；不使用 \R，逐行扫更稳健。
     """
-    ogset = set(ogs); n_in = n_out = n_drop = 0
-    with in_family.open("r", encoding="utf-8", errors="ignore") as fin, \
-         out_family.open("w", encoding="utf-8") as fout:
-        header = fin.readline()
-        if not header: raise RuntimeError(f"[ERR] family.tsv 为空：{in_family}")
-        fout.write(header)
-        for line in fin:
-            if not line.strip(): continue
-            n_in += 1
-            og = extract_og_from_line_fields(line)
-            if og in ogset:
-                n_drop += 1
-                continue
-            fout.write(line); n_out += 1
-    log.info(f"[FILTER] {in_family.name}：数据行 {n_in}，剔除 {n_drop}，保留 {n_out} → {out_family.name}")
+    if not logfile.is_file(): return []
+    lines = logfile.read_text(encoding="utf-8", errors="ignore").splitlines()
+    locs = [i for i,ln in enumerate(lines) if "Families with largest size differentials:" in ln]
+    if not locs: return []
+    start = locs[-1] + 1  # 最后一个块的下一行开始
+    ogs, i = [], start
+    while i < len(lines):
+        ln = lines[i].strip()
+        if not ln: break
+        m = OG_RE.search(ln)
+        if m: ogs.append(m.group(1))
+        else:
+            # 到了非 OG 行（例如提示语/下一段），收集结束
+            break
+        i += 1
+    return ogs
 
-def list_dirnames(mdir: Path) -> set:
-    return set(p.name for p in mdir.iterdir())
+def filter_family_remove_ogs(src_tsv: Path, dst_tsv: Path, bad_ogs: List[str]) -> int:
+    """在 family.tsv（首列 Desc，第2列 Orthogroup）中删除 bad_ogs 对应行。返回删除数量。"""
+    if not bad_ogs: 
+        copy_file(src_tsv, dst_tsv); 
+        return 0
+    head, body = read_family_as_rows(src_tsv)
+    idx_og = find_idx(head, ["orthogroup","og","family"])
+    if idx_og < 0:
+        raise RuntimeError("[ERR] 无 Orthogroup 列，无法删除 OG")
+    bad = set(x.upper() for x in bad_ogs)
+    kept = [r for r in body if (idx_og >= len(r) or r[idx_og].upper() not in bad)]
+    removed = len(body) - len(kept)
+    write_family_from_rows(dst_tsv, head, kept)
+    return removed
 
-def move_round_outputs(mdir: Path, new_names: set, round_idx: int, keep_names: set, log: logging.Logger):
-    """将非最终轮新产生的文件移入 _roundN_tmp/，避免被 13 聚合。"""
-    dst = ensure_dir(mdir / f"_round{round_idx}_tmp")
-    moved = 0
-    for name in sorted(new_names):
-        if name in keep_names: continue
-        src = mdir / name
-        try:
-            shutil.move(str(src), str(dst / name)); moved += 1
-        except Exception:
-            pass
-    log.info(f"[CLEAN] 第 {round_idx} 轮产生的 {moved} 个结果文件已移入：{dst}")
+def parse_high_fail_from_runlog(logfile: Path, threshold_rate: float = 0.20) -> List[str]:
+    """
+    抓取 “The following families had failure rates >20% of the time:” 之后的 OG 列表（直到空行/下一段）。
+    """
+    if not logfile.is_file(): return []
+    lines = logfile.read_text(encoding="utf-8", errors="ignore").splitlines()
+    start = -1
+    key = "had failure rates >"
+    for i,ln in enumerate(lines):
+        if key in ln and "families" in ln:
+            start = i + 1; break
+    if start < 0: return []
+    ogs = []
+    i = start
+    while i < len(lines):
+        ln = lines[i].strip()
+        if not ln: break
+        m = OG_RE.search(ln)
+        if m: ogs.append(m.group(1))
+        else: break
+        i += 1
+    return ogs
 
-def append_runlog(runlog: Path, header: str, lines: List[str]):
-    with runlog.open("a", encoding="utf-8") as w:
-        w.write(f"\n===== {header} =====\n")
-        for ln in lines:
-            w.write(ln + ("\n" if not ln.endswith("\n") else ""))
-
-def run_cafe_streaming(cmd: List[str], mdir: Path,
-                       log: logging.Logger, model: str) -> List[str]:
-    log.info(f"[MODEL {model}] CMD: " + " ".join(map(str, cmd)))
-    proc = subprocess.Popen(
-        cmd, cwd=str(mdir),
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        text=True, bufsize=1, universal_newlines=True,
-    )
-    lines: List[str] = []
-    log.info(f"[MODEL {model}] ---- CAFE5 输出开始 ----")
-    assert proc.stdout is not None
-    for line in proc.stdout:
-        line = line.rstrip("\n")
-        lines.append(line)
-        log.info(f"[MODEL {model}] {line}")
-    proc.wait()
-    log.info(f"[MODEL {model}] ---- CAFE5 输出结束 ----")
-    if proc.returncode != 0:
-        raise RuntimeError(f"[ERR] CAFE5 退出码 {proc.returncode}（模型：{model}）")
-    return lines
-
-def archive_previous_run(mdir: Path, log: logging.Logger):
-    """开跑前把现有内容（除 run.log*）归档到 _prev_run_YYYYmmdd-HHMMSS/。"""
-    items = list(mdir.iterdir())
-    if not items: return
-    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    dst = ensure_dir(mdir / f"_prev_run_{stamp}")
-    moved = 0
-    for p in items:
-        if p.name.startswith("run.log"):  # run.log* 轮转单独处理
-            continue
-        try:
-            shutil.move(str(p), str(dst / p.name)); moved += 1
-        except Exception:
-            pass
-    if moved:
-        log.info(f"[ARCHIVE] 发现历史产物，已归档 {moved} 项到：{dst}")
-
-def rotate_runlog(runlog: Path, log: logging.Logger):
-    """run.log 轮转到带时间戳的备份，并创建空的 run.log。"""
-    if runlog.exists():
-        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-        bak = runlog.with_name(f"run.log.{stamp}")
-        try:
-            runlog.rename(bak); log.info(f"[LOG] 轮转 run.log → {bak.name}")
-        except Exception:
-            shutil.copy2(str(runlog), str(bak))
-            runlog.unlink(missing_ok=True)
-            log.info(f"[LOG] 复制轮转 run.log → {bak.name}")
-    runlog.touch()
-
-# ====================== 主流程 ======================
+# ------------------------- 主逻辑 -------------------------
 
 def main():
     cfg = load_config()
-    paths = cfg["paths"]; cafe = cfg.get("cafe5", {}) or {}
+    paths = cfg.get("paths", {})
+    cafes = cfg.get("cafes", {})
+    bins  = cfg.get("binaries", {})
 
-    logs_dir = Path(paths["logs_dir"])
-    LOG_FILE = logs_dir / "12_cafe5_run_models.log"
-    log = get_logger("aphylo.12", LOG_FILE)
-    banner(log, "APhylo 12 — CAFE5 批量模型（按第2列OG，自救增强）")
+    cafe_bin = str(bins.get("cafe5", "cafe5"))
+    threads  = int(cafes.get("threads", 30))
+    # —— 改动 1：支持把 k_cycles: 0 视为 Base（不传 -k） ——
+    _raw_k = cafes.get("k_cycles", None)
+    k_cycles = int(_raw_k) if str(_raw_k).strip() not in ("", "None", "none", "0") else None
+    p_alpha  = float(cafes.get("p_alpha", 0.05))
+    models   = cafes.get("models", ["global"])
 
-    if not cafe.get("enable", True):
-        log.info("cafe5.enable=false —— 跳过本步")
-        write_done(Path(paths["cafe_run_dir"]) / ".cafe.done"); return
+    # 两阶段：large
+    two_stage = cafes.get("two_stage_large", {}) or {}
+    large_enable = bool(two_stage.get("enable", True))
+    large_copy_thr = int(two_stage.get("copy_threshold", 100))
 
-    threads = int(cafe.get("threads", 4))
-    k = cafe.get("gamma_k", None)
-    pval_thr = cafe.get("pvalue", None)
-    models = cafe.get("models", ["global"])
-    max_autofix_rounds = int(cafe.get("max_autofix_rounds", 0))  # 0=关闭自动修正
-    cafe_bin = cfg.get("binaries", {}).get("cafe5", "cafe5")
+    # 自动修正轮数（仅 primary）
+    max_autofix = int(cafes.get("max_autofix_rounds", 3))
 
-    # 输入
-    inp = need_dir(Path(paths["cafe_run_dir"]) / "input", "CAFE 输入目录")
-    ts = sorted(inp.glob("*.tsv"));  nwks = sorted(inp.glob("*.nwk"))
-    if not ts:  raise FileNotFoundError("[ERR] 未找到 family TSV（*.tsv）")
-    if not nwks:raise FileNotFoundError("[ERR] 未找到超时钟树（*.nwk）")
-    family0_abs = ts[0].resolve(); nwk_abs = nwks[0].resolve()
-    log.info(f"[IN] family: {family0_abs}")
-    log.info(f"[IN] tree  : {nwk_abs}")
-    if max_autofix_rounds > 0:
-        log.info(f"[CFG] max_autofix_rounds = {max_autofix_rounds}")
+    # 误差模型
+    em = cafes.get("error_model", {}) or {}
+    em_enable  = bool(em.get("enable", False))
+    em_mode    = str(em.get("mode", "off")).lower()   # off|estimate|use
+    em_file    = em.get("file", None)
+    em_apply   = str(em.get("apply_to", "primary")).lower()  # primary|both
 
-    # 输出
-    models_dir = ensure_dir(Path(paths["cafe_run_dir"]) / "models")
+    # 归档/清理
+    archive = cafes.get("archive_on_start", False)
 
-    all_ok = True
-    for model in models:
-        mname = str(model).replace(":", "_")
-        mdir = ensure_dir(models_dir / mname)
-        runlog = mdir / "run.log"
-        log.info(f"[MODEL {model}] 输出目录：{mdir}")
+    # 路径
+    proj_root = Path(".").resolve()
+    cafe_root = ensure_dir(Path(paths.get("cafe_run_dir", "results/06_cafe")))
+    input_dir = ensure_dir(cafe_root / "input")
+    models_root = ensure_dir(cafe_root / "models")
+    logs_dir = ensure_dir(Path(paths.get("logs_dir", "logs")))
+    # —— 集中主日志：开跑即清空（不轮转） ——
+    MAIN_LOG = logs_dir / "12_cafe5_run_models.log"
+    with MAIN_LOG.open("w", encoding="utf-8"):
+        pass
 
-        # 开跑前：归档旧产物 + run.log 轮转
-        archive_previous_run(mdir, log)
-        rotate_runlog(runlog, log)
+    family_tsv = Path(paths.get("cafe_family", str(input_dir / "family.tsv")))
+    utree_nwk  = Path(paths.get("cafe_tree",   str(input_dir / "utree_for_cafe.nwk")))
 
-        current_family = family0_abs
-        success = False
-        rounds = max(0, max_autofix_rounds)
-
-        for r in range(0, rounds + 1):
-            before = list_dirnames(mdir)
-
-            cmd = [cafe_bin, "-i", str(current_family), "-t", str(nwk_abs), "-c", str(threads), "-o", "."]
-            if k: cmd += ["-k", str(k)]
-            if pval_thr is not None: cmd += ["-P", str(pval_thr)]
-
-            # 跑一轮
-            out_lines = run_cafe_streaming(cmd, mdir, log, model)
-            stdout_text = "\n".join(out_lines)
-
-            # 致命错误（非初始化类）
-            detect_cafe_errors_fatal(stdout_text, model, LOG_FILE)
-            # 记录 run.log
-            append_runlog(runlog, f"MODEL={model} ROUND={r+1}", out_lines)
-
-            # 成功 or 自救
-            if need_autofix(stdout_text):
-                ogs = parse_extreme_ogs_from_stdout(stdout_text)
-                if ogs and r < rounds:
-                    # 交叉校验（按第2列）
-                    hit_n = count_hits_in_family_by_col2(current_family, ogs)
-                    if hit_n == 0:
-                        log.error(f"[MODEL {model}] 解析到 {len(ogs)} 个极端 OG，但在 {current_family.name} 第2列命中数为 0。"
-                                  f"请检查 family 的分隔与 OG 列内容是否一致。")
-                        success = False; break
-
-                    # 记录被删 OG
-                    removed_tsv = mdir / f"autofix_removed_round{r+1}.tsv"
-                    with removed_tsv.open("w", encoding="utf-8") as w:
-                        w.write("OG\n"); w.write("\n".join(ogs) + "\n")
-
-                    # 生成下一轮 family（按第2列剔除）
-                    next_family = mdir / f"family.autofix{r+1}.tsv"
-                    filter_family_drop_ogs_by_col2(current_family, ogs, next_family, log)
-                    current_family = next_family.resolve()
-
-                    # 移走本轮新产物（避免 13 聚合旧轮）
-                    after = list_dirnames(mdir)
-                    new_names = after - before
-                    keep = {runlog.name, removed_tsv.name, next_family.name}
-                    move_round_outputs(mdir, new_names, r+1, keep, log)
-
-                    log.info(f"[MODEL {model}] 第 {r+1} 轮自动修正完成，进入下一轮。")
-                    continue
-                else:
-                    log.error(f"[MODEL {model}] 检测到初始化失败，但已无剩余轮次或未解析出 OG。")
-                    success = False; break
-            else:
-                success = True
-                log.info(f"[MODEL {model}] CAFE5 运行完成（第 {r+1} 轮，无失败提示）。")
-                break
-
-        if not success:
-            all_ok = False
-            break  # 任一模型失败即整体退出
-
-    if all_ok:
-        write_done(Path(paths["cafe_run_dir"]) / ".cafe.done")
-        log.info("[DONE] CAFE5 模型运行完成")
+    print("="*60)
+    print(" APhylo 12 — CAFE5（教程增强版·两阶段/误差/流式输出）")
+    print("="*60)
+    print(f"[IN] family: {family_tsv}")
+    print(f"[IN] tree  : {utree_nwk}")
+    # —— 改动 2：k 为 None 时显示 Base ——
+    print(f"[CFG] threads={threads}, k={'Base' if k_cycles is None else k_cycles}, P={p_alpha}, models={models}")
+    if large_enable:
+        print(f"[CFG] two-stage large: enable, copy_threshold={large_copy_thr}")
     else:
-        sys.stderr.write("[ERR] CAFE5 自动修正用尽或删除失败；请检查 family/树/注释质量与分隔符/列内容。\n")
-        sys.exit(2)
+        print(f"[CFG] two-stage large: disabled")
+    if em_enable:
+        print(f"[CFG] error model: mode={em_mode}, apply_to={em_apply}, file={em_file or 'N/A'}")
+    else:
+        print(f"[CFG] error model: off")
+
+    # 可选归档旧模型
+    if archive and models_root.exists():
+        tag = now_tag()
+        dst = cafe_root / f"models_archive_{tag}"
+        shutil.move(str(models_root), str(dst))
+        print(f"[ARCHIVE] 旧 models -> {dst}")
+        ensure_dir(models_root)
+
+    # 拆分 primary/large
+    primary_tsv = input_dir / "family.primary.tsv"
+    large_tsv   = input_dir / "family.large.tsv"
+    prim_n, larg_n = split_primary_large(family_tsv, primary_tsv, large_tsv, large_copy_thr)
+    print(f"[SPLIT] primary={prim_n} 行, large={larg_n} 行（阈值 {large_copy_thr}）")
+
+    # 误差模型（estimate）文件落点
+    estim_err_file: Optional[Path] = None
+
+    # 遍历模型（目前多半只有 'global'）
+    for model in models:
+        print("\n" + "="*60)
+        print(f"[MODEL={model} PRIMARY-GLOBAL] —— CAFE5 入口开始 ——")
+        print("="*60)
+
+        mroot = ensure_dir(models_root / model)
+        flags_dir = ensure_dir(mroot / "flags")
+        sent_dir  = ensure_dir(mroot / "sentinels")
+
+        # ---------- PRIMARY ----------
+        out_primary = ensure_dir(mroot / "primary_global")
+        runlog_p = out_primary / "run.log"
+        # 清空 run.log（轮转）
+        if runlog_p.exists():
+            bak = out_primary / f"run_{now_tag()}.log"
+            shutil.move(str(runlog_p), str(bak))
+        runlog_p.touch()
+
+        # primary 输入文件（可能经历 autofix 迭代）
+        cur_family = primary_tsv
+        lambda_fixed: Optional[float] = None
+
+        for rnd in range(1, max_autofix + 1):
+            print(f"[PRIMARY-GLOBAL ROUND={rnd}] 入口")
+            cmd = [
+                cafe_bin,
+                "-i", str(cur_family),
+                "-t", str(utree_nwk),
+                "-c", str(threads),
+                # （原来这里有 -k；见改动 3）
+                "-P", str(p_alpha),
+                "-o", str(out_primary)
+            ]
+            # —— 改动 3（part A）：仅当 k_cycles 有效时才追加 -k ——
+            if k_cycles is not None:
+                cmd += ["-k", str(k_cycles)]
+
+            # 误差模型（仅当 enable & apply_to 包含 primary）
+            em_use_this_round = (em_enable and em_mode in ("use","estimate") and em_apply in ("primary","both"))
+            err_model_path_for_run: Optional[Path] = None
+
+            if em_use_this_round:
+                if em_mode == "use":
+                    if not em_file or not Path(em_file).is_file():
+                        print("[WARN] 指定的误差模型文件不存在，跳过误差应用。")
+                    else:
+                        cmd.append(f"-e{em_file}")
+                elif em_mode == "estimate":
+                    # 先独立估计误差模型（只需一次）
+                    if estim_err_file is None:
+                        print("[EM] 估计误差模型（estimate）")
+                        em_out = ensure_dir(mroot / "primary_global" / "emodel_tmp")
+                        em_cmd = [cafe_bin, "-i", str(cur_family), "-t", str(utree_nwk), "-e", "-o", str(em_out)]
+                        _ = tee_streamed(em_cmd, cwd=proj_root, logfile=(em_out / "em_estimate.log"), mirror=MAIN_LOG)
+                        # CAFE5 命名可能为 Base_error_model.txt 或 Gamma_error_model.txt，做个兜底
+                        cand = [em_out/"Base_error_model.txt", em_out/"Gamma_error_model.txt", em_out/"error_model.txt"]
+                        for p in cand:
+                            if p.is_file():
+                                estim_err_file = p
+                                break
+                        if estim_err_file:
+                            print(f"[EM] 估计完成：{estim_err_file.name}")
+                        else:
+                            print("[WARN] 未找到误差模型输出，继续无误差。")
+                    if estim_err_file and estim_err_file.is_file():
+                        cmd.append(f"-e{str(estim_err_file)}")
+
+            # 跑 CAFE5（流式）
+            ret = tee_streamed(cmd, cwd=proj_root, logfile=runlog_p, mirror=MAIN_LOG)
+            print(f"[PRIMARY-GLOBAL ROUND={rnd}] ret={ret}")
+
+            # 抓 λ（用于 large 固定）
+            if lambda_fixed is None:
+                # Gamma_results.txt / Base_results.txt 皆可
+                for nm in ("Gamma_results.txt", "Base_results.txt"):
+                    p = out_primary / nm
+                    lam = extract_lambda_from_results(p)
+                    if lam is not None:
+                        lambda_fixed = lam
+                        print(f"[PRIMARY] λ = {lambda_fixed}")
+                        break
+
+            # 解析极端 OG（仅 primary 做自动修正）
+            extreme = parse_extreme_from_runlog(runlog_p)
+            if not extreme:
+                print("[PRIMARY] 未解析到极端 OG 或已稳定，结束自动修正。")
+                break
+            # 生成下一轮 family
+            nxt = input_dir / f"family.autofix{rnd}.tsv"
+            removed = filter_family_remove_ogs(cur_family, nxt, extreme)
+            # 记录被移除的 OG
+            (mroot / f"autofix_removed_round{rnd}.tsv").write_text("\n".join(extreme) + "\n", encoding="utf-8")
+            print(f"[PRIMARY] 解析到 {len(extreme)} 个极端 OG，实际从 family 移除 {removed} 行。")
+            if removed == 0:
+                print("[PRIMARY] 解析与 family 不匹配，停止自动修正。")
+                break
+            cur_family = nxt  # 下一轮用修正后的 family
+
+        # 记高失败率家族
+        high_fail = parse_high_fail_from_runlog(runlog_p)
+        if high_fail:
+            (flags_dir / "high_fail_ogs.list").write_text("\n".join(high_fail) + "\n", encoding="utf-8")
+            print(f"[PRIMARY] 高失败率家族记录：{len(high_fail)}")
+
+        # ---------- LARGE（只跑一次，不剔除极端 OG） ----------
+        if large_enable and large_tsv.is_file() and larg_n > 0:
+            print("\n" + "="*60)
+            print(f"[MODEL={model} LARGE] —— CAFE5 入口开始 ——")
+            print("="*60)
+
+            out_large = ensure_dir(mroot / "large")
+            runlog_l = out_large / "run.log"
+            if runlog_l.exists():
+                bak = out_large / f"run_{now_tag()}.log"
+                shutil.move(str(runlog_l), str(bak))
+            runlog_l.touch()
+
+            cmdL = [
+                cafe_bin,
+                "-i", str(large_tsv),
+                "-t", str(utree_nwk),
+                "-c", str(threads),
+                # （原来这里有 -k；见改动 3）
+                "-P", str(p_alpha),
+                "-o", str(out_large)
+            ]
+            # —— 改动 3（part B）：仅当 k_cycles 有效时才追加 -k ——
+            if k_cycles is not None:
+                cmdL += ["-k", str(k_cycles)]
+
+            # 固定 λ（若 primary 成功获得）
+            if lambda_fixed is not None:
+                cmdL += ["-l", f"{lambda_fixed}"]
+
+            # 误差模型应用：若 apply_to = both
+            if em_enable and em_mode in ("use","estimate") and em_apply == "both":
+                if em_mode == "use":
+                    if em_file and Path(em_file).is_file():
+                        cmdL.append(f"-e{em_file}")
+                elif em_mode == "estimate":
+                    if estim_err_file and estim_err_file.is_file():
+                        cmdL.append(f"-e{str(estim_err_file)}")
+
+            retL = tee_streamed(cmdL, cwd=proj_root, logfile=runlog_l, mirror=MAIN_LOG)
+            print(f"[LARGE] ret={retL}")
+
+            # 记录 large 阶段的高失败率家族（额外）
+            high_fail_L = parse_high_fail_from_runlog(runlog_l)
+            if high_fail_L:
+                (flags_dir / "high_fail_ogs_large.list").write_text("\n".join(high_fail_L) + "\n", encoding="utf-8")
+                print(f"[LARGE] 高失败率家族记录：{len(high_fail_L)}")
+        else:
+            print("[LARGE] 跳过：未启用或无 large 行。")
+
+        # sentinel
+        (sent_dir / ".done_primary_global").write_text(now_tag()+"\n", encoding="utf-8")
+
+    # 总完成旗标
+    (cafe_root / ".cafe.done").write_text(now_tag()+"\n", encoding="utf-8")
+    print("\n---- CAFÉ5 全部结束。祝皇上凯旋！----")
 
 if __name__ == "__main__":
     try:
         main()
     except Exception as e:
-        sys.stderr.write(str(e) + "\n")
+        sys.stderr.write(f"[FATAL] {e}\n")
         sys.exit(2)
+

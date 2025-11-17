@@ -26,8 +26,8 @@
       finetune = 1: .08 .12 .1 .5 .12 .05 * auto (0 or 1): times, musigma2, rates, mixing, paras, FossilErr
 
          print = 1   * 0: no mcmc sample; 1: everything except branch rates 2: everything
-        burnin = 500000
+        burnin = 200000
       sampfreq = 50
-       nsample = 200000
+       nsample = 100000
 
 *** Note: Make your window wider (100 columns) before running the program.

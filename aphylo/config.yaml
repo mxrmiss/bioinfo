@@ -61,7 +61,7 @@ codeml:
     - name: "HighSalinity"
       tips: ["Sinonovacula_constricta"]         # 论文：高盐前景
 
-cafes:
+cafe5:
   threads: 30                                          # -c
   k_cycles:                                           # -k
   p_alpha: 0.05                                        # -P
