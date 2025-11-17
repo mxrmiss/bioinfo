@@ -80,12 +80,13 @@ deg:
   transform: "vst"        # vst|rlog；仅影响下游可选的矩阵导出（不做绘图）
 
 # ========== 注释准备（07 / 07b） ==========
-annot:
+go_local:
   # 07b（go_local.R）导出范围控制：FALSE=仅导出 gene2go.tsv 中出现的 GO（推荐）；TRUE=导出 GO.db 全量
-  go_export_all: false
+  export_all: false
 
 # ========== 富集分析（08） ==========
 enrich:
+  input: deg               # 或 lists
   source: emapper_only     # 仅使用 emapper 产生的 GO/Pathway 集合
   pval_cutoff: 0.05
   p_adjust: "BH"           # 多重校正方法：BH | BY | holm | hochberg | hommel | bonferroni | fdr | none

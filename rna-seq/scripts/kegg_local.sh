@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 # =============================================================================
-# build_kegg_pathway_maps_local.sh  v9.2 — 自愈构建器
+# kegg_local.sh  v9.2 — 自愈构建器（最小化口径统一：表头与落点）
 # - 手工基准映射优先：ref/ko_to_pathway.tsv.manual 若存在，直接用，不覆盖
 # - 若无手工表：若缺 RAW 自动下载，再规范化为 ko_to_pathway.tsv
-# - 生成：term2gene_kegg_pathway.tsv / term2name_kegg_pathway.tsv
+# - 生成：term2gene_kegg_pathway.tsv / kegg_pathway.tsv（名称字典）
 # - 可选：KEGG-MODULE（term2gene_kegg_module.tsv / term2name_kegg_module.tsv）
-# - 规范化严格且不丢行：只在正确列做去前缀/大小写/正则校验，多 KO 拆分，CR/LANG 兼容
+# - 统一表头：
+#     kegg_pathway.tsv               -> pathway_id\tname
+#     term2gene_kegg_pathway.tsv     -> pathway_id\tgene
 # =============================================================================
 
 # ==== 开关 ====
@@ -21,8 +23,9 @@ MANUAL="$REF/ko_to_pathway.tsv.manual"
 KO2PATH_TSV="$REF/ko_to_pathway.tsv"
 PATHNAME_TSV="$REF/kegg_pathway.tsv"
 
-T2G_PW="$REF/kegg_legacy/term2gene_kegg_pathway.tsv"
-T2N_PW="$REF/kegg_pathway.tsv"
+# —— 改动①：term2gene 产到顶层（原来在 kegg_legacy 下）——
+T2G_PW="$REF/term2gene_kegg_pathway.tsv"
+T2N_PW="$REF/kegg_pathway_bak.tsv"
 
 T2G_MOD="$REF/kegg_legacy/term2gene_kegg_module.tsv"
 T2N_MOD="$REF/kegg_legacy/term2name_kegg_module.tsv"
@@ -39,8 +42,8 @@ norm_ko_path(){
   awk -vOFS='\t' '{
     gsub(/\r/,"");
     k=$1; p=$2;
-    gsub(/^ko:/,"",k); k=toupper(k);                  # 仅 KO 列
-    gsub(/^path:/,"",p); sub(/^map/,"ko",p);         # 仅 Path 列
+    gsub(/^ko:/,"",k); k=toupper(k);
+    gsub(/^path:/,"",p); sub(/^map/,"ko",p);
     if (k ~ /^K[0-9]{5}$/ && p ~ /^ko[0-9]{5}$/) print k,p;
   }' "$1" | LC_ALL=C sort -u
 }
@@ -78,6 +81,14 @@ if [[ ! -s "$PATHNAME_TSV" ]]; then
     cut -f2 "$KO2PATH_TSV" | LC_ALL=C sort -u | awk -vOFS='\t' '{print $1,$1}' > "$PATHNAME_TSV"
   fi
 fi
+
+# —— 改动②：确保 kegg_pathway.tsv 带表头 —— 
+if [[ -s "$PATHNAME_TSV" ]]; then
+  if [[ "$(head -n1 "$PATHNAME_TSV")" != $'pathway_id\tname' ]]; then
+    { echo -e "pathway_id\tname"; cat "$PATHNAME_TSV"; } > "$REF/.kegg_pathway.with_header.tsv"
+    mv -f "$REF/.kegg_pathway.with_header.tsv" "$PATHNAME_TSV"
+  fi
+fi
 log "[✔] pathway_names.tsv: $(wc -l < "$PATHNAME_TSV") 行"
 
 # ==== C) gene→KO 预处理：任意分隔符→TAB、多 KO 拆分、清洗 ====
@@ -110,13 +121,18 @@ log "[✔] gene2ko.clean: pairs=$g2k_pairs  genes=$g2k_genes  KO=$g2k_kos"
 
 # ==== D) join：Pathway→gene ====
 log "[4] 连接 KO→Pathway × gene→KO → Pathway→gene"
+tmp_t2g="$REF/.term2gene_kegg_pathway.tmp"
 join -t $'\t' -1 1 -2 2 \
   <(LC_ALL=C sort -k1,1 "$KO2PATH_TSV") \
   <(LC_ALL=C sort -k2,2 "$REF/.gene2ko.clean") \
-| awk -vOFS='\t' '{print $2,$3}' | LC_ALL=C sort -u > "$T2G_PW"
+| awk -vOFS='\t' '{print $2,$3}' | LC_ALL=C sort -u > "$tmp_t2g"
+
+# —— 改动③：确保 term2gene 带表头，并落到顶层 —— 
+{ echo -e "pathway_id\tgene"; cat "$tmp_t2g"; } > "$T2G_PW"
+rm -f "$tmp_t2g"
 
 t2g_lines=$(wc -l < "$T2G_PW")
-if [[ $t2g_lines -eq 0 ]]; then
+if [[ $t2g_lines -le 1 ]]; then
   log "[❌] term2gene_kegg_pathway.tsv 为空，打印未命中 KO 样例："
   comm -23 \
     <(cut -f2 "$REF/.gene2ko.clean" | LC_ALL=C sort -u) \
@@ -124,6 +140,8 @@ if [[ $t2g_lines -eq 0 ]]; then
 else
   log "[✔] term2gene_kegg_pathway.tsv: $t2g_lines 行"
 fi
+
+# 备份一份名称表（保持原行为，不影响口径）
 cp -f "$PATHNAME_TSV" "$T2N_PW"
 log "[✔] term2name_kegg_pathway.tsv: $(wc -l < "$T2N_PW") 行"
 
@@ -159,3 +177,4 @@ if [[ "$ENABLE_MODULE" -eq 1 ]]; then
 fi
 
 log "[完成] 构建日志：$LOG"
+
