@@ -2,17 +2,11 @@
 # -*- coding: utf-8 -*-
 
 """
-09_publish_results.py — 发布工作簿（仅用于查看，不参与下游）
-输出：
-  1) 每个 label（对比名或基因集名）一本 xlsx：GO/KEGG × All/Up/Down + 命中明细（若存在） + Summary
-  2) project_summary.xlsx：Quant_QC（Salmon 覆盖率）、Top_GO / Top_KEGG（跨 label 汇总）
-
-与 08 的产物完全对齐：
-- tables/ 下文件名可大小写混用（all/All/up/Up/down/Down），此脚本统一规范为 All/Up/Down。
-- genes/ 下命名采用：GO|KEGG_{all|up|down}__{hit_in_set|hit_in_sig}__<label>.tsv
+09_publish_results.py — 发布工作簿（装订层，不改统计口径）
+新增：强制把 BP/CC/MF & KEGG 的 by-term 宽表写入每本 <label>.xlsx（若文件存在）。
 """
 
-import sys, os, re, yaml, pandas as pd
+import sys, re, yaml, pandas as pd
 from pathlib import Path
 from collections import defaultdict
 
@@ -26,7 +20,6 @@ DEFAULTS = {
     }
 }
 
-# ---------- 小工具 ----------
 def load_yaml(fp):
     with open(fp, "r", encoding="utf-8") as r:
         return yaml.safe_load(r) or {}
@@ -40,94 +33,82 @@ def deep_merge(a,b):
             out[k]=v
     return out
 
-def read_tsv(fp):
-    """所有列按字符串读入，避免 NA/科学计数污染"""
+def read_tsv(fp):  # 全字符串
     return pd.read_csv(fp, sep="\t", dtype=str).fillna("")
 
-def read_tsv_num(fp):
-    """数值列保留原类型，用于 padj/pvalue 排序"""
+def read_tsv_num(fp):  # 数值列自动
     return pd.read_csv(fp, sep="\t")
 
 def norm_subset(s: str) -> str:
-    """把 all/up/down（任意大小写）统一为 All/Up/Down"""
     x = (s or "").strip().lower()
     if x == "all":  return "All"
     if x == "up":   return "Up"
     if x == "down": return "Down"
-    return s  # 未识别时原样返回（后续一般会被忽略）
+    return s
 
-# ---------- 收集 08 的富集表 ----------
+# --------- 收集富集表 ----------
 def collect_enrich_tables(enrich_tables_dir: Path):
-    """
-    返回 dict[label][type]['All'/'Up'/'Down'] = DataFrame
-      - type: 'GO' | 'KEGG'
-      - label: go_enrich_<label>_<subset>.tsv / kegg_enrich_<label>_<subset>.tsv
-    """
     m = defaultdict(lambda: {"GO":{}, "KEGG":{}})
-
     if not enrich_tables_dir.exists():
         raise FileNotFoundError(f"[ERR] 未找到富集表目录：{enrich_tables_dir}")
-
     files = list(enrich_tables_dir.glob("*.tsv"))
     if not files:
-        raise FileNotFoundError(f"[ERR] 目录为空：{enrich_tables_dir}（期待 go_enrich_*.tsv / kegg_enrich_*.tsv）")
+        raise FileNotFoundError(f"[ERR] 目录为空：{enrich_tables_dir}")
 
-    pat = re.compile(r"^(go|kegg)_enrich_(.+)_(All|Up|Down|all|up|down)\.tsv$", re.IGNORECASE)
+    pat = re.compile(r"^(go|kegg)_enrich_(.+)_(All|all|Up|up|Down|down)\.tsv$")
     matched = 0
     for fp in files:
         g = pat.match(fp.name)
-        if not g:
-            continue
+        if not g: continue
         typ = "GO" if g.group(1).lower()=="go" else "KEGG"
         label = g.group(2)
         subset = norm_subset(g.group(3))
-        try:
-            df = read_tsv_num(fp)
-        except Exception as e:
-            raise RuntimeError(f"[ERR] 读取富集表失败：{fp} ；原因：{e}")
+        df = read_tsv_num(fp)
         m[label][typ][subset] = df
         matched += 1
-
     if matched == 0:
-        raise FileNotFoundError(f"[ERR] 未匹配到任何富集表文件，请检查命名：{enrich_tables_dir}")
-
+        raise FileNotFoundError(f"[ERR] 未匹配到任何富集表：{enrich_tables_dir}")
     return m
 
-# ---------- 收集 genes/ 命中明细（按当前命名规范） ----------
+# --------- 收集命中长表（可选） ----------
 def collect_gene_hits(genes_dir: Path):
-    """
-    返回 dict[label][type]['All'/'Up'/'Down']['hit_in_set'|'hit_in_sig'] = DataFrame
-    文件命名：GO|KEGG_{all|up|down}__{hit_in_set|hit_in_sig}__<label>.tsv
-    """
-    hits = defaultdict(lambda: {"GO": {"All":{}, "Up":{}, "Down":{}},
-                               "KEGG":{"All":{}, "Up":{}, "Down":{}}})
+    hits = defaultdict(lambda: {"GO":{"All":{}, "Up":{}, "Down":{}},
+                                "KEGG":{"All":{}, "Up":{}, "Down":{}}})
     if not genes_dir.exists():
-        # 没有 genes 目录不报错，视为可选
         return hits
-
-    files = list(genes_dir.glob("*.tsv"))
-    if not files:
-        return hits
-
     pat = re.compile(r"^(GO|KEGG)_(all|up|down)__(hit_in_set|hit_in_sig)__(.+)\.tsv$", re.IGNORECASE)
-    for fp in files:
+    for fp in genes_dir.glob("*.tsv"):
         m = pat.match(fp.name)
-        if not m:
-            continue
-        typ = m.group(1).upper()
-        subset = norm_subset(m.group(2))
-        which = m.group(3)  # 命名维持小写
+        if not m: continue
+        typ   = m.group(1).upper()
+        subset= norm_subset(m.group(2))
+        which = m.group(3)
         label = m.group(4)
-        try:
-            df = read_tsv(fp)
-        except Exception as e:
-            raise RuntimeError(f"[ERR] 读取命中明细失败：{fp} ；原因：{e}")
-        hits[label][typ][subset][which] = df
-
+        hits[label][typ][subset][which] = read_tsv(fp)
     return hits
 
-# ---------- 写单本工作簿 ----------
-def write_label_workbook(publish_dir: Path, label: str, bundle: dict, gene_hits: dict):
+# --------- 收集 by-term 宽表（强制装订，若存在就写） ----------
+def collect_byterm(genes_dir: Path):
+    """
+    GO_BP/GO_CC/GO_MF_{all|up|down}_genes_by_term.tsv
+    KEGG_pathway_{all|up|down}_genes_by_term.tsv
+    与 label 无关（by-term 是跨 label 的视图），直接作为附表写入每本工作簿。
+    """
+    store = {"GO_BP":{}, "GO_CC":{}, "GO_MF":{}, "KEGG":{}}
+    if not genes_dir.exists():
+        return store
+    for subset in ["All","Up","Down"]:
+        # GO 三域
+        for dom, prefix in [("GO_BP", "GO_BP"), ("GO_CC","GO_CC"), ("GO_MF","GO_MF")]:
+            fp = genes_dir / f"{prefix}_{subset.lower()}_genes_by_term.tsv"
+            if fp.exists(): store[dom][subset] = read_tsv(fp)
+        # KEGG
+        fp_k = genes_dir / f"KEGG_pathway_{subset.lower()}_genes_by_term.tsv"
+        if fp_k.exists(): store["KEGG"][subset] = read_tsv(fp_k)
+    return store
+
+# --------- 写工作簿 ----------
+def write_label_workbook(publish_dir: Path, label: str, bundle: dict, gene_hits: dict, byterm: dict):
     xlsx = publish_dir / f"{label}.xlsx"
     with pd.ExcelWriter(xlsx, engine="xlsxwriter") as w:
         # Summary
@@ -135,8 +116,7 @@ def write_label_workbook(publish_dir: Path, label: str, bundle: dict, gene_hits:
         for typ in ["GO","KEGG"]:
             for subset in ["All","Up","Down"]:
                 df = bundle.get(typ, {}).get(subset)
-                if df is None or len(df)==0:
-                    continue
+                if df is None or len(df)==0: continue
                 row = {
                     "type": typ, "subset": subset,
                     "bg_size": df.get("bg_size",[None]).iloc[0] if "bg_size" in df.columns else None,
@@ -147,67 +127,68 @@ def write_label_workbook(publish_dir: Path, label: str, bundle: dict, gene_hits:
         if summary_rows:
             pd.DataFrame(summary_rows).to_excel(w, index=False, sheet_name="Summary")
 
-        # 富集表（GO/KEGG × All/Up/Down）
+        # 富集表
         for typ in ["GO","KEGG"]:
             for subset in ["All","Up","Down"]:
                 df = bundle.get(typ,{}).get(subset)
-                if df is None or len(df)==0:
-                    continue
+                if df is None or len(df)==0: continue
                 df.to_excel(w, index=False, sheet_name=f"{typ}_{subset}")
 
-        # 命中明细（若存在则写入）
+        # 命中长表（若存在）
         gstore = gene_hits.get(label, {})
         for typ in ["GO","KEGG"]:
             for subset in ["All","Up","Down"]:
                 for which in ["hit_in_set","hit_in_sig"]:
                     df = (((gstore.get(typ, {})).get(subset, {})).get(which))
-                    if df is None or len(df)==0:
-                        continue
-                    # Sheet 名 ≤31 字符
+                    if df is None or len(df)==0: continue
                     sheet = f"{typ}_{subset}_{which}"
-                    if len(sheet) > 31:
-                        sheet = sheet[:31]
+                    if len(sheet) > 31: sheet = sheet[:31]
                     df.to_excel(w, index=False, sheet_name=sheet)
+
+        # by-term 宽表（强制写：若磁盘存在就写）
+        for subset in ["All","Up","Down"]:
+            for dom, sh in [("GO_BP","GO_BP"), ("GO_CC","GO_CC"), ("GO_MF","GO_MF")]:
+                df = byterm.get(dom,{}).get(subset)
+                if df is not None and len(df)>0:
+                    name = f"{sh}_{subset}_by_term"
+                    if len(name)>31: name = name[:31]
+                    df.to_excel(w, index=False, sheet_name=name)
+            dfk = byterm.get("KEGG",{}).get(subset)
+            if dfk is not None and len(dfk)>0:
+                name = f"KEGG_{subset}_by_term"
+                if len(name)>31: name = name[:31]
+                dfk.to_excel(w, index=False, sheet_name=name)
 
     return xlsx
 
-# ---------- 项目总览 ----------
+# --------- 总览 ----------
 def build_project_summary(publish_dir: Path, quant_dir: Path, collect: dict):
     xlsx = publish_dir / "project_summary.xlsx"
     with pd.ExcelWriter(xlsx, engine="xlsxwriter") as w:
-        # Salmon 覆盖率
         qsum = quant_dir / "summary.tsv"
         if qsum.exists():
-            try:
-                pd.read_csv(qsum, sep="\t").to_excel(w, index=False, sheet_name="Quant_QC")
-            except Exception as e:
-                raise RuntimeError(f"[ERR] 读取 quant/summary.tsv 失败：{qsum} ；原因：{e}")
-
-        # Top GO/KEGG（跨 label 合并，按 padj、pvalue 排序）
+            pd.read_csv(qsum, sep="\t").to_excel(w, index=False, sheet_name="Quant_QC")
         rows_go, rows_kegg = [], []
         for label, bundle in collect.items():
             for typ, store in bundle.items():
                 for subset, df in store.items():
-                    if df is None or len(df)==0:
-                        continue
+                    if df is None or len(df)==0: continue
                     tmp = df.copy()
                     tmp.insert(0, "label", label)
                     tmp.insert(1, "subset", subset)
-                    if typ=="GO":
-                        rows_go.append(tmp)
-                    else:
-                        rows_kegg.append(tmp)
+                    (rows_go if typ=="GO" else rows_kegg).append(tmp)
         if rows_go:
             go_all = pd.concat(rows_go, ignore_index=True)
-            go_all = go_all.sort_values(["padj","pvalue"], na_position="last") if "padj" in go_all.columns and "pvalue" in go_all.columns else go_all
+            if "padj" in go_all.columns and "pvalue" in go_all.columns:
+                go_all = go_all.sort_values(["padj","pvalue"], na_position="last")
             go_all.to_excel(w, index=False, sheet_name="Top_GO")
         if rows_kegg:
             kegg_all = pd.concat(rows_kegg, ignore_index=True)
-            kegg_all = kegg_all.sort_values(["padj","pvalue"], na_position="last") if "padj" in kegg_all.columns and "pvalue" in kegg_all.columns else kegg_all
+            if "padj" in kegg_all.columns and "pvalue" in kegg_all.columns:
+                kegg_all = kegg_all.sort_values(["padj","pvalue"], na_position="last")
             kegg_all.to_excel(w, index=False, sheet_name="Top_KEGG")
     return xlsx
 
-# ---------- 主程 ----------
 def main():
     proj = Path.cwd()
     cfg_fp = proj / "config.yaml"
@@ -223,31 +204,30 @@ def main():
     publish_dir       = proj / paths.get("publish_dir","results/publish")
     publish_dir.mkdir(parents=True, exist_ok=True)
 
-    # —— 输入检测（清晰报错）——
     if not enrich_dir.exists():
         print(f"[ERR] 未找到富集结果目录：{enrich_dir}（请先完成 08）", file=sys.stderr); sys.exit(2)
     if not enrich_tables_dir.exists():
         print(f"[ERR] 未找到富集表目录：{enrich_tables_dir}（请确认 08 是否成功）", file=sys.stderr); sys.exit(2)
 
-    # 读取富集表（必须有）
     try:
         collect = collect_enrich_tables(enrich_tables_dir)
     except Exception as e:
         print(str(e), file=sys.stderr); sys.exit(2)
 
-    # 读取命中明细（可选）
+    # 可选：命中长表
     try:
         gene_hits = collect_gene_hits(genes_dir)
     except Exception as e:
         print(str(e), file=sys.stderr); sys.exit(3)
 
-    # 逐 label 写工作簿
+    # 强制：by-term 宽表（若存在就装订）
+    byterm = collect_byterm(genes_dir)
+
     created = []
     for label, bundle in collect.items():
-        xlsx = write_label_workbook(publish_dir, label, bundle, gene_hits)
+        xlsx = write_label_workbook(publish_dir, label, bundle, gene_hits, byterm)
         created.append(xlsx)
 
-    # 项目总览
     try:
         summary_xlsx = build_project_summary(publish_dir, quant_dir, collect)
     except Exception as e:
