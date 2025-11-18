@@ -43,7 +43,7 @@ norm_ko_path(){
   awk -vOFS='\t' '{
     gsub(/\r/,"");
     k=$1; p=$2;
-    gsub(/^ko:/,"",k); k=toupper(k);
+    gsub(/^ko:/,"",k); k=toupper(k);   # 清除 ko: 前缀
     gsub(/^path:/,"",p); sub(/^map/,"ko",p);
     if (k ~ /^K[0-9]{5}$/ && p ~ /^ko[0-9]{5}$/) print k,p;
   }' "$1" | LC_ALL=C sort -u
