@@ -1,226 +1,240 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+
 """
-04_salmon_quant.py — Salmon 准比对定量（PE/SE，自适应解析 FASTQ 路径，带回退）
+04_salmon_quant.py —— Salmon 定量（严格契约·PE）
+规则（与约定一致）：
+  1) 仅读取项目根的 config.yaml，不接收命令行参数；
+  2) 只支持 PE；样本表必须包含列：sample, group, fastq1, fastq2；
+  3) 有 clean 就用 clean（results/01_qc/clean/{sample}_R1/2.fastq.gz）；
+     若缺 clean：
+        - quant.require_clean_fastq=true → 直接报错退出；
+        - 否则回落到 raw（samples.tsv 中的 fastq1/fastq2）；
+  4) 跳过 qc/rejects.tsv 中列出的样本；
+  5) 索引目录有效性：必须存在 info.json + refseq.bin + (hash.bin 或 mphf.bin)；
+  6) 线程取 resources.threads.salmon；库型取 reference.salmon.libtype（通常为 "A"）；
+  7) 日志与屏幕双通道：logs/04_salmon_quant.log；每个样本记录所用 FASTQ 源（clean/raw）与命令行；
+  8) 若 quant.overwrite=false 且目标 quant.sf 已存在 → 跳过并在日志记录。
 """
 
 from __future__ import annotations
-import sys, json, time, subprocess, shutil
+import sys, csv, subprocess, shlex
 from pathlib import Path
-from typing import Dict, Any, Optional, Tuple, List
-import yaml
-import pandas as pd
+from typing import Dict, Any, List, Tuple
+from datetime import datetime
 
-LOCAL_CONFIG = {
-  "config_yaml": "config.yaml",
-  "paths": {
-    "salmon_index": "results/refprep/salmon_index",
-    "quant_dir":    "results/quant",
-    "logs_dir":     "logs",
-    "tx2gene":      "ref/tx2gene.geneMap.tsv",
-    "fastq_dir":    "data/fastq"
-  },
-  "tables": { "samples": "data/samples.tsv" },
-  "binaries": { "salmon": "salmon" },
-  "resources": { "threads": { "quant": 8 } },
-  "salmon": { "libType": "A", "use_geneMap": True }
-}
-SCRIPT_TAG = "04_salmon_quant"
+# ========== 基础工具 ==========
+def now() -> str:
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-def cwd() -> Path: return Path.cwd().resolve()
+def log_print(msg: str, log_fp: Path, ts: bool = True) -> None:
+    line = f"{now()} {msg}" if ts else msg
+    print(line)
+    log_fp.parent.mkdir(parents=True, exist_ok=True)
+    with open(log_fp, "a", encoding="utf-8") as f:
+        f.write(line + "\n")
 
-def to_abs(p: str | Path | None) -> Optional[Path]:
-    if p is None: return None
-    s = str(p).strip()
-    if s == "": return None
-    q = Path(s)
-    return (q if q.is_absolute() else cwd()/q).resolve()
+def load_yaml(cfg_path: Path) -> Dict[str, Any]:
+    try:
+        import yaml
+    except Exception:
+        print("[ERR] 需要 PyYAML，请先安装：mamba/conda install pyyaml", file=sys.stderr)
+        sys.exit(1)
+    if not cfg_path.exists():
+        print(f"[ERR] 未找到配置文件：{cfg_path}", file=sys.stderr); sys.exit(1)
+    with open(cfg_path, "r", encoding="utf-8") as f:
+        user = (yaml.safe_load(f) or {})
 
-def load_yaml(path: str) -> Dict[str, Any]:
-    p = to_abs(path)
-    if not p or not p.exists(): return {}
-    with p.open('r', encoding='utf-8') as f:
-        return yaml.safe_load(f) or {}
+    # 默认值（用户配置覆盖默认）
+    defaults: Dict[str, Any] = {
+        "data": {"samples_tsv": "data/samples.tsv"},
+        "dirs": {"qc": "results/01_qc", "quant": "results/04_quant", "logs": "logs"},
+        "reference": {"salmon": {"index_dir": "ref/salmon_index", "libtype": "A"}},
+        "resources": {"threads": {"salmon": 8}},
+        "binaries": {"salmon": "salmon"},
+        "quant": {"overwrite": False, "require_clean_fastq": False},
+        "logging": {"timestamp": True}
+    }
+    # 递归合并
+    def merge(u: Dict[str, Any], base: Dict[str, Any]) -> Dict[str, Any]:
+        out = dict(base)
+        for k, v in u.items():
+            if isinstance(v, dict) and isinstance(out.get(k), dict):
+                out[k] = merge(v, out[k])
+            else:
+                out[k] = v
+        return out
 
-def merge_params(local_cfg: dict, yaml_cfg: dict) -> dict:
-    if not isinstance(local_cfg, dict): local_cfg = {}
-    if not isinstance(yaml_cfg, dict):  yaml_cfg  = {}
-    def is_set(v):
-        return v is not None and not (isinstance(v,(str,list,dict)) and len(v)==0) \
-               and not (isinstance(v,str) and v.strip()=="")
-    def merge(a,b):
-        if isinstance(a,dict) and isinstance(b,dict):
-            out={}
-            for k in set(a.keys())|set(b.keys()):
-                av=a.get(k); bv=b.get(k)
-                if isinstance(av,dict) or isinstance(bv,dict):
-                    out[k]=merge(av if isinstance(av,dict) else {}, bv if isinstance(bv,dict) else {})
-                else:
-                    out[k]= bv if is_set(bv) else av
-            return out
-        return b if is_set(b) else a
-    return merge(local_cfg, yaml_cfg)
+    cfg = merge(user, defaults)
 
-def err(msg: str):
-    print(f"[ERR] {msg}", file=sys.stderr); sys.exit(1)
+    # 解析关键键位（与契约保持一致）
+    samples_tsv = Path(str(cfg["data"]["samples_tsv"]))
+    qc_root     = Path(str(cfg["dirs"]["qc"]))
+    quant_root  = Path(str(cfg["dirs"]["quant"]))
+    logs_root   = Path(str(cfg["dirs"]["logs"]))
+    index_dir   = Path(str(cfg["reference"]["salmon"]["index_dir"]))
+    libtype     = str(cfg["reference"]["salmon"]["libtype"])  # 按契约：libtype 位于 reference.salmon
+    threads     = int(cfg["resources"]["threads"]["salmon"])
+    salmon_bin  = str(cfg["binaries"]["salmon"])
+    overwrite   = bool(cfg["quant"].get("overwrite", False))
+    require_clean = bool(cfg["quant"].get("require_clean_fastq", False))
+    use_ts = bool(cfg["logging"].get("timestamp", True))
 
-def ensure_dir(p) -> Path:
-    p = to_abs(p); p.mkdir(parents=True, exist_ok=True); return p
+    # 基础检查
+    if not samples_tsv.exists():
+        print(f"[ERR] 未找到样本表：{samples_tsv}", file=sys.stderr); sys.exit(1)
+    # 索引有效：info.json + refseq.bin + (hash.bin 或 mphf.bin)
+    have_any = any((index_dir / x).exists() for x in ("hash.bin", "mphf.bin"))
+    if not ((index_dir / "info.json").exists() and (index_dir / "refseq.bin").exists() and have_any):
+        print(f"[ERR] Salmon 索引目录无效：{index_dir}（缺少 info.json/refseq.bin 或 hash.bin|mphf.bin；请先完成 02）", file=sys.stderr)
+        sys.exit(1)
 
-def require_exists(p, kind="file") -> Path:
-    p = to_abs(p)
-    if p is None: err("必需路径为空")
-    if kind=="file" and not p.is_file(): err(f"缺少文件：{p}")
-    if kind=="dir"  and not p.is_dir() : err(f"缺少目录：{p}")
-    return p
+    cfg["_RESOLVED"] = {
+        "samples_tsv": samples_tsv, "qc_root": qc_root, "quant_root": quant_root,
+        "logs_root": logs_root, "index_dir": index_dir, "libtype": libtype,
+        "threads": threads, "salmon_bin": salmon_bin, "overwrite": overwrite,
+        "require_clean_fastq": require_clean, "use_ts": use_ts
+    }
+    return cfg
 
-def exe_exists(name: str) -> bool: return shutil.which(name) is not None
+def read_samples(samples_tsv: Path) -> List[Dict[str, str]]:
+    rows: List[Dict[str, str]] = []
+    with open(samples_tsv, "r", encoding="utf-8") as f:
+        reader = csv.DictReader(f, dialect=csv.excel_tab)
+        need = ["sample", "group", "fastq1", "fastq2"]
+        if not reader.fieldnames or any(c not in reader.fieldnames for c in need):
+            print(f"[ERR] samples.tsv 必含列：{', '.join(need)}（现有列：{reader.fieldnames}）", file=sys.stderr)
+            sys.exit(1)
+        for r in reader:
+            sid = (r.get("sample") or "").strip()
+            f1  = (r.get("fastq1") or "").strip()
+            f2  = (r.get("fastq2") or "").strip()
+            if not sid or not f1 or not f2:
+                print(f"[ERR] 行缺失：sample/fastq1/fastq2 均需填写（行={r}）", file=sys.stderr); sys.exit(1)
+            rows.append({"sample": sid, "group": (r.get("group") or "").strip(), "fastq1": f1, "fastq2": f2})
+    # 样本 ID 去重
+    seen = set()
+    for r in rows:
+        if r["sample"] in seen:
+            print(f"[ERR] 样本重复：{r['sample']}", file=sys.stderr); sys.exit(1)
+        seen.add(r["sample"])
+    return rows
 
-def log_open(d, tag):
-    d = ensure_dir(d); return open(d/f"{tag}.log","a",encoding="utf-8")
+def read_rejects(qc_root: Path) -> set[str]:
+    rej = set()
+    rej_fp = qc_root / "rejects.tsv"
+    if rej_fp.exists():
+        with open(rej_fp, "r", encoding="utf-8") as f:
+            reader = csv.DictReader(f, dialect=csv.excel_tab)
+            if "sample" in (reader.fieldnames or []):
+                for r in reader:
+                    sid = (r.get("sample") or "").strip()
+                    if sid: rej.add(sid)
+    return rej
 
-def log(fp, msg):
-    ts = time.strftime("%Y-%m-%d %H:%M:%S")
-    fp.write(f"[{ts}] {msg}\n"); fp.flush(); print(msg, flush=True)
+def decide_fastq(sample: str, raw_f1: str, raw_f2: str, qc_root: Path, require_clean: bool) -> Tuple[Path, Path, str]:
+    """返回 (R1, R2, source)，source ∈ {'clean','raw'}；遵循“有 clean 用 clean；否则 raw/或强制报错”"""
+    r1c = qc_root / "clean" / f"{sample}_R1.fastq.gz"
+    r2c = qc_root / "clean" / f"{sample}_R2.fastq.gz"
+    if r1c.exists() and r2c.exists():
+        return r1c, r2c, "clean"
+    if require_clean:
+        print(f"[ERR] 要求使用 clean FASTQ，但未找到：{r1c} 或 {r2c}", file=sys.stderr); sys.exit(1)
+    r1, r2 = Path(raw_f1), Path(raw_f2)
+    if not r1.exists() or not r2.exists():
+        print(f"[ERR] 原始 FASTQ 不存在：{r1} 或 {r2}", file=sys.stderr); sys.exit(1)
+    return r1, r2, "raw"
 
-def write_params_snapshot(params, logs_dir, tag):
-    d = ensure_dir(logs_dir); out = d/f"{tag}.params.tsv"
-    rows=[]
-    def flat(prefix,obj):
-        if isinstance(obj,dict):
-            for k,v in obj.items(): flat(f"{prefix}.{k}" if prefix else k, v)
-        else:
-            rows.append((prefix, json.dumps(obj, ensure_ascii=False)))
-    flat("", params)
-    pd.DataFrame(rows, columns=["key","value"]).to_csv(out, sep="\t", index=False)
+def run_stream(cmd: List[str], log_fp: Path) -> int:
+    """流式执行：屏幕实时打印 + 统一日志"""
+    pretty = " ".join(shlex.quote(c) for c in cmd)
+    log_print("[CMD] " + pretty, log_fp)
+    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+    assert p.stdout is not None
+    with open(log_fp, "a", encoding="utf-8") as lf:
+        for line in p.stdout:
+            line = line.rstrip("\n")
+            print(line)
+            lf.write(line + "\n")
+        rc = p.wait()
+        lf.write(f"{now()} [RC] {rc}\n")
+    if rc != 0:
+        log_print(f"[ERR] 命令执行失败，返回码={rc}", log_fp)
+    return rc
 
-def run_cmd(cmd: list[str], fp, cwd_path: Optional[str]=None, env=None):
-    log(fp, "CMD: " + " ".join(cmd))
-    r = subprocess.run(cmd, cwd=to_abs(cwd_path) if cwd_path else None, env=env)
-    if r.returncode != 0: err(f"外部命令失败，退出码={r.returncode}")
+# ========== 主流程 ==========
+def main() -> None:
+    cfg = load_yaml(Path("config.yaml"))
+    R = cfg["_RESOLVED"]
 
-# -------- 样本表与路径解析 --------
-def parse_samples_table(samples_tsv: Path) -> pd.DataFrame:
-    df = pd.read_csv(samples_tsv, sep="\t", dtype=str).fillna("")
-    cols = {c.lower(): c for c in df.columns}
-    def pick(*cands):
-        for k in cands:
-            if k in cols: return cols[k]
-        return None
-    c_sample = pick("sample","samples","id","sid")
-    c_r1     = pick("r1","fastq1","fq1","read1","file1")
-    c_r2     = pick("r2","fastq2","fq2","read2","file2")
-    if c_sample is None or c_r1 is None:
-        err("samples.tsv 至少需要列：sample 与 R1（大小写/同义名均可）")
-    out = df[[c_sample]].rename(columns={c_sample:"sample"})
-    out["R1"] = df[c_r1].astype(str)
-    out["R2"] = df[c_r2].astype(str) if c_r2 else ""
-    out = out[out["sample"].astype(str).str.len()>0].copy()
-    if out.empty: err("samples.tsv 解析为空，请检查")
-    return out.reset_index(drop=True)
+    logs_root: Path = R["logs_root"]; logs_root.mkdir(parents=True, exist_ok=True)
+    quant_root: Path = R["quant_root"]; quant_root.mkdir(parents=True, exist_ok=True)
+    qc_root: Path = R["qc_root"]
+    log_fp = logs_root / "04_salmon_quant.log"
 
-def resolve_fastq_with_fallback(raw: str, fastq_dir: Path, tried: List[Path]) -> Optional[Path]:
-    """
-    解析顺序（并记录尝试过的候选路径）：
-      1) 绝对路径（若存在）→ 使用
-      2) 相对路径（含 '/'）→ 以项目根解析；若不存在，则回退到 fastq_dir / basename(raw)
-      3) 仅文件名 → fastq_dir / 文件名
-    """
-    if raw is None or str(raw).strip()=="":
-        return None
-    s = str(raw).strip()
-    # 1) 绝对路径
-    p = Path(s)
-    if p.is_absolute():
-        tried.append(p)
-        return p if p.exists() else p  # 让上层统一校验
-    # 2) 相对路径（含 '/'）
-    if "/" in s:
-        p1 = to_abs(p)
-        tried.append(p1)
-        if p1.exists():
-            return p1
-        # 回退到 fastq_dir / basename
-        p2 = to_abs(fastq_dir / p.name)
-        tried.append(p2)
-        return p2
-    # 3) 仅文件名
-    p3 = to_abs(fastq_dir / s)
-    tried.append(p3)
-    return p3
+    # 电子回执（可审计）：把关键键位与取值写入日志与屏幕
+    log_print("========== 04 — Salmon 定量（严格契约·PE） ==========", log_fp, R["use_ts"])
+    log_print(f"[Info] data.samples_tsv            = {R['samples_tsv'].resolve()}", log_fp, R["use_ts"])
+    log_print(f"[Info] reference.salmon.index_dir  = {R['index_dir'].resolve()}", log_fp, R["use_ts"])
+    log_print(f"[Info] reference.salmon.libtype    = {R['libtype']}", log_fp, R["use_ts"])
+    log_print(f"[Info] resources.threads.salmon    = {R['threads']}", log_fp, R["use_ts"])
+    log_print(f"[Info] dirs.quant                   = {R['quant_root'].resolve()}", log_fp, R["use_ts"])
+    log_print(f"[Info] dirs.logs                    = {R['logs_root'].resolve()}", log_fp, R["use_ts"])
+    log_print(f"[Info] binaries.salmon             = {R['salmon_bin']}", log_fp, R["use_ts"])
+    log_print(f"[Info] quant.overwrite             = {R['overwrite']}", log_fp, R["use_ts"])
+    log_print(f"[Info] quant.require_clean_fastq   = {R['require_clean_fastq']}", log_fp, R["use_ts"])
 
-def build_salmon_cmd(sample: str, r1: Path, r2: Optional[Path], outdir: Path, cfg: dict) -> list[str]:
-    cmd = [
-        cfg["binaries"]["salmon"], "quant",
-        "-i", str(require_exists(cfg["paths"]["salmon_index"], "dir")),
-        "-l", str(cfg["salmon"]["libType"]),
-        "-p", str(cfg["resources"]["threads"]["quant"]),
-        "-o", str(outdir),
-        "--validateMappings",
-        "--gcBias"
-    ]
-    if r2 and str(r2).strip()!="":
-        cmd += ["-1", str(require_exists(r1, "file")), "-2", str(require_exists(r2, "file"))]
-    else:
-        cmd += ["-r", str(require_exists(r1, "file"))]
-    if bool(cfg["salmon"].get("use_geneMap", True)):
-        gm = cfg["paths"].get("tx2gene", "")
-        if gm:
-            gm_p = require_exists(gm, "file")
-            cmd += ["--geneMap", str(gm_p)]
-    return cmd
+    samples = read_samples(R["samples_tsv"])
+    rejects = read_rejects(R["qc_root"])
+    if rejects:
+        log_print(f"[Info] 发现 rejects：{len(rejects)} 个样本将被剔除", log_fp, R["use_ts"])
 
-# -------- 主逻辑 --------
-def main():
-    cfg = merge_params(LOCAL_CONFIG, load_yaml(LOCAL_CONFIG["config_yaml"]))
-    logs_dir = cfg["paths"].get("logs_dir","logs")
-    fp = log_open(logs_dir, SCRIPT_TAG)
-    write_params_snapshot(cfg, logs_dir, SCRIPT_TAG)
+    # 逐样本执行
+    for r in samples:
+        sid = r["sample"]
+        if sid in rejects:
+            log_print(f"[Skip] 样本 {sid} 位于 rejects.tsv，定量时剔除", log_fp, R["use_ts"])
+            continue
 
-    if not exe_exists(cfg["binaries"]["salmon"]):
-        err("未找到 salmon 可执行（binaries.salmon）。请在 PATH 中提供或在 config.yaml 中指定。")
-    require_exists(cfg["paths"]["salmon_index"], "dir")
-    samples_tsv = require_exists(cfg["tables"]["samples"], "file")
-    fastq_dir   = ensure_dir(cfg["paths"].get("fastq_dir","data/fastq"))
-    quant_dir   = ensure_dir(cfg["paths"]["quant_dir"])
+        out_dir = R["quant_root"] / sid
+        out_qsf = out_dir / "quant.sf"
+        if out_qsf.exists() and not R["overwrite"]:
+            log_print(f"[Keep] 已存在：{out_qsf}（overwrite=false，跳过）", log_fp, R["use_ts"])
+            continue
 
-    df = parse_samples_table(samples_tsv)
-    log(fp, f"共解析到 {len(df)} 个样本。FASTQ 根目录：{fastq_dir}")
+        # 决策 clean/raw
+        r1, r2, src = decide_fastq(sid, r["fastq1"], r["fastq2"], R["qc_root"], R["require_clean_fastq"])
+        out_dir.mkdir(parents=True, exist_ok=True)
+        log_print(f"[Use] sample={sid} | source={src} | R1={r1} | R2={r2}", log_fp, R["use_ts"])
 
-    for _, row in df.iterrows():
-        sample = row["sample"].strip()
-        r1_raw = row["R1"].strip()
-        r2_raw = row["R2"].strip()
+        # 组装 Salmon 命令（契约：只读配置；线程/库型/索引从 config.yaml）
+        cmd = [
+            R["salmon_bin"], "quant",
+            "-i", str(R["index_dir"]),
+            "-l", R["libtype"],
+            "-1", str(r1),
+            "-2", str(r2),
+            "-p", str(R["threads"]),
+            "-o", str(out_dir),
+            "--validateMappings",
+            "--gcBias"
+        ]
+        rc = run_stream(cmd, log_fp)
+        if rc != 0:
+            print(f"[ERR] Salmon 运行失败（sample={sid}），请查看日志：{log_fp}", file=sys.stderr)
+            sys.exit(1)
 
-        tried1: List[Path] = []
-        tried2: List[Path] = []
+        # 产物快速验收
+        if not out_qsf.exists() or out_qsf.stat().st_size == 0:
+            print(f"[ERR] 产物缺失或为空：{out_qsf}", file=sys.stderr); sys.exit(1)
+        log_print(f"[Out] {out_qsf}", log_fp, R["use_ts"])
 
-        r1 = resolve_fastq_with_fallback(r1_raw, fastq_dir, tried1)
-        r2 = resolve_fastq_with_fallback(r2_raw, fastq_dir, tried2) if r2_raw else None
-
-        log(fp, f"[{sample}] R1 = {r1}")
-        if r2: log(fp, f"[{sample}] R2 = {r2}")
-
-        # 明确的存在性校验 + 失败时打印全部候选
-        if not (r1 and Path(r1).is_file()):
-            hints = "\n  - ".join(str(p) for p in tried1)
-            err(f"[{sample}] 找不到 R1：{r1}\n已尝试：\n  - {hints}")
-        if r2 and not Path(r2).is_file():
-            hints = "\n  - ".join(str(p) for p in tried2)
-            err(f"[{sample}] 找不到 R2：{r2}\n已尝试：\n  - {hints}")
-
-        outdir = ensure_dir(Path(quant_dir) / sample)
-        cmd = build_salmon_cmd(sample, r1, r2, outdir, cfg)
-        run_cmd(cmd, fp)
-
-        qsf = outdir/"quant.sf"
-        if not qsf.exists():
-            err(f"[{sample}] 运行结束但未发现 {qsf}，请检查 Salmon 日志。")
-        log(fp, f"[{sample}] 完成，输出目录：{outdir}")
-
-    log(fp, "全部样本定量完成 ✅")
-    log(fp, f"结果根目录：{quant_dir}")
+    log_print("========== 04 完成；quant.sf 全部就位 ==========", log_fp, R["use_ts"])
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        print(f"[ERR] 04 执行失败：{e}", file=sys.stderr)
+        sys.exit(1)
 

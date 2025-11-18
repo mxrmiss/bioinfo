@@ -2,283 +2,329 @@
 # -*- coding: utf-8 -*-
 
 """
-07_prepare_emapper_annotations.py — 规范化 eggnog-mapper 注释为下游富集“原材料”
-特性：
-  1) 稳健读取 emapper *.annotations.tsv / *.tsv.gz：
-     - 先嗅探以 '#' 开头的表头行（如 '#query ...'）
-     - 再以 comment='#' 只读数据段，显式设置列名
-  2) 列名别名对齐 + 缺列补空，统一输出规范化总表 emapper.parsed.tsv
-  3) 将 emapper 的 query 字段规整为 gene_id（去物种前缀与转录本后缀），与 05/06 的基因矩阵天然对齐
-  4) 生成三张“长表”原材料（TSV）：
-       - gene2go.tsv        （gene_id, GO）
-       - gene2ko.tsv        （gene_id, KO）
-       - gene2pathway.tsv   （gene_id, pathway_id, pathway_name）
-     其中 KEGG_Pathway 支持 koXXXXX / mapXXXXX / 'koXXXXX:Name' 混排并尽量解析名称
-  5) 路径参数：默认优先读取项目根 config.yaml；若缺键则回退为脚本内默认。无绘图、无 Excel。
+07_prepare_emapper_annotations.py —— 整理 eggNOG-mapper 注释为“基因层映射”（手工前/后缀契约版）
+
+契约要点：
+  * 仅按 config.yaml 的“手工前/后缀开关 + 字面量列表”清理 emapper 的 query；不开关则不改动。
+  * 不做任何“自动去数字/正则猜测/智能识别”。
+  * 优先按（清理后）query == transcript_id 命中 → gene_id；若 allow_gene_space_match=true，则允许 query 直接等于 gene_id 命中。
+  * 列名默认：query, GOs, KEGG_ko, KEGG_Pathway；可在 config.annotations.*_col 覆盖。
+  * 输出：
+      - results/07_annot/gene2go.tsv（gene_id, go_id）
+      - results/07_annot/gene2ko.tsv（gene_id, ko_id）
+      - results/07_annot/gene2pathway.tsv（gene_id, pathway_id）
+      - results/07_annot/universe_coverage.tsv（覆盖率审计）
+      - results/07_annot/unmapped_queries.list（未命中原始 query）
+      - results/07_annot/id_cleanup.audit.tsv（raw→prefix→suffix 的命中率）
 """
 
 from __future__ import annotations
-import sys, io, os, gzip, re
+import sys, csv, gzip, logging, re
 from pathlib import Path
-from typing import List, Dict, Any
+from typing import Dict, Any, List, Optional
 import yaml
-import pandas as pd
 
-# ======================== 默认参数（可被 config.yaml 覆盖） ========================
-LOCAL = {
-    "config_yaml": "config.yaml",
-    "tables": {
-        # 皇上指定：使用 *.tsv，不用 xlsx；这里也会强校验
-        "emapper": "ref/annotations/Sinonovacula_constricta_annotations.tsv"
-    },
-    "paths": {
-        "anno_dir": "ref/annotations",
-        "logs_dir": "logs"
-    },
-    "emapper": {
-        # 列名别名映射（不同 emapper 版本可能有 query_name / target_name / kegg_ko 等）
-        "col_alias": {
-            "query_name": "query",
-            "target_name": "seed_ortholog",
-            "og": "eggNOG_OGs",
-            "kegg_ko": "KEGG_ko",
-            "kegg_pathway": "KEGG_Pathway",
-            "kegg_module": "KEGG_Module",
-            "kegg_reaction": "KEGG_Reaction",
-            "brite": "BRITE",
-            "cazy": "CAZy",
-            "pfams": "PFAMs",
-        },
-        # 我们关心的标准列集合（缺失将补空列，以便下游稳定）
-        "wanted_cols": [
-            "query", "seed_ortholog", "evalue", "score",
-            "eggNOG_OGs", "max_annot_lvl", "COG_category",
-            "Description", "Preferred_name",
-            "GOs", "EC",
-            "KEGG_ko", "KEGG_Pathway", "KEGG_Module",
-            "KEGG_Reaction", "KEGG_rclass",
-            "BRITE", "KEGG_TC", "CAZy", "BiGG_Reaction",
-            "PFAMs"
-        ],
-        # 多值字段分隔符（eggnog-mapper 常用逗号）
-        "multi_sep": {
-            "GOs": ",",
-            "KEGG_ko": ",",
-            "KEGG_Pathway": ","
+CONFIG_PATH = "config.yaml"
+
+DEFAULTS: Dict[str, Any] = {
+    "reference": {"emapper": ""},
+    "dirs": {"maps": "results/03_maps", "annotations": "results/07_annot"},
+    "annotations": {
+        "emapper_query_col": "",
+        "emapper_gos_col": "",
+        "emapper_ko_col": "",
+        "emapper_pathway_col": "",
+        "allow_gene_space_match": True,
+        "id_cleanup": {
+            "strip_prefix": False,
+            "prefix": [],
+            "strip_suffix": False,
+            "suffix": [],
+            "order": ["prefix","suffix"]  # 默认先前缀再后缀
         }
-    }
+    },
+    "logging": {"level": "INFO", "timestamp": True}
 }
 
-# ================================ 工具函数 ================================
-def to_abs(p: str | Path) -> Path:
-    """将相对路径转为基于当前工作目录的绝对路径（不修改原结构）"""
-    p = Path(p)
-    return p if p.is_absolute() else (Path.cwd() / p)
+_SPLIT_RE = re.compile(r"[,\|\s;]+")
 
-def load_yaml(path: str) -> Dict[str, Any]:
-    """读取 YAML（缺失返回空 dict）"""
-    p = to_abs(path)
-    if not p.exists():
-        return {}
-    with p.open("r", encoding="utf-8") as f:
-        return yaml.safe_load(f) or {}
-
-def merge_cfg(a: dict, b: dict) -> dict:
-    """浅递归合并 dict：b 覆盖 a，同层优先 b"""
-    if not isinstance(a, dict): return b
-    if not isinstance(b, dict): return a
-    out = dict(a)
-    for k, v in b.items():
-        if isinstance(v, dict) and isinstance(out.get(k), dict):
-            out[k] = merge_cfg(out[k], v)
-        else:
-            out[k] = v
-    return out
-
-def ensure_dir(p: str | Path) -> Path:
-    """确保目录存在"""
-    p = to_abs(p)
+def mkdir_p(p: Path) -> None:
     p.mkdir(parents=True, exist_ok=True)
-    return p
 
-def open_text_auto(path: Path):
-    """自动识别 .gz 或普通文本"""
-    if str(path).endswith(".gz"):
-        return io.TextIOWrapper(gzip.open(path, "rb"), encoding="utf-8", errors="ignore")
-    return open(path, "r", encoding="utf-8", errors="ignore")
+def open_maybe_gz(p: Path):
+    return gzip.open(p, "rt", encoding="utf-8", errors="ignore") if str(p).lower().endswith(".gz") \
+           else open(p, "r", encoding="utf-8", errors="ignore")
 
-def sniff_emapper_header(path: Path) -> List[str]:
-    """
-    提取以 '#' 开头的表头行（如 '#query\t...'），去掉 '#' 后按制表符切列名。
-    若未找到，返回空列表（后续用 wanted_cols 兜底）。
-    """
-    with open_text_auto(path) as fin:
-        for line in fin:
-            if not line:
-                continue
-            if line.startswith("#"):
-                head = line.lstrip("#").rstrip("\n")
-                cols = head.split("\t")
-                if len(cols) >= 3:
-                    return cols
+def load_yaml(path: Path) -> Dict[str, Any]:
+    if not path.exists():
+        raise FileNotFoundError(f"未找到配置文件：{path}")
+    with open(path, "r", encoding="utf-8") as f:
+        user = (yaml.safe_load(f) or {})
+    def merge(u, d):
+        out = dict(d)
+        for k, v in u.items():
+            if isinstance(v, dict) and isinstance(out.get(k), dict):
+                out[k] = merge(v, out[k])
             else:
-                break
-    return []
+                out[k] = v
+        return out
+    return merge(user, DEFAULTS)
 
-def read_emapper_tsv(path: Path, wanted_cols: List[str], alias_map: Dict[str, str]) -> pd.DataFrame:
-    """
-    稳健读取 emapper 的 TSV：
-      1) 先 sniff '#'-header 作为列名；若无则用 wanted_cols 兜底
-      2) 以 comment='#' 读取数据段；显式设置 names=列名；dtype=str
-      3) 应用别名映射；缺列补空；仅保留“关心列”的超集（关心列 + 其余列）
-    """
-    cols = sniff_emapper_header(path)
-    if not cols:
-        cols = wanted_cols[:]  # 兜底列集合
-    df = pd.read_csv(
-        path,
-        sep="\t",
-        comment="#",
-        names=cols,
-        dtype=str
-    ).fillna("")
-    # 别名标准化
-    col_map = {}
-    for c in df.columns:
-        key = c.strip()
-        std = alias_map.get(key, alias_map.get(key.lower(), key))
-        col_map[c] = std
-    df = df.rename(columns=col_map)
-    # 缺列补空
-    for c in wanted_cols:
-        if c not in df.columns:
-            df[c] = ""
-    keep = [c for c in wanted_cols if c in df.columns]
-    others = [c for c in df.columns if c not in keep]
-    df = df[keep + others]
-    return df
+def clean_id_literal(x: str, prefixes: List[str], suffixes: List[str], order: List[str]) -> str:
+    y = x
+    for step in order:
+        if step == "prefix":
+            for pfx in prefixes:
+                if y.startswith(pfx):
+                    y = y[len(pfx):]
+                    break
+        elif step == "suffix":
+            for sfx in suffixes:
+                if y.endswith(sfx):
+                    y = y[:-len(sfx)]
+                    break
+    return y
 
-def split_multi(s: str, sep: str) -> list[str]:
-    """将多值字段按分隔符拆分为去空白的条目列表"""
-    s = (s or "").strip()
-    if not s:
-        return []
-    return [x.strip() for x in s.split(sep) if x.strip()]
+def normalize_ko(tok: str) -> Optional[str]:
+    if not tok: return None
+    s = tok.strip().upper()
+    return s if re.fullmatch(r"K\d{5}", s) else None
 
-# ---------- 基因 ID 规整：去物种前缀与转录本/版本后缀 ----------
-_Q_SPLIT = re.compile(r"\|")
-_TX_DOT_VER = re.compile(r"\.[0-9]+$")             # 例如 .1 /.2
-_TX_SUFFIX = re.compile(r"[-_](?:RA|RB|RC|PA|PB)$", re.IGNORECASE)  # 常见转录本/蛋白后缀
-def normalize_gene_id(query: str) -> str:
-    """
-    将 emapper 的 query 规整为基因级 ID：
-      - 若含 'prefix|ID'，取最后一个 '|' 右侧的 ID
-      - 去掉转录本/版本后缀（.数字 / -RA/-PA 等）
-    """
-    q = (query or "").strip()
-    if not q:
-        return q
-    # 取最后一个 |
-    parts = _Q_SPLIT.split(q)
-    core = parts[-1] if parts else q
-    core = _TX_DOT_VER.sub("", core)
-    core = _TX_SUFFIX.sub("", core)
-    return core
+def normalize_pathway(tok: str) -> Optional[str]:
+    if not tok: return None
+    s = tok.strip().replace("path:", "")
+    if s.startswith("map"): s = "ko" + s[3:]
+    return s if re.fullmatch(r"ko\d{5}", s) else None
 
-# ---------- Pathway 标准化 ----------
-_PW_RE = re.compile(r"^(?:(?:ko|map))?(\d{5})(?::\s*(.+))?$", re.IGNORECASE)
-def parse_pathway_token(token: str) -> tuple[str, str]:
-    """
-    将 Pathway 的条目解析为 (pathway_id, pathway_name)：
-      - 支持 'ko04151' / 'map04151' / '04151' / 'ko04151:Apoptosis' 等
-      - 未匹配到则返回 (原条目去空白, "")
-    """
-    t = (token or "").strip()
-    if not t:
-        return "", ""
-    m = _PW_RE.match(t)
-    if m:
-        pid = f"ko{m.group(1)}"
-        pname = (m.group(2) or "").strip()
-        return pid, pname
-    return t, ""
+def main() -> None:
+    cfg = load_yaml(Path(CONFIG_PATH))
+    level = getattr(logging, (cfg.get("logging", {}).get("level") or "INFO").upper(), logging.INFO)
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s [%(levelname)s] %(message)s" if cfg.get("logging", {}).get("timestamp", True) else "[%(levelname)s] %(message)s",
+    )
 
-# ================================ 主流程 ================================
-def main():
-    # 1) 合并配置：config.yaml 覆盖 LOCAL
-    cfg = merge_cfg(LOCAL, load_yaml(LOCAL["config_yaml"]))
+    logging.info("========== 07 — emapper 注释整理（手工前/后缀契约） ==========")
 
-    emap_fp  = to_abs(cfg.get("tables", {}).get("emapper", LOCAL["tables"]["emapper"]))
-    anno_dir = ensure_dir(cfg.get("paths", {}).get("anno_dir", LOCAL["paths"]["anno_dir"]))
-    ensure_dir(cfg.get("paths", {}).get("logs_dir", LOCAL["paths"]["logs_dir"]))
+    # 路径
+    emapper_fp = Path((cfg.get("reference", {}).get("emapper") or "").strip())
+    maps_dir   = Path(cfg["dirs"]["maps"])
+    out_dir    = Path(cfg["dirs"]["annotations"])
+    mkdir_p(out_dir)
+    if not emapper_fp.exists():
+        raise FileNotFoundError(f"未找到 emapper 注释文件：{emapper_fp}")
 
-    # 2) 基础校验
-    if not emap_fp.exists():
-        print(f"[ERR] 缺少 emapper 注释文件：{emap_fp}", file=sys.stderr)
-        sys.exit(1)
-    if not (str(emap_fp).endswith(".tsv") or str(emap_fp).endswith(".tsv.gz")):
-        print(f"[ERR] 输入不是 TSV/TSV.GZ：{emap_fp}\n请提供 eggnog-mapper 的 *.annotations.tsv（或 .tsv.gz）。", file=sys.stderr)
-        sys.exit(1)
+    # 读取 tx2gene.clean.tsv
+    tx2gene_fp = maps_dir / "tx2gene.clean.tsv"
+    if not tx2gene_fp.exists():
+        raise FileNotFoundError(f"未找到 tx2gene.clean.tsv：{tx2gene_fp}")
+    t2g: Dict[str, str] = {}
+    gene_set: set = set()
+    with open(tx2gene_fp, "r", encoding="utf-8") as f:
+        rdr = csv.DictReader(f, dialect=csv.excel_tab)
+        need = ["transcript_id", "gene_id"]
+        for c in need:
+            if c not in (rdr.fieldnames or []):
+                raise ValueError(f"tx2gene.clean.tsv 缺少必要列：{c}")
+        for r in rdr:
+            tid = (r["transcript_id"] or "").strip()
+            gid = (r["gene_id"] or "").strip()
+            if tid and gid:
+                t2g[tid] = gid
+                gene_set.add(gid)
 
-    # 3) 读取 emapper 表
-    alias  = cfg["emapper"]["col_alias"]
-    wanted = cfg["emapper"]["wanted_cols"]
-    df = read_emapper_tsv(emap_fp, wanted_cols=wanted, alias_map=alias)
+    # 清理配置（仅按手工列表；不开关就不动）
+    icfg = cfg["annotations"]["id_cleanup"]
+    do_prefix = bool(icfg.get("strip_prefix", False))
+    do_suffix = bool(icfg.get("strip_suffix", False))
+    order    = list(icfg.get("order", ["prefix","suffix"]))
+    pfx_list = list(icfg.get("prefix", [])) if do_prefix else []
+    sfx_list = list(icfg.get("suffix", [])) if do_suffix else []
+    allow_gene_space = bool(cfg["annotations"].get("allow_gene_space_match", True))
+    logging.info("[Rule] 顺序=%s；strip_prefix=%s；strip_suffix=%s；allow_gene_space_match=%s",
+                 order, do_prefix, do_suffix, allow_gene_space)
+    if pfx_list: logging.info("[Rule] prefix=%s", pfx_list)
+    if sfx_list: logging.info("[Rule] suffix=%s", sfx_list)
 
-    # 4) 生成规范化总表 + gene_id 列
-    if "query" not in df.columns:
-        print("[ERR] emapper 表缺少 'query' 列，无法继续。", file=sys.stderr)
-        sys.exit(1)
+    # 解析 emapper 表头（仅认 '#query\t...' 行）
+    header: Optional[List[str]] = None
+    idx: Dict[str, int] = {}
+    want = {
+        "query": (cfg["annotations"].get("emapper_query_col") or "query"),
+        "gos": (cfg["annotations"].get("emapper_gos_col") or "GOs"),
+        "ko": (cfg["annotations"].get("emapper_ko_col") or "KEGG_ko"),
+        "path": (cfg["annotations"].get("emapper_pathway_col") or "KEGG_Pathway"),
+    }
 
-    df["gene_id"] = [normalize_gene_id(q) for q in df["query"]]
+    def locate(h: List[str]) -> Dict[str, int]:
+        lo = [x.lower() for x in h]
+        out = { "query": -1, "gos": -1, "ko": -1, "path": -1 }
+        for k, nm in want.items():
+            for i, v in enumerate(lo):
+                if v == nm.lower():
+                    out[k] = i; break
+        return out
 
-    # 将 Pathway 字段中显式 mapXXXXX 统一为 koXXXXX:Name 形式在长表解析时处理
-    parsed_out = anno_dir / "emapper.parsed.tsv"
-    df.to_csv(parsed_out, sep="\t", index=False)
-    print(f"[OK] 规范化表写出：{parsed_out}（{len(df)} 行）")
+    # 先收集所有 query（便于审计 raw→prefix→suffix 的命中率）
+    queries_raw: List[str] = []
+    with open_maybe_gz(emapper_fp) as f:
+        for line in f:
+            if not line: continue
+            s = line.rstrip("\n")
+            if header is None:
+                if s.startswith("#query\t") or s.startswith("#Query\t") or s.startswith("#QUERY\t"):
+                    header = s[1:].split("\t")
+                    idx = locate(header)
+                    if idx["query"] < 0:
+                        raise RuntimeError("未在 emapper 表头中找到 'query' 列")
+                continue
+            if s.startswith("#") or not s:
+                continue
+            parts = s.split("\t")
+            queries_raw.append(parts[idx["query"]].strip())
 
-    # 5) 产出三张“长表”
-    gene_col = "gene_id"
+    def apply_stage(x: str, stage: str) -> str:
+        if stage == "prefix" and do_prefix:
+            for pfx in pfx_list:
+                if x.startswith(pfx):
+                    return x[len(pfx):]
+        if stage == "suffix" and do_suffix:
+            for sfx in sfx_list:
+                if x.endswith(sfx):
+                    return x[:-len(sfx)]
+        return x
 
-    # 5.1 GO
-    go_sep = cfg["emapper"]["multi_sep"].get("GOs", ",")
-    rows_go: list[tuple[str, str]] = []
-    gos = df["GOs"] if "GOs" in df.columns else []
-    for g, s in zip(df[gene_col], gos):
-        for go in split_multi(s, go_sep):
-            rows_go.append((g, go))
-    g2go_out = anno_dir / "gene2go.tsv"
-    pd.DataFrame(rows_go, columns=["gene_id", "GO"]).to_csv(g2go_out, sep="\t", index=False)
-    print(f"[OK] gene2go 写出：{g2go_out}（{len(rows_go)} 条）")
+    # 审计：raw→prefix→suffix 命中率（命中 = 命中任一集合 {transcript_id, gene_id(可选)}）
+    audit_rows: List[List[str]] = [["stage","matched","total","match_rate"]]
+    for stage in ["raw"] + order:
+        matched = 0
+        for q in queries_raw:
+            qq = apply_stage(q, stage) if stage != "raw" else q
+            if (qq in t2g) or (allow_gene_space and (qq in gene_set)):
+                matched += 1
+        total = len(queries_raw) if queries_raw else 1
+        rate = matched / total
+        audit_rows.append([stage, str(matched), str(total), f"{rate:.6f}"])
 
-    # 5.2 KO
-    ko_sep = cfg["emapper"]["multi_sep"].get("KEGG_ko", ",")
-    rows_ko: list[tuple[str, str]] = []
-    kos = df["KEGG_ko"] if "KEGG_ko" in df.columns else []
-    for g, s in zip(df[gene_col], kos):
-        for ko in split_multi(s, ko_sep):
-            # emapper 有时会带 'ko:' 前缀，这里统一去掉 'ko:' 保留 K 号或直接保留原样都可
-            ko_clean = ko.replace("ko:", "").strip()
-            rows_ko.append((g, ko_clean))
-    g2ko_out = anno_dir / "gene2ko.tsv"
-    pd.DataFrame(rows_ko, columns=["gene_id", "KO"]).to_csv(g2ko_out, sep="\t", index=False)
-    print(f"[OK] gene2ko 写出：{g2ko_out}（{len(rows_ko)} 条）")
+    # 正式产出
+    def final_clean(x: str) -> str:
+        return clean_id_literal(x, pfx_list if do_prefix else [], sfx_list if do_suffix else [], order)
 
-    # 5.3 Pathway
-    pw_sep = cfg["emapper"]["multi_sep"].get("KEGG_Pathway", ",")
-    rows_pw: list[tuple[str, str, str]] = []
-    pws = df["KEGG_Pathway"] if "KEGG_Pathway" in df.columns else []
-    for g, s in zip(df[gene_col], pws):
-        for it in split_multi(s, pw_sep):
-            pid, pname = parse_pathway_token(it)
-            if pid:  # 过滤空白
-                rows_pw.append((g, pid, pname))
-    g2pw_out = anno_dir / "gene2pathway.tsv"
-    pd.DataFrame(rows_pw, columns=["gene_id", "pathway_id", "pathway_name"]).to_csv(g2pw_out, sep="\t", index=False)
-    print(f"[OK] gene2pathway 写出：{g2pw_out}（{len(rows_pw)} 条）")
+    gene2go: Dict[str, set] = {}
+    gene2ko: Dict[str, set] = {}
+    gene2path: Dict[str, set] = {}
+    mapped_tx = mapped_gene = unmapped = 0
+    unmapped_examples: List[str] = []
 
-    print("完成 ✅")
+    with open_maybe_gz(emapper_fp) as f:
+        qcol = gos_col = ko_col = path_col = None
+        for line in f:
+            if not line: continue
+            s = line.rstrip("\n")
+            if qcol is None:
+                if s.startswith("#query\t") or s.startswith("#Query\t") or s.startswith("#QUERY\t"):
+                    hdr = s[1:].split("\t")
+                    if header is None:
+                        header = hdr
+                    idx = locate(hdr)
+                    qcol, gos_col, ko_col, path_col = idx["query"], idx["gos"], idx["ko"], idx["path"]
+                    logging.info("[Info] 表头命中：query=%s, GOs=%s, KEGG_ko=%s, KEGG_Pathway=%s",
+                                 hdr[qcol] if qcol>=0 else "NA",
+                                 hdr[gos_col] if gos_col>=0 else "NA",
+                                 hdr[ko_col]  if ko_col>=0  else "NA",
+                                 hdr[path_col]if path_col>=0 else "NA")
+                    continue
+                else:
+                    continue
+            if s.startswith("#") or not s:
+                continue
+
+            parts = s.split("\t")
+            q_raw = parts[qcol].strip()
+            q = final_clean(q_raw)
+
+            gid: Optional[str] = None
+            if q in t2g:
+                gid = t2g[q]; mapped_tx += 1
+            elif allow_gene_space and (q in gene_set):
+                gid = q; mapped_gene += 1
+            else:
+                unmapped += 1
+                if len(unmapped_examples) < 50000:
+                    unmapped_examples.append(q_raw)
+                continue
+
+            if gos_col is not None and gos_col >= 0 and gos_col < len(parts):
+                s_g = parts[gos_col].strip()
+                if s_g and s_g != "-":
+                    for tok in _SPLIT_RE.split(s_g):
+                        if tok and tok.startswith("GO:") and re.fullmatch(r"GO:\d{7}", tok):
+                            gene2go.setdefault(gid, set()).add(tok)
+
+            if ko_col is not None and ko_col >= 0 and ko_col < len(parts):
+                s_k = parts[ko_col].strip()
+                if s_k and s_k != "-":
+                    for tok in _SPLIT_RE.split(s_k):
+                        k = normalize_ko(tok)
+                        if k:
+                            gene2ko.setdefault(gid, set()).add(k)
+
+            if path_col is not None and path_col >= 0 and path_col < len(parts):
+                s_p = parts[path_col].strip()
+                if s_p and s_p != "-":
+                    for tok in _SPLIT_RE.split(s_p):
+                        p = normalize_pathway(tok)
+                        if p:
+                            gene2path.setdefault(gid, set()).add(p)
+
+    out_dir = Path(cfg["dirs"]["annotations"])
+    mkdir_p(out_dir)
+
+    def write_pairs(fp: Path, hdr: List[str], d: Dict[str, set]) -> None:
+        with open(fp, "w", encoding="utf-8", newline="") as f:
+            w = csv.writer(f, dialect=csv.excel_tab)
+            w.writerow(hdr)
+            for k in sorted(d.keys()):
+                for v in sorted(d[k]):
+                    w.writerow([k, v])
+        logging.info("[Out] %s", fp)
+
+    g2go_fp   = out_dir / "gene2go.tsv"
+    g2ko_fp   = out_dir / "gene2ko.tsv"
+    g2path_fp = out_dir / "gene2pathway.tsv"
+    write_pairs(g2go_fp, ["gene_id","go_id"], gene2go)
+    write_pairs(g2ko_fp, ["gene_id","ko_id"], gene2ko)
+    write_pairs(g2path_fp, ["gene_id","pathway_id"], gene2path)
+
+    cov_fp   = out_dir / "universe_coverage.tsv"
+    with open(cov_fp, "w", encoding="utf-8", newline="") as f:
+        w = csv.writer(f, dialect=csv.excel_tab)
+        w.writerow(["metric","value"])
+        w.writerow(["emapper_data_rows", str(len(queries_raw))])
+        w.writerow(["mapped_via_transcript", str(mapped_tx)])
+        w.writerow(["mapped_via_gene", str(mapped_gene)])
+        w.writerow(["unmapped", str(unmapped)])
+        uniq_genes = len(set(list(gene2go.keys()) + list(gene2ko.keys()) + list(gene2path.keys())))
+        w.writerow(["unique_genes_mapped", str(uniq_genes)])
+    logging.info("[Out] %s", cov_fp)
+
+    audit_fp = out_dir / "id_cleanup.audit.tsv"
+    with open(audit_fp, "w", encoding="utf-8", newline="") as f:
+        w = csv.writer(f, dialect=csv.excel_tab)
+        w.writerows(audit_rows)
+    logging.info("[Out] %s", audit_fp)
+
+    if unmapped_examples:
+        with open(out_dir / "unmapped_queries.list", "w", encoding="utf-8") as f:
+            f.write("\n".join(unmapped_examples))
+        logging.info("[Out] %s", out_dir / "unmapped_queries.list")
+
+    logging.info("========== 07 完成 ==========")
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        print(f"[ERR] 07 执行失败：{e}", file=sys.stderr)
+        sys.exit(1)
 

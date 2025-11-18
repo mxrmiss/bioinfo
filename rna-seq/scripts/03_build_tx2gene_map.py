@@ -1,202 +1,224 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+
 """
-03_build_tx2gene_map.py — 从 GFF3/GTF 生成 tx2gene（原始 + 清洗版）
-产出：
-  - ref/tx2gene.raw.tsv        （列：TX,GENE）
-  - ref/tx2gene.geneMap.tsv    （清洗后，供 --geneMap 与 tximport 使用）
+03_build_tx2gene_map.py —— 从 GFF3/GTF 生成 tx2gene（严格契约版）
+
+契约要点（严格遵守《转录组计划1.md》）：
+  • 仅读取项目根 config.yaml 中的 reference.ref_gtf（必须存在），不做别名兼容。
+  • 固定输出目录：results/03_maps/
+  • 固定主表表头：transcript_id, gene_id
+  • 不进行任何 ID 前/后缀或版本号清理（原样保留）。
+  • 记录来源指纹：TX2GENE.SOURCE（绝对路径与 MD5），便于下游审计。
+  • 黑名单：gene 关联的转录本数 ≥ 阈值（tx2gene.blacklist_threshold，默认 10）。
+
+输出文件：
+  - results/03_maps/tx2gene.clean.tsv
+  - results/03_maps/tx2gene.blacklist.tsv
+  - results/03_maps/TX2GENE.SOURCE
 """
 
 from __future__ import annotations
-import sys, json, time, re
+import sys, csv, hashlib
 from pathlib import Path
-from typing import Dict, Any, Optional, Tuple
-import yaml
-import pandas as pd
+from typing import Dict, Tuple, Iterable, List
+from datetime import datetime
 
-# ================== 脚本默认（YAML 可覆盖） ==================
-LOCAL_CONFIG = {
-  "config_yaml": "config.yaml",
-  "paths": {
-    "ref_gtf":   "ref/genes.gff3",
-    "anno_dir":  "ref/annotations",
-    "logs_dir":  "logs"
-  }
+# 依赖：PyYAML
+try:
+    import yaml
+except Exception:
+    sys.stderr.write("[ERR] 缺少 PyYAML，请先安装：mamba/conda install pyyaml\n")
+    sys.exit(1)
+
+# ===================== 顶部参数区（所有参数集中于此） =====================
+CONFIG_PATH = "config.yaml"   # 只读，不接受命令行参数
+
+DEFAULTS: Dict[str, dict] = {
+    "dirs": {
+        "maps": "results/03_maps"
+    },
+    "tx2gene": {
+        "blacklist_threshold": 10
+    },
+    "logging": {
+        "timestamp": True  # 屏幕输出是否带时间戳
+    }
 }
-SCRIPT_TAG = "03_tx2gene"
+# ========================================================================
 
-# ================== 通用工具 ==================
-def cwd() -> Path: return Path.cwd().resolve()
+_TS = True  # 是否打印时间戳，由配置控制
 
-def to_abs(p: str | Path | None) -> Optional[Path]:
-    if p is None: return None
-    s = str(p).strip()
-    if s == "": return None
-    q = Path(s)
-    return (q if q.is_absolute() else cwd()/q).resolve()
+def log(msg: str) -> None:
+    """标准化日志输出；是否带时间戳由配置决定。"""
+    print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} {msg}" if _TS else msg)
 
-def load_yaml(path: str) -> Dict[str, Any]:
-    p = to_abs(path)
-    if not p or not p.exists(): return {}
-    with p.open('r', encoding='utf-8') as f:
-        return yaml.safe_load(f) or {}
+def load_cfg(p: Path) -> Dict:
+    """读取 YAML 并与默认值浅合并（用户优先）；严格要求 reference.ref_gtf 存在。"""
+    if not p.exists():
+        sys.stderr.write(f"[ERR] 未找到配置文件：{p}\n")
+        sys.exit(1)
+    with open(p, "r", encoding="utf-8") as f:
+        user = yaml.safe_load(f) or {}
 
-def merge_params(local_cfg: dict, yaml_cfg: dict) -> dict:
-    if not isinstance(local_cfg, dict): local_cfg = {}
-    if not isinstance(yaml_cfg, dict):  yaml_cfg  = {}
-    def is_set(v):
-        return v is not None and not (isinstance(v,(str,list,dict)) and len(v)==0) \
-               and not (isinstance(v,str) and v.strip()=="")
-    def merge(a,b):
-        if isinstance(a,dict) and isinstance(b,dict):
-            out={}
-            for k in set(a.keys())|set(b.keys()):
-                av=a.get(k); bv=b.get(k)
-                if isinstance(av,dict) or isinstance(bv,dict):
-                    out[k]=merge(av if isinstance(av,dict) else {}, bv if isinstance(bv,dict) else {})
-                else:
-                    out[k]= bv if is_set(bv) else av
-            return out
-        return b if is_set(b) else a
-    return merge(local_cfg, yaml_cfg)
-
-def err(msg: str):
-    print(f"[ERR] {msg}", file=sys.stderr); sys.exit(1)
-
-def ensure_dir(p) -> Path:
-    p = to_abs(p); p.mkdir(parents=True, exist_ok=True); return p
-
-def require_exists(p, kind="file") -> Path:
-    p = to_abs(p)
-    if p is None: err("必需路径为空")
-    if kind=="file" and not p.is_file(): err(f"缺少文件：{p}")
-    if kind=="dir"  and not p.is_dir() : err(f"缺少目录：{p}")
-    return p
-
-def log_open(d, tag):
-    d = ensure_dir(d); return open(d/f"{tag}.log","a",encoding="utf-8")
-
-def log(fp, msg):
-    ts = time.strftime("%Y-%m-%d %H:%M:%S")
-    fp.write(f"[{ts}] {msg}\n"); fp.flush(); print(msg, flush=True)
-
-def write_params_snapshot(params, logs_dir, tag):
-    d = ensure_dir(logs_dir); out = d/f"{tag}.params.tsv"
-    rows=[]
-    def flat(prefix,obj):
-        if isinstance(obj,dict):
-            for k,v in obj.items(): flat(f"{prefix}.{k}" if prefix else k, v)
+    # 浅合并（用户优先）
+    out = dict(DEFAULTS)
+    for k, v in user.items():
+        if isinstance(v, dict) and isinstance(out.get(k), dict):
+            out[k] = {**out[k], **v}
         else:
-            rows.append((prefix, json.dumps(obj, ensure_ascii=False)))
-    flat("", params)
-    pd.DataFrame(rows, columns=["key","value"]).to_csv(out, sep="\t", index=False)
+            out[k] = v
 
-# ================== GTF/GFF3 解析 ==================
-def parse_attr_kv(attr_raw: str) -> Dict[str,str]:
-    """兼容 GTF（k "v";）与 GFF3（k=v;）属性解析"""
-    s = attr_raw.strip()
-    kv = {}
-    # 判断格式
-    if "=" in s and ";" in s and not ('"' in s):
-        # GFF3
-        for item in s.split(";"):
-            item=item.strip()
-            if not item: continue
-            if "=" in item:
-                k,v = item.split("=",1)
-                kv[k.strip()] = v.strip()
-    else:
-        # GTF 风格：key "value";
-        for item in s.split(";"):
-            item=item.strip()
-            if not item: continue
-            parts = item.split()
-            if len(parts)>=2:
-                k = parts[0].strip()
-                v = " ".join(parts[1:]).strip().strip('"')
-                kv[k]=v
-    return kv
+    # 严格取 reference.ref_gtf（契约规定的唯一位置）
+    ref_block = out.get("reference", {})
+    if not isinstance(ref_block, dict):
+        sys.stderr.write("[ERR] 配置缺少块：reference\n")
+        sys.exit(1)
+    ref_gtf = ref_block.get("ref_gtf")
+    if not isinstance(ref_gtf, str) or not ref_gtf.strip():
+        sys.stderr.write("[ERR] 配置缺少键：reference.ref_gtf（必须）\n")
+        sys.exit(1)
+    out["reference"]["ref_gtf"] = ref_gtf.strip()
 
-def iter_tx_gene_pairs(gtf_path: Path):
+    return out
+
+def md5sum(path: Path) -> str:
+    """计算文件 MD5（写入 SOURCE 用）。"""
+    h = hashlib.md5()
+    with open(path, "rb") as f:
+        for ch in iter(lambda: f.read(8192), b""):
+            h.update(ch)
+    return h.hexdigest()
+
+# -------------------- 属性解析 --------------------
+def parse_attr_gff3(s: str) -> Dict[str, str]:
+    """解析 GFF3 属性字段：key=value;key2=value2;..."""
+    out: Dict[str, str] = {}
+    for part in s.split(";"):
+        part = part.strip()
+        if not part or "=" not in part:
+            continue
+        k, v = part.split("=", 1)
+        out[k.strip()] = v.strip()
+    return out
+
+def parse_attr_gtf(s: str) -> Dict[str, str]:
+    """解析 GTF 属性字段：key "value"; key2 "value2"; ..."""
+    out: Dict[str, str] = {}
+    for seg in [x.strip() for x in s.rstrip(";").split(";") if x.strip()]:
+        sp = seg.split()
+        if len(sp) >= 2:
+            out[sp[0].strip()] = " ".join(sp[1:]).strip().strip('"')
+    return out
+
+# -------------------- 提取 (transcript_id, gene_id) --------------------
+def iter_tx_gene_pairs(gtf_path: Path) -> Iterable[Tuple[str, str]]:
     """
-    仅抓取转录本层面的记录：
-      - GFF3: 第3列为 mRNA / transcript，属性 ID=<tx>; Parent=<gene>
-      - GTF : 第3列任意（exon/CDS/transcript），属性 transcript_id / gene_id 存在即可
+    仅产出“转录本→基因”的二元组 (transcript_id, gene_id)。
+    - 对 GFF3：feature=mRNA 或 transcript 的行（属性 ID=<tx> 与 Parent=<gene>）
+    - 对 GTF ：属性同时包含 transcript_id 与 gene_id
     """
+    is_gff3 = gtf_path.suffix.lower() in (".gff3", ".gff")
     with open(gtf_path, "r", encoding="utf-8", errors="ignore") as fin:
         for line in fin:
-            if not line or line.startswith("#"): continue
-            cols = line.rstrip("\n").split("\t")
-            if len(cols) < 9: continue
-            feature = cols[2].lower()
-            attrs = parse_attr_kv(cols[8])
-            tx = None; gene = None
+            if not line or line.startswith("#"):
+                continue
+            parts = line.rstrip("\n").split("\t")
+            if len(parts) < 9:
+                continue
+            feature = (parts[2] or "").lower()
+            attrs = parts[8]
 
-            # 优先 GTF 常用键
-            if "transcript_id" in attrs and "gene_id" in attrs:
-                tx   = attrs.get("transcript_id","").strip()
-                gene = attrs.get("gene_id","").strip()
+            if is_gff3:
+                if feature not in ("mrna", "transcript"):
+                    continue
+                a = parse_attr_gff3(attrs)
+                tx = a.get("ID") or a.get("transcript_id")
+                parent = a.get("Parent") or a.get("gene_id")
+                if not tx or not parent:
+                    continue
+                # Parent 可能多值（逗号分隔），常规取第一个 gene
+                gene = parent.split(",")[0].strip()
+                yield (tx.strip(), gene)
             else:
-                # GFF3：mRNA/transcript 层
-                if feature in ("mrna","transcript"):
-                    tx   = attrs.get("ID","").strip()
-                    gene = attrs.get("Parent","").strip()
+                a = parse_attr_gtf(attrs)
+                tx = (a.get("transcript_id") or "").strip()
+                gene = (a.get("gene_id") or "").strip()
+                if tx and gene:
+                    yield (tx, gene)
 
-            if tx and gene:
-                yield tx, gene
+# -------------------- 主流程 --------------------
+def main() -> None:
+    cfg = load_cfg(Path(CONFIG_PATH))
+    global _TS
+    _TS = bool(cfg.get("logging", {}).get("timestamp", True))
 
-# ================== 清洗规则（与老口径一致） ==================
-def clean_tx_id(tx: str) -> str:
-    """
-    归一化转录本 ID，保证与 quant.sf 的 Name 列对齐：
-      1) 去前缀：cds\d+.
-      2) 去后缀：.exon\d+
-      3) 去版本号：.<数字>（只去最后一段小数版本）
-      4) 去竖线后缀：| 之后全部删除
-    """
-    x = tx
-    x = re.sub(r"^cds\d+\.", "", x)
-    x = re.sub(r"\.exon\d+$", "", x)
-    x = re.sub(r"\|.*$", "", x)          # 忽略 | 之后
-    x = re.sub(r"\.(\d+)$", "", x)       # 去结尾 .1/.2
-    return x
+    maps_dir = Path(cfg["dirs"]["maps"])
+    maps_dir.mkdir(parents=True, exist_ok=True)
 
-# ================== 主逻辑 ==================
-def main():
-    cfg = merge_params(LOCAL_CONFIG, load_yaml(LOCAL_CONFIG["config_yaml"]))
-    logs_dir = cfg["paths"].get("logs_dir","logs")
-    fp = log_open(logs_dir, SCRIPT_TAG)
-    write_params_snapshot(cfg, logs_dir, SCRIPT_TAG)
+    out_clean = maps_dir / "tx2gene.clean.tsv"
+    out_black = maps_dir / "tx2gene.blacklist.tsv"
+    out_src   = maps_dir / "TX2GENE.SOURCE"
 
-    gtf = require_exists(cfg["paths"]["ref_gtf"], "file")
-    anno_dir = ensure_dir(cfg["paths"].get("anno_dir","ref/annotations"))
-    raw_out  = to_abs("ref/tx2gene.raw.tsv")
-    map_out  = to_abs("ref/tx2gene.geneMap.tsv")
+    ref_gtf = Path(cfg["reference"]["ref_gtf"])
+    if not ref_gtf.exists():
+        sys.stderr.write(f"[ERR] 未找到注释文件：{ref_gtf}\n")
+        sys.exit(1)
 
-    log(fp, f"读取注释：{gtf}")
-    pairs = list(iter_tx_gene_pairs(gtf))
+    log("========== 03 — 构建 tx2gene 映射 ==========")
+    log(f"[Info] reference.ref_gtf = {ref_gtf.resolve()}")
+
+    # 采集 (tx, gene)
+    pairs: List[Tuple[str, str]] = []
+    for tx, gene in iter_tx_gene_pairs(ref_gtf):
+        if tx and gene:
+            pairs.append((tx, gene))
     if not pairs:
-        err("未在注释中解析到任何 transcript→gene 对，应检查 GFF3/GTF 与属性名。")
+        sys.stderr.write("[ERR] 未从注释中解析到任何 (transcript_id, gene_id)；请检查 GFF3/GTF 的 feature/属性是否标准。\n")
+        sys.exit(1)
 
-    df = pd.DataFrame(pairs, columns=["TX","GENE"]).drop_duplicates()
-    # 过滤掉明显异常的空白
-    df = df[(df["TX"].astype(str)!="") & (df["GENE"].astype(str)!="")].copy()
-    n_raw = len(df)
-    df.to_csv(raw_out, sep="\t", index=False)
-    log(fp, f"原始 tx2gene 写出：{raw_out}（{n_raw} 行）")
+    # 去重
+    seen = set()
+    uniq: List[Tuple[str, str]] = []
+    for tx, gene in pairs:
+        k = (tx, gene)
+        if k not in seen:
+            uniq.append(k); seen.add(k)
 
-    # 清洗 ID
-    dfc = df.copy()
-    dfc["TX"] = dfc["TX"].astype(str).map(clean_tx_id)
-    dfc = dfc.drop_duplicates()
-    n_map = len(dfc)
-    dfc.to_csv(map_out, sep="\t", index=False)
-    log(fp, f"清洗版 geneMap 写出：{map_out}（{n_map} 行）")
+    # 写 clean 主表
+    with open(out_clean, "w", encoding="utf-8", newline="") as f:
+        w = csv.writer(f, dialect=csv.excel_tab)
+        w.writerow(["transcript_id", "gene_id"])
+        w.writerows(uniq)
+    log(f"[Out] {out_clean}  行数：{len(uniq)}")
 
-    # 生成用于富集/注释的目录（若后续需要）
-    ensure_dir(anno_dir)
-    log(fp, "完成 ✅")
+    # 黑名单（gene→转录本数 ≥ 阈值）
+    thr = int(cfg.get("tx2gene", {}).get("blacklist_threshold", DEFAULTS["tx2gene"]["blacklist_threshold"]))
+    g2n: Dict[str, int] = {}
+    for _, g in uniq:
+        g2n[g] = g2n.get(g, 0) + 1
+    bad = [(g, n) for g, n in g2n.items() if n >= thr]
+    with open(out_black, "w", encoding="utf-8", newline="") as f:
+        w = csv.writer(f, dialect=csv.excel_tab)
+        w.writerow(["gene_id", "n_transcripts", "threshold"])
+        for g, n in sorted(bad, key=lambda x: (-x[1], x[0])):
+            w.writerow([g, n, thr])
+    log(f"[Out] {out_black}  触发阈值基因数：{len(bad)}（阈值={thr}）")
+
+    # 来源指纹（供 05 自检同源，不影响结果）
+    try:
+        with open(out_src, "w", encoding="utf-8") as f:
+            f.write(f"ref_gtf={ref_gtf.resolve()}\n")
+            f.write(f"md5={md5sum(ref_gtf)}\n")
+    except Exception as e:
+        log(f"[Warn] 写 SOURCE 指纹失败（可忽略）：{e}")
+
+    log("========== 03 完成 ✅ ==========")
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        sys.stderr.write(f"[ERR] 03 执行失败：{e}\n")
+        sys.exit(1)
 

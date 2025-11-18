@@ -1,189 +1,316 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-02_refprep_salmon_index.py — 构建 Salmon 索引（强制 gentrome + decoys，官方推荐）
-用法：在项目根目录运行
-  python scripts/02_refprep_salmon_index.py
 
-依赖（从 config.yaml 读取，YAML 优先于脚本默认）：
-paths:
-  ref_fasta:    ref/Sinonovacula_constricta_genome.fa      # 基因组 FASTA
-  ref_gtf:      ref/Sinonovacula_constricta_genome.gff3    # GTF/GFF3，提取转录本用
-  salmon_index: results/refprep/salmon_index               # 索引输出目录
-  logs_dir:     logs
-binaries:
-  salmon:  salmon
-  gffread: gffread
-resources:
-  threads:
-    salmon_index: 20
+"""
+02_refprep_salmon_index.py —— 构建 Salmon decoy-aware 索引（严格契约 + 流式输出）
+
+契约（来自《转录组计划1.md》）：
+  • 仅读 config.yaml 指定键：
+      - reference.ref_fasta（必需）
+      - reference.ref_gtf   （必需）
+      - reference.salmon.index_dir（必需）
+      - reference.salmon.kmer_len（默认 31）
+      - reference.salmon.decoy_list（可选；留空则本脚本生成）
+      - reference.salmon.gentrome_fa（可选；留空则本脚本生成）
+      - resources.threads.salmon（必需；线程数）
+  • 构建摘要写入：results/02_ref/gentrome_decoy_summary.tsv
+  • 中间产物（若需生成）：ref/transcripts.fa 、（缺省）ref/decoys.txt、ref/gentrome.fa
+  • 屏幕“流式输出” + 写日志 logs/02_refprep_salmon_index.log
+  • 不接受命令行参数；一切以 config.yaml 为准
 """
 
 from __future__ import annotations
-import sys, json, time, subprocess, shutil
+import sys, os, csv, subprocess, shutil, hashlib
 from pathlib import Path
-from typing import Dict, Any, Optional
-import yaml
-import pandas as pd
+from typing import Dict, Any, List
+from datetime import datetime
 
-# ================== 配置（脚本默认；YAML 覆盖） ==================
-LOCAL_CONFIG = {
-  "config_yaml": "config.yaml",
-  "paths": {
-    "ref_fasta":    "ref/genome.fa",
-    "ref_gtf":      "ref/genes.gff3",
-    "salmon_index": "results/refprep/salmon_index",
-    "logs_dir":     "logs"
-  },
-  "binaries": { "salmon":"salmon", "gffread":"gffread" },
-  "resources": { "threads": { "salmon_index": 8 } }
+# 依赖：PyYAML
+try:
+    import yaml
+except Exception:
+    print("[ERR] 缺少 PyYAML，请先安装：mamba/conda install pyyaml", file=sys.stderr)
+    sys.exit(1)
+
+# ================= 顶部参数（其余全部从 config 读取） =================
+CONFIG_PATH = "config.yaml"
+DEFAULTS: Dict[str, Any] = {
+    "reference": {
+        "salmon": {
+            "kmer_len": 31,
+            # decoy_list / gentrome_fa 若在 config 留空，脚本将使用默认路径生成
+            "decoy_list": "",
+            "gentrome_fa": "",
+            "rebuild": "if_missing"  # always / if_missing / never
+        }
+    },
+    "resources": {
+        "threads": {
+            # 线程必须由 resources.threads.salmon 提供，若缺失→报错
+            # 此处不设默认，避免静默回落
+        }
+    },
+    "binaries": {
+        "salmon": "salmon",
+        "gffread": "gffread"
+    },
+    "dirs": {
+        "logs": "logs"
+    },
+    "logging": { "timestamp": True }
 }
-SCRIPT_TAG = "02_salmon_index"
+# =====================================================================
 
-# ================== 工具函数 ==================
-def cwd() -> Path: return Path.cwd().resolve()
+CFG: Dict[str, Any] = {}
 
-def to_abs(p: str | Path | None) -> Optional[Path]:
-    if p is None: return None
-    s = str(p).strip()
-    if s == "": return None
-    q = Path(s)
-    return (q if q.is_absolute() else cwd()/q).resolve()
+def now_ts() -> str:
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-def load_yaml(path: str) -> Dict[str, Any]:
-    p = to_abs(path)
-    if not p or not p.exists(): return {}
-    with p.open('r', encoding='utf-8') as f:
-        return yaml.safe_load(f) or {}
+def log(msg: str) -> None:
+    """屏幕日志（是否带时间戳由配置控制）"""
+    if CFG.get("logging", {}).get("timestamp", True):
+        print(f"{now_ts()} {msg}")
+    else:
+        print(msg)
 
-def merge_params(local_cfg: dict, yaml_cfg: dict) -> dict:
-    if not isinstance(local_cfg, dict): local_cfg = {}
-    if not isinstance(yaml_cfg, dict):  yaml_cfg  = {}
-    def is_set(v):
-        return v is not None and not (isinstance(v,(str,list,dict)) and len(v)==0) \
-               and not (isinstance(v,str) and v.strip()=="")
-    def merge(a,b):
-        if isinstance(a,dict) and isinstance(b,dict):
-            out={}
-            for k in set(a.keys())|set(b.keys()):
-                av=a.get(k); bv=b.get(k)
-                if isinstance(av,dict) or isinstance(bv,dict):
-                    out[k]=merge(av if isinstance(av,dict) else {}, bv if isinstance(bv,dict) else {})
-                else:
-                    out[k]= bv if is_set(bv) else av
-            return out
-        return b if is_set(b) else a
-    return merge(local_cfg, yaml_cfg)
+def load_cfg(path: Path) -> Dict[str, Any]:
+    if not path.exists():
+        print(f"[ERR] 未找到配置文件：{path}", file=sys.stderr); sys.exit(1)
+    with open(path, "r", encoding="utf-8") as f:
+        user = yaml.safe_load(f) or {}
 
-def err(msg: str):
-    print(f"[ERR] {msg}", file=sys.stderr); sys.exit(1)
+    # 浅合并：user 覆盖 defaults
+    def merge(u: Dict[str, Any], base: Dict[str, Any]) -> Dict[str, Any]:
+        out = dict(base)
+        for k, v in u.items():
+            if isinstance(v, dict) and isinstance(out.get(k), dict):
+                out[k] = merge(v, out[k])
+            else:
+                out[k] = v
+        return out
 
-def ensure_dir(p) -> Path:
-    p = to_abs(p); p.mkdir(parents=True, exist_ok=True); return p
+    cfg = merge(user, DEFAULTS)
 
-def require_exists(p, kind="file") -> Path:
-    p = to_abs(p)
-    if p is None: err("必需路径为空")
-    if kind=="file" and not p.is_file(): err(f"缺少文件：{p}")
-    if kind=="dir" and not p.is_dir(): err(f"缺少目录：{p}")
-    return p
+    # 严格取值：参考路径
+    ref = cfg.get("reference", {}) or {}
+    ref_fa = Path(str(ref.get("ref_fasta", "")).strip())
+    ref_gtf = Path(str(ref.get("ref_gtf", "")).strip())
+    sal = ref.get("salmon", {}) or {}
+    index_dir = Path(str(sal.get("index_dir", "")).strip())
+    if not ref_fa or not ref_fa.exists():
+        print(f"[ERR] 缺少或无法读取 reference.ref_fasta：{ref_fa}", file=sys.stderr); sys.exit(1)
+    if not ref_gtf or not ref_gtf.exists():
+        print(f"[ERR] 缺少或无法读取 reference.ref_gtf：{ref_gtf}", file=sys.stderr); sys.exit(1)
+    if not index_dir:
+        print("[ERR] 缺少 reference.salmon.index_dir（必须）", file=sys.stderr); sys.exit(1)
 
-def exe_exists(name: str) -> bool:
-    return shutil.which(name) is not None
+    # 线程：严格来自 resources.threads.salmon（契约规定）
+    threads_block = (cfg.get("resources", {}).get("threads", {}) or {})
+    if "salmon" not in threads_block:
+        print("[ERR] 缺少线程配置：resources.threads.salmon（必须）", file=sys.stderr); sys.exit(1)
+    try:
+        threads = int(threads_block["salmon"])
+    except Exception:
+        print("[ERR] resources.threads.salmon 不是有效整数", file=sys.stderr); sys.exit(1)
+    if threads <= 0:
+        print("[ERR] resources.threads.salmon 必须为正整数", file=sys.stderr); sys.exit(1)
 
-def log_open(d, tag):
-    d = ensure_dir(d); return open(d/f"{tag}.log","a",encoding="utf-8")
+    # 其它 Salmon 参数
+    kmer = int(sal.get("kmer_len", 31))
+    rebuild = str(sal.get("rebuild", "if_missing")).lower()
+    if rebuild not in ("always", "if_missing", "never"):
+        rebuild = "if_missing"
 
-def log(fp, msg):
-    ts = time.strftime("%Y-%m-%d %H:%M:%S")
-    fp.write(f"[{ts}] {msg}\n"); fp.flush(); print(msg, flush=True)
+    # decoy_list 与 gentrome_fa：若为空则采用脚本默认路径
+    decoy_path = Path(str(sal.get("decoy_list", "")).strip() or "ref/decoys.txt")
+    gentrome_fa = Path(str(sal.get("gentrome_fa", "")).strip() or "ref/gentrome.fa")
 
-def write_params_snapshot(params, logs_dir, tag):
-    d = ensure_dir(logs_dir); out = d/f"{tag}.params.tsv"
-    rows=[]
-    def flat(prefix,obj):
-        if isinstance(obj,dict):
-            for k,v in obj.items(): flat(f"{prefix}.{k}" if prefix else k, v)
-        else:
-            rows.append((prefix, json.dumps(obj, ensure_ascii=False)))
-    flat("", params)
-    pd.DataFrame(rows, columns=["key","value"]).to_csv(out, sep="\t", index=False)
+    # 中间转录本导出路径（固定）
+    transcripts_fa = Path("ref/transcripts.fa")
 
-def run_cmd(cmd: list[str], fp, cwd_path: Optional[str]=None, env=None):
-    log(fp, "CMD: " + " ".join(cmd))
-    r = subprocess.run(cmd, cwd=to_abs(cwd_path) if cwd_path else None, env=env)
-    if r.returncode != 0: err(f"外部命令失败，退出码={r.returncode}")
+    # 日志与二进制
+    salmon_bin = Path(str(cfg.get("binaries", {}).get("salmon", "salmon")))
+    gffread_bin = Path(str(cfg.get("binaries", {}).get("gffread", "gffread")))
+    log_file = Path(cfg.get("dirs", {}).get("logs", "logs")) / "02_refprep_salmon_index.log"
 
-# ================== 业务函数 ==================
-def make_transcripts_with_gffread(ref_gtf: Path, ref_fasta: Path, out_transcripts: Path, fp):
-    if not exe_exists(LOCAL_CONFIG["binaries"]["gffread"]):
-        err("未找到 gffread 可执行（binaries.gffread）。请在 PATH 中提供或在 config.yaml 中指定。")
-    run_cmd([
-        LOCAL_CONFIG["binaries"]["gffread"],
-        str(ref_gtf),
-        "-g", str(ref_fasta),
-        "-w", str(out_transcripts)
-    ], fp)
+    # 摘要表路径（契约：results/02_ref）
+    summary_tsv = Path("results/02_ref") / "gentrome_decoy_summary.tsv"
 
-def write_decoys_from_genome_fa(ref_fasta: Path, out_decoys: Path, fp):
-    n = 0
-    with open(ref_fasta, 'r', encoding='utf-8', errors='ignore') as fin, \
-         open(out_decoys, 'w', encoding='utf-8') as fout:
-        for line in fin:
-            if line.startswith('>'):
+    # 把解析后的关键值塞回 cfg 便于后续使用/打印
+    cfg["_RESOLVED"] = {
+        "ref_fa": ref_fa, "ref_gtf": ref_gtf, "index_dir": index_dir,
+        "threads": threads, "kmer": kmer, "rebuild": rebuild,
+        "decoy_path": decoy_path, "gentrome_fa": gentrome_fa,
+        "transcripts_fa": transcripts_fa, "salmon_bin": salmon_bin,
+        "gffread_bin": gffread_bin, "log_file": log_file, "summary_tsv": summary_tsv
+    }
+    return cfg
+
+def mkdir_p(p: Path) -> None:
+    p.mkdir(parents=True, exist_ok=True)
+
+def run_cmd_stream(cmd: List[str], log_file: Path) -> int:
+    """流式执行外部命令：屏幕实时打印 + 追加写日志文件"""
+    mkdir_p(log_file.parent)
+    log(f"[CMD] {' '.join(cmd)}")
+    with open(log_file, "a", encoding="utf-8") as lf:
+        lf.write(f"[{now_ts()}] [CMD] {' '.join(cmd)}\n")
+        p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+        assert p.stdout is not None
+        for line in p.stdout:
+            line = line.rstrip("\n")
+            print(line)
+            lf.write(line + "\n")
+        rc = p.wait()
+        lf.write(f"[{now_ts()}] [RC] {rc}\n")
+    if rc != 0:
+        log(f"[ERR] 命令执行失败，返回码={rc}（详见 {log_file}）")
+    return rc
+
+def fasta_headers(fa: Path) -> List[str]:
+    """读取 FASTA 的所有头（取 > 后到第一个空白为止）"""
+    names: List[str] = []
+    with open(fa, "r", encoding="utf-8", errors="ignore") as f:
+        for line in f:
+            if line.startswith(">"):
                 name = line[1:].strip().split()[0]
                 if name:
-                    fout.write(name + "\n"); n += 1
-    log(fp, f"decoys.txt 写入 {n} 条序列名：{out_decoys}")
+                    names.append(name)
+    return names
 
-def concat_fa(fa1: Path, fa2: Path, out_fa: Path, fp):
-    with open(out_fa, 'w', encoding='utf-8') as fout:
-        for src in (fa1, fa2):
-            with open(src, 'r', encoding='utf-8', errors='ignore') as fin:
-                for line in fin: fout.write(line)
-    log(fp, f"gentrome.fa 生成：{out_fa}")
+def file_md5(path: Path) -> str:
+    h = hashlib.md5()
+    with open(path, "rb") as f:
+        for ch in iter(lambda: f.read(8192), b""):
+            h.update(ch)
+    return h.hexdigest()
 
-# ================== 主逻辑（强制 gentrome） ==================
-def main():
-    cfg = merge_params(LOCAL_CONFIG, load_yaml(LOCAL_CONFIG["config_yaml"]))
-    logs_dir = cfg["paths"].get("logs_dir","logs")
-    fp = log_open(logs_dir, SCRIPT_TAG)
-    write_params_snapshot(cfg, logs_dir, SCRIPT_TAG)
+def main() -> None:
+    global CFG
+    CFG = load_cfg(Path(CONFIG_PATH))
+    R = CFG["_RESOLVED"]
 
-    ref_fa  = require_exists(cfg["paths"]["ref_fasta"], "file")
-    ref_gtf = require_exists(cfg["paths"]["ref_gtf"],   "file")
-    out_idx = ensure_dir(cfg["paths"]["salmon_index"])
+    # 打印“来源键路径”以便您审核
+    log("========== 02 — 构建 Salmon decoy-aware 索引 ==========")
+    log(f"[Info] reference.ref_fasta      = {R['ref_fa'].resolve()}")
+    log(f"[Info] reference.ref_gtf        = {R['ref_gtf'].resolve()}")
+    log(f"[Info] reference.salmon.index_dir = {R['index_dir'].resolve()}")
+    log(f"[Info] reference.salmon.kmer_len  = {R['kmer']}")
+    log(f"[Info] resources.threads.salmon   = {R['threads']}（严格来自 resources.*）")
+    log(f"[Info] decoy_list path             = {R['decoy_path']}（来自 reference.salmon.decoy_list 或默认）")
+    log(f"[Info] gentrome_fa path           = {R['gentrome_fa']}（来自 reference.salmon.gentrome_fa 或默认）")
+    log(f"[Info] rebuild policy             = {R['rebuild']}")
 
-    if not exe_exists(cfg["binaries"]["salmon"]):
-        err("未找到 salmon 可执行（binaries.salmon）。请在 PATH 中提供或在 config.yaml 中指定。")
+    # 准备目录
+    mkdir_p(Path("ref"))
+    mkdir_p(R["index_dir"])
+    mkdir_p(R["summary_tsv"].parent)
 
-    ref_dir = to_abs(cfg["paths"]["ref_fasta"]).parent
-    transcripts_fa = ref_dir / "transcripts.fa"
-    decoys_txt     = ref_dir / "decoys.txt"
-    gentrome_fa    = ref_dir / "gentrome.fa"
+    # 1) 若 gentrome_fa/decoy_list 未给或不存在，则生成
+    # 1.1 提取 transcripts.fa
+    need_tx = (R["rebuild"] == "always") or (not R["transcripts_fa"].exists())
+    if need_tx:
+        if R["transcripts_fa"].exists():
+            R["transcripts_fa"].unlink()
+        rc = run_cmd_stream([
+            str(R["gffread_bin"]),
+            "-w", str(R["transcripts_fa"]),
+            "-g", str(R["ref_fa"]),
+            str(R["ref_gtf"])
+        ], R["log_file"])
+        if rc != 0 or not R["transcripts_fa"].exists() or R["transcripts_fa"].stat().st_size == 0:
+            print("[ERR] gffread 未生成有效的 transcripts.fa", file=sys.stderr); sys.exit(1)
+    else:
+        log(f"[Skip] 已存在：{R['transcripts_fa']}（按 rebuild 策略跳过）")
 
-    log(fp, "[步骤] 构建 transcripts.fa（gffread）")
-    make_transcripts_with_gffread(ref_gtf, ref_fa, transcripts_fa, fp)
+    # 1.2 decoy_list
+    need_decoy = (R["rebuild"] == "always") or (not R["decoy_path"].exists())
+    if need_decoy:
+        if R["decoy_path"].exists():
+            R["decoy_path"].unlink()
+        names = fasta_headers(R["ref_fa"])
+        if not names:
+            print("[ERR] ref_fasta 未解析到任何序列头，无法生成 decoys.txt", file=sys.stderr); sys.exit(1)
+        with open(R["decoy_path"], "w", encoding="utf-8") as f:
+            for n in names:
+                f.write(n + "\n")
+        log(f"[Out] 生成 decoys：{R['decoy_path']}（{len(names)} 条）")
+    else:
+        log(f"[Skip] 已存在：{R['decoy_path']}（按 rebuild 策略跳过）")
 
-    log(fp, "[步骤] 生成 decoys.txt（来自基因组 FASTA 头）")
-    write_decoys_from_genome_fa(ref_fa, decoys_txt, fp)
+    # 1.3 gentrome.fa
+    need_gentrome = (R["rebuild"] == "always") or (not R["gentrome_fa"].exists())
+    if need_gentrome:
+        if R["gentrome_fa"].exists():
+            R["gentrome_fa"].unlink()
+        with open(R["gentrome_fa"], "wb") as out, \
+             open(R["transcripts_fa"], "rb") as f1, \
+             open(R["ref_fa"], "rb") as f2:
+            shutil.copyfileobj(f1, out)
+            shutil.copyfileobj(f2, out)
+        log(f"[Out] 生成 gentrome：{R['gentrome_fa']}")
+    else:
+        log(f"[Skip] 已存在：{R['gentrome_fa']}（按 rebuild 策略跳过）")
 
-    log(fp, "[步骤] 拼接 gentrome.fa = transcripts.fa + genome.fa")
-    concat_fa(transcripts_fa, ref_fa, gentrome_fa, fp)
+    # 2) 构建索引（若需要）
+    need_index = True
+    if R["index_dir"].exists():
+        marker = R["index_dir"] / "hash.bin"
+        if R["rebuild"] == "never":
+            need_index = False
+        elif R["rebuild"] == "if_missing":
+            need_index = not marker.exists()
+        elif R["rebuild"] == "always":
+            # 清空重建
+            for p in R["index_dir"].glob("*"):
+                if p.is_file(): p.unlink()
+    if need_index:
+        cmd = [
+            str(R["salmon_bin"]), "index",
+            "-t", str(R["gentrome_fa"]),
+            "-i", str(R["index_dir"]),
+            "-k", str(R["kmer"]),
+            "-p", str(R["threads"]),
+            "--decoys", str(R["decoy_path"])
+        ]
+        rc = run_cmd_stream(cmd, R["log_file"])
+        if rc != 0:
+            sys.exit(1)
+    else:
+        log(f"[Skip] 索引已存在且 rebuild={R['rebuild']}：{R['index_dir']}")
 
-    log(fp, "[步骤] salmon index（gentrome + decoys）")
-    run_cmd([
-        cfg["binaries"]["salmon"], "index",
-        "-t", str(gentrome_fa),
-        "-d", str(decoys_txt),
-        "-i", str(out_idx),
-        "-p", str(cfg["resources"]["threads"]["salmon_index"])
-    ], fp)
+    # 3) 构建摘要（契约：results/02_ref/gentrome_decoy_summary.tsv）
+    def count_fasta(fp: Path) -> int:
+        c = 0
+        with open(fp, "r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                if line.startswith(">"): c += 1
+        return c
+    tx_n = count_fasta(R["transcripts_fa"])
+    decoy_n = sum(1 for _ in open(R["decoy_path"], "r", encoding="utf-8"))
+    g_size = R["gentrome_fa"].stat().st_size if R["gentrome_fa"].exists() else 0
 
-    log(fp, "Salmon 索引完成 ✅")
-    log(fp, f"索引目录：{out_idx}")
-    log(fp, f"中间文件：{transcripts_fa.name}, {decoys_txt.name}, {gentrome_fa.name}")
+    with open(R["summary_tsv"], "w", encoding="utf-8", newline="") as f:
+        w = csv.writer(f, dialect=csv.excel_tab)
+        w.writerow(["timestamp", "transcripts_fa", "transcript_count",
+                    "genome_fa", "decoy_list", "decoy_count",
+                    "gentrome_fa", "gentrome_bytes",
+                    "index_dir", "kmer_len", "threads",
+                    "ref_fasta_md5", "ref_gtf_md5"])
+        w.writerow([
+            now_ts(), str(R["transcripts_fa"]), tx_n,
+            str(R["ref_fa"]), str(R["decoy_path"]), decoy_n,
+            str(R["gentrome_fa"]), g_size,
+            str(R["index_dir"]), R["kmer"], R["threads"],
+            file_md5(R["ref_fa"]), file_md5(R["ref_gtf"])
+        ])
+    log(f"[Out] 摘要：{R['summary_tsv']}")
+    log("========== 02 完成 ✅ ==========")
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        print(f"[ERR] 02 执行失败：{e}", file=sys.stderr)
+        sys.exit(1)
 
