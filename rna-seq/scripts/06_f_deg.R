@@ -1,13 +1,6 @@
 #!/usr/bin/env Rscript
-
-# 06_f_deg.R —— DESeq2 实施（严格契约·只读 config.yaml）
-# 约定要点：
-#  1) 只读 config.yaml / 标准路径，不接受命令行/环境变量。
-#  2) contrasts.tsv 列严格为：contrast, case, control。
-#  3) 计数矩阵严格为：results/05_matrix/counts/gene_counts.tsv（无回退）。
-#  4) 剔除 results/01_qc/rejects.tsv 中样本（若存在）。
-#  5) 产物（每对比）固定 6 件套；DEG 三表列名统一 snake_case。
-#  6) 批次：deg.allow_batch=true 且可估计 → ~ batch + group；否则回退 ~ group，并在 design.txt 写明原因。
+# 06_f_deg.R —— 差异表达主程（严格契约）
+# 只读 config.yaml；不接命令行参数；输出契约文件
 
 suppressPackageStartupMessages({
   library(yaml)
@@ -20,7 +13,6 @@ suppressPackageStartupMessages({
 
 CONFIG_PATH <- "config.yaml"
 
-# ---------- 工具：递归合并默认值 ----------
 merge_list <- function(user, defaults) {
   if (is.null(user)) return(defaults)
   for (nm in names(defaults)) {
@@ -41,8 +33,7 @@ defaults <- list(
   dirs = list(
     qc     = "results/01_qc",
     matrix = "results/05_matrix",
-    deg    = "results/06_deg",
-    logs   = "logs"
+    deg    = "results/06_deg"
   ),
   deg = list(
     lfc = 1.0,
@@ -53,212 +44,163 @@ defaults <- list(
   )
 )
 
-cfg <- read_yaml(CONFIG_PATH)
-cfg <- merge_list(cfg, defaults)
+cfg <- read_yaml(CONFIG_PATH); cfg <- merge_list(cfg, defaults)
 
-# ---------- 路径 ----------
 samples_fp   <- cfg$data$samples_tsv
 contrasts_fp <- cfg$data$contrasts_tsv
-counts_fp    <- file.path(cfg$dirs$matrix, "counts", "gene_counts.tsv")
-qc_rejects   <- file.path(cfg$dirs$qc, "rejects.tsv")
+matrix_dir   <- cfg$dirs$matrix
 deg_root     <- cfg$dirs$deg
+qc_dir       <- cfg$dirs$qc
 
-# ---------- 必需文件检查 ----------
-if (!file.exists(samples_fp))   stop(sprintf("未找到 samples.tsv：%s", samples_fp))
-if (!file.exists(contrasts_fp)) stop(sprintf("未找到 contrasts.tsv：%s", contrasts_fp))
-if (!file.exists(counts_fp))    stop(sprintf("未找到 gene_counts.tsv：%s（请先完成 05）", counts_fp))
+counts_fp <- file.path(matrix_dir, "counts", "gene_counts.tsv")
+tpms_fp   <- file.path(matrix_dir, "tpms",   "gene_tpm.tsv")
 
-# ---------- 读取数据 ----------
-cat("========== 06-R — DESeq2 ==========\n")
+cat("========== 06-R — DEG ==========\n")
 cat(sprintf("[Info] samples   = %s\n", samples_fp))
 cat(sprintf("[Info] contrasts = %s\n", contrasts_fp))
 cat(sprintf("[Info] counts    = %s\n", counts_fp))
-cat(sprintf("[Info] qc.rejects= %s\n", qc_rejects))
+cat(sprintf("[Info] tpms      = %s\n", tpms_fp))
 
+# 读入
 samples <- fread(samples_fp, sep = "\t", header = TRUE, data.table = FALSE)
 if (!all(c("sample","group") %in% colnames(samples))) {
-  stop("samples.tsv 必含列：sample, group")
+  stop("samples.tsv 必须包含列：sample, group")
 }
-has_batch <- "batch" %in% colnames(samples)
-
-contr <- fread(contrasts_fp, sep = "\t", header = TRUE, data.table = FALSE)
-if (!all(c("contrast","case","control") %in% colnames(contr))) {
-  stop("contrasts.tsv 必含列：contrast, case, control")
+contrasts <- fread(contrasts_fp, sep = "\t", header = TRUE, data.table = FALSE)
+if (!all(c("contrast","case","control") %in% colnames(contrasts))) {
+  stop("contrasts.tsv 必须包含列：contrast, case, control")
 }
+counts <- fread(counts_fp, sep = "\t", header = TRUE, data.table = FALSE)
+tpms   <- fread(tpms_fp,   sep = "\t", header = TRUE, data.table = FALSE)
 
-cnt <- fread(counts_fp, sep = "\t", header = TRUE, data.table = FALSE, check.names = FALSE)
-if (!"gene_id" %in% colnames(cnt)) stop("gene_counts.tsv 必含列：gene_id")
-rownames(cnt) <- cnt$gene_id
-cnt$gene_id <- NULL
+rownames_assign <- function(df, idcol) {
+  rn <- df[[idcol]]; df[[idcol]] <- NULL; rn <- make.unique(as.character(rn))
+  rownames(df) <- rn; df
+}
+counts <- rownames_assign(counts, "gene_id")
+tpms   <- rownames_assign(tpms,   "gene_id")
 
-# 剔除 rejects.tsv 中样本（若存在）
-rej <- character(0)
-if (file.exists(qc_rejects)) {
-  rej_tab <- tryCatch(fread(qc_rejects, sep = "\t", header = TRUE, data.table = FALSE),
-                      error = function(e) NULL)
-  if (!is.null(rej_tab) && "sample" %in% colnames(rej_tab)) {
-    rej <- unique(as.character(rej_tab$sample))
+# 剔除 rejects.tsv 样本
+rej_fp <- file.path(qc_dir, "rejects.tsv")
+if (file.exists(rej_fp)) {
+  rej <- fread(rej_fp, sep = "\t", header = TRUE, data.table = FALSE)
+  if ("sample" %in% colnames(rej)) {
+    samples <- subset(samples, !(samples$sample %in% rej$sample))
+    cat(sprintf("[Info] 剔除 rejects 样本：%d 个\n", nrow(rej)))
   }
 }
-if (length(rej) > 0) {
-  keep_samp <- setdiff(colnames(cnt), rej)
-  cnt <- cnt[, keep_samp, drop = FALSE]
-  samples <- subset(samples, !(sample %in% rej))
-  cat(sprintf("[Info] 剔除低质样本（来自 rejects.tsv）：%s\n",
-              paste(rej, collapse = ",")))
-}
 
-# 与计数矩阵对齐（交集）
-common <- intersect(colnames(cnt), samples$sample)
-if (length(common) < 2) stop("有效样本数不足：与计数矩阵的交集 < 2")
-cnt <- cnt[, common, drop = FALSE]
-samples <- samples[samples$sample %in% common, , drop = FALSE]
-row.names(samples) <- samples$sample
+# DE 主循环
+for (i in seq_len(nrow(contrasts))) {
+  label   <- contrasts$contrast[i]
+  grp1    <- contrasts$case[i]
+  grp0    <- contrasts$control[i]
 
-# ---------- 配置参数 ----------
-deg_lfc  <- as.numeric(cfg$deg$lfc)
-deg_fdr  <- as.numeric(cfg$deg$fdr)
-use_apeg <- isTRUE(cfg$deg$use_apeglm)
-use_iflt <- isTRUE(cfg$deg$independent_filter)
-allow_bt <- isTRUE(cfg$deg$allow_batch)
+  cat(sprintf("\n[Run] %s : %s vs %s\n", label, grp1, grp0))
 
-cat(sprintf("[Parm] lfc=%.3f  fdr=%.3f  use_apeglm=%s  independent_filter=%s  allow_batch=%s\n",
-            deg_lfc, deg_fdr, as.character(use_apeg), as.character(use_iflt), as.character(allow_bt)))
-
-# ---------- 每个对比逐一计算 ----------
-for (i in seq_len(nrow(contr))) {
-  lb   <- as.character(contr$contrast[i])
-  case <- as.character(contr$case[i])
-  ctrl <- as.character(contr$control[i])
-
-  outdir <- file.path(deg_root, lb)
-  if (!dir.exists(outdir)) dir.create(outdir, recursive = TRUE)
-
-  cat(sprintf("\n[Run] contrast=%s  case=%s  control=%s\n", lb, case, ctrl))
-
-  # 只保留 case/control 两组样本
-  samp_sub <- subset(samples, group %in% c(case, ctrl))
-  sids <- samp_sub$sample
-  if (length(sids) < 2) {
-    cat("[Warn] 对比有效样本数不足，跳过\n")
-    next
-  }
-  cnt_sub <- cnt[, sids, drop = FALSE]
-
-  # 因子水平（control 作为基线）
-  samp_sub$group <- factor(samp_sub$group, levels = c(ctrl, case))
-  if (has_batch) {
-    # 若存在 batch 列，转为因子；否则后续根据 allow_batch 决策是否纳入
-    samp_sub$batch <- factor(samp_sub$batch)
+  keep_samp <- samples[samples$group %in% c(grp1, grp0), , drop = FALSE]
+  if (nrow(keep_samp) < 2) {
+    warning(sprintf("对比 %s 有效样本数不足；跳过", label)); next
   }
 
-  # 设计式与满秩检查
-  reason <- "—"
+  # 提取计数矩阵
+  common_cols <- intersect(colnames(counts), keep_samp$sample)
+  if (length(common_cols) < 2) {
+    warning(sprintf("对比 %s 可用列不足；跳过", label)); next
+  }
+  cnt <- counts[, common_cols, drop = FALSE]
+  coldata <- data.frame(row.names = common_cols,
+                        group = factor(keep_samp$group[match(common_cols, keep_samp$sample)],
+                                       levels = c(grp0, grp1)))
+
+  # 批次可选
   use_batch <- FALSE
-  design_formula <- ~ group
-
-  if (allow_bt && has_batch) {
-    # 只有 batch 至少两个水平且每水平至少有样本时才考虑
-    if (nlevels(droplevels(samp_sub$batch)) >= 2) {
-      mm <- model.matrix(~ batch + group, data = samp_sub)
-      full_rank <- qr(mm)$rank == ncol(mm)
-      if (full_rank) {
-        design_formula <- ~ batch + group
-        use_batch <- TRUE
-      } else {
-        reason <- "设计矩阵不可估（秩亏），回退为 ~ group"
-      }
-    } else {
-      reason <- "batch 单一或无效，回退为 ~ group"
+  if (isTRUE(cfg$deg$allow_batch) && "batch" %in% colnames(samples)) {
+    bvals <- samples$batch[match(common_cols, samples$sample)]
+    if (length(unique(bvals[!is.na(bvals)])) >= 2) {
+      coldata$batch <- factor(bvals)
+      use_batch <- TRUE
     }
-  } else if (!allow_bt && has_batch) {
-    reason <- "按配置未纳入 batch（allow_batch=false）"
   }
 
-  # 构造 DESeq2 对象并运行
-  dds <- DESeqDataSetFromMatrix(countData = round(as.matrix(cnt_sub)),
-                                colData   = samp_sub,
-                                design    = design_formula)
-  # 低表达过滤（温和）：保留总计数>=10的基因
-  keep <- rowSums(counts(dds)) >= 10
-  dds <- dds[keep, ]
+  # 设计式与记录
+  design_txt <- file.path(deg_root, label, "design.txt")
+  dir.create(file.path(deg_root, label), showWarnings = FALSE, recursive = TRUE)
+  if (use_batch) {
+    design_formula <- ~ batch + group
+    writeLines(c(
+      sprintf("design : ~ batch + group"),
+      sprintf("case   : %s", grp1),
+      sprintf("control: %s", grp0),
+      sprintf("allow_batch: TRUE (本对比已纳入 batch)")
+    ), con = design_txt)
+  } else {
+    design_formula <- ~ group
+    writeLines(c(
+      sprintf("design : ~ group"),
+      sprintf("case   : %s", grp1),
+      sprintf("control: %s", grp0),
+      sprintf("allow_batch: %s（未纳入）", as.character(cfg$deg$allow_batch))
+    ), con = design_txt)
+  }
 
+  # 构建 DESeq2
+  dds <- DESeqDataSetFromMatrix(countData = round(as.matrix(cnt)),
+                                colData   = coldata,
+                                design    = design_formula)
+
+  # 运行 DESeq2
   dds <- DESeq(dds)
 
-  # 结果与 LFC 收缩
-  res <- results(dds,
-                 contrast = c("group", case, ctrl),
-                 alpha = deg_fdr,
-                 independentFiltering = use_iflt)
-
-  if (use_apeg) {
-    # 使用 apeglm 收缩
-    resL <- lfcShrink(dds,
-                      contrast = c("group", case, ctrl),
-                      type = "apeglm",
-                      res = res)
-    # 用收缩后的 lfc 和 SE 回填
-    res$log2FoldChange <- resL$log2FoldChange
-    res$lfcSE <- resL$lfcSE
+  # 结果与收缩
+  res <- results(dds, contrast = c("group", grp1, grp0),
+                 alpha = cfg$deg$fdr, independentFiltering = cfg$deg$independent_filter)
+  if (isTRUE(cfg$deg$use_apeglm)) {
+    resLFC <- lfcShrink(dds, coef = paste0("group_", grp1, "_vs_", grp0),
+                        type = "apeglm")
+    res$log2FoldChange <- resLFC$log2FoldChange
+    res$lfcSE <- resLFC$lfcSE
   }
 
-  # 组装表格并统一列名（snake_case）
-  dt <- as.data.frame(res)
-  dt$gene_id <- rownames(dt)
-  dt <- dt[, c("gene_id", "log2FoldChange", "lfcSE", "stat", "pvalue", "padj", "baseMean")]
-  colnames(dt) <- c("gene_id", "log2fc", "lfc_se", "stat", "p_value", "p_adjust", "base_mean")
-
-  # 写 All
-  all_fp <- file.path(outdir, "DEG_all.tsv")
-  write_tsv(dt, all_fp)
-
-  # 写 Up / Down（按阈值与 FDR）
-  up_dt   <- subset(dt, !is.na(p_adjust) & p_adjust <= deg_fdr & log2fc >=  deg_lfc)
-  down_dt <- subset(dt, !is.na(p_adjust) & p_adjust <= deg_fdr & log2fc <= -deg_lfc)
-  write_tsv(up_dt,   file.path(outdir, "DEG_up.tsv"))
-  write_tsv(down_dt, file.path(outdir, "DEG_down.tsv"))
-
-  cat(sprintf("[Out] %s\n[Out] %s\n[Out] %s\n",
-              all_fp,
-              file.path(outdir, "DEG_up.tsv"),
-              file.path(outdir, "DEG_down.tsv")))
-
-  # 诊断：varTop100（基于归一化计数的方差）
-  ncnt <- counts(dds, normalized = TRUE)
-  vars <- rowVars(as.matrix(ncnt))
-  ord  <- order(vars, decreasing = TRUE)
-  top  <- rownames(ncnt)[head(ord, 100)]
-  writeLines(top, con = file.path(outdir, "varTop100.list"))
-  cat(sprintf("[Out] %s\n", file.path(outdir, "varTop100.list")))
-
-  # 诊断：RLE 范围（log2(norm+1) 减基因中位数）
-  logn <- log2(ncnt + 1)
-  med  <- matrixStats::rowMedians(as.matrix(logn))
-  rle  <- sweep(logn, 1, med, FUN = "-")
-  rle_vals <- as.numeric(as.matrix(rle))
-  rle_min <- min(rle_vals, na.rm = TRUE)
-  rle_max <- max(rle_vals, na.rm = TRUE)
-  rle_iqr <- IQR(rle_vals, na.rm = TRUE)
-  rle_tab <- data.frame(rle_min = rle_min, rle_max = rle_max, rle_iqr = rle_iqr)
-  write_tsv(rle_tab, file.path(outdir, "rle_range.tsv"))
-  cat(sprintf("[Out] %s\n", file.path(outdir, "rle_range.tsv")))
-
-  # design.txt（把口径与原因写清楚）
-  des_lines <- c(
-    sprintf("contrast: %s  (case=%s vs control=%s)", lb, case, ctrl),
-    sprintf("design: %s", deparse(design_formula)),
-    sprintf("batch_included: %s", ifelse(use_batch, "true", "false")),
-    sprintf("reason_if_no_batch: %s", reason),
-    sprintf("thresholds: |log2fc| >= %.3f  , FDR <= %.3f", deg_lfc, deg_fdr),
-    sprintf("n_samples: %d  (case=%d, control=%d)",
-            nrow(samp_sub), sum(samp_sub$group == case), sum(samp_sub$group == ctrl)),
-    sprintf("samples: %s", paste(rownames(samp_sub), collapse = ",")),
-    sprintf("rejected_samples_excluded: %s",
-            ifelse(length(rej) == 0, "none", paste(rej, collapse = ",")))
+  # 整理表头（契约）
+  out <- data.frame(
+    gene_id   = rownames(res),
+    log2fc    = as.numeric(res$log2FoldChange),
+    lfc_se    = as.numeric(res$lfcSE),
+    stat      = as.numeric(res$stat),
+    p_value   = as.numeric(res$pvalue),
+    p_adjust  = as.numeric(res$padj),
+    base_mean = as.numeric(res$baseMean),
+    stringsAsFactors = FALSE
   )
-  writeLines(des_lines, con = file.path(outdir, "design.txt"))
-  cat(sprintf("[Out] %s\n", file.path(outdir, "design.txt")))
+  # 三套表
+  deg_dir <- file.path(deg_root, label)
+  dir.create(deg_dir, recursive = TRUE, showWarnings = FALSE)
+  write_tsv(out, file.path(deg_dir, "DEG_all.tsv"))
+  up   <- subset(out,  !is.na(p_adjust) & p_adjust <= cfg$deg$fdr & log2fc >= cfg$deg$lfc)
+  down <- subset(out, !is.na(p_adjust) & p_adjust <= cfg$deg$fdr & log2fc <= -cfg$deg$lfc)
+  write_tsv(up,   file.path(deg_dir, "DEG_up.tsv"))
+  write_tsv(down, file.path(deg_dir, "DEG_down.tsv"))
+
+  # 诊断：Top-var 与 RLE 范围
+  vsd <- vst(dds, blind = TRUE)
+  vmat <- assay(vsd)
+  gvar <- rowVars(vmat)
+  top_idx <- order(gvar, decreasing = TRUE)[seq_len(min(100, length(gvar)))]
+  writeLines(rownames(vmat)[top_idx], con = file.path(deg_dir, "varTop100.list"))
+
+  # RLE 范围
+  med <- rowMedians(vmat)
+  rle <- sweep(vmat, 1, med, FUN = "-")
+  rle_range <- data.frame(
+    min = min(rle, na.rm = TRUE),
+    max = max(rle, na.rm = TRUE),
+    iqr = IQR(as.numeric(rle), na.rm = TRUE)
+  )
+  write_tsv(rle_range, file.path(deg_dir, "rle_range.tsv"))
+
+  cat(sprintf("[Out] %s/{DEG_all.tsv, DEG_up.tsv, DEG_down.tsv, varTop100.list, rle_range.tsv}\n",
+              deg_dir))
 }
 
 cat("========== 06-R 完成 ==========\n")
-

@@ -3,13 +3,12 @@
 
 """
 06_deg_module.py —— DEG 驱动（严格契约版）
-遵守要点（来自“转录组计划”约定）：
-  * 对比表仅认可列名：contrast, case, control（不做别名与回退）
-  * 计数矩阵只认：results/05_matrix/counts/gene_counts.tsv（无回退）
-  * R 端不吃命令行参数与环境变量，只读 config.yaml 与标准路径
-  * 产物（每对比）：DEG_all.tsv / DEG_up.tsv / DEG_down.tsv / varTop100.list / rle_range.tsv / design.txt
-  * 列名统一为 snake_case：gene_id, log2fc, lfc_se, stat, p_value, p_adjust, base_mean
-  * 剔除 results/01_qc/rejects.tsv 中样本（由 R 端执行，Python 仅做存在性提示）
+- 读 config.yaml（不接收命令行参数）
+- 检查 05 产物是否就位（counts/gene_counts.tsv 与 tpms/gene_tpm.tsv）
+- 检查 contrasts.tsv 表头：contrast, case, control
+- 剔除 results/01_qc/rejects.tsv 中样本
+- 调用同目录 06_f_deg.R（屏幕流式输出 + 日志）
+- 事后对每个对比进行“契约产物”自检
 """
 
 from __future__ import annotations
@@ -25,7 +24,7 @@ DEFAULTS: Dict[str, Any] = {
         "qc": "results/01_qc",
         "matrix": "results/05_matrix",
         "deg": "results/06_deg",
-        "logs": "logs",
+        "logs": "logs"
     },
     "binaries": {"Rscript": "Rscript"},
     "deg": {
@@ -33,65 +32,55 @@ DEFAULTS: Dict[str, Any] = {
         "fdr": 0.05,
         "use_apeglm": True,
         "independent_filter": True,
-        "allow_batch": True,
+        "allow_batch": True
     },
-    "logging": {"level": "INFO", "timestamp": True},
+    "logging": {"level": "INFO", "timestamp": True}
 }
 
 def load_yaml(path: Path) -> Dict[str, Any]:
-    """读取 YAML，并与默认值递归合并；缺关键项即报错。"""
     try:
         import yaml
     except Exception:
-        print("[ERR] 需要 PyYAML，请先安装 pyyaml", file=sys.stderr)
-        raise
+        print("[ERR] 需要 PyYAML，请安装 pyyaml", file=sys.stderr); raise
     if not path.exists():
         raise FileNotFoundError(f"未找到配置文件：{path}")
     with open(path, "r", encoding="utf-8") as f:
         user = yaml.safe_load(f) or {}
-
-    def merge(user_d: Dict[str, Any], base_d: Dict[str, Any]) -> Dict[str, Any]:
+    def merge(user_d, base_d):
         out = dict(base_d)
-        for k, v in user_d.items():
+        for k, v in (user_d or {}).items():
             if isinstance(v, dict) and isinstance(out.get(k), dict):
                 out[k] = merge(v, out[k])
             else:
                 out[k] = v
         return out
-
-    cfg = merge(user, DEFAULTS)
-    # 关键顶层键校验（依约定）
-    for top in ["data", "dirs", "binaries", "deg"]:
-        if top not in cfg:
-            raise KeyError(f"配置缺少顶层键：{top}")
-    return cfg
+    return merge(user, DEFAULTS)
 
 def mkdir_p(p: Path) -> None:
     p.mkdir(parents=True, exist_ok=True)
 
-def read_contrasts(contrasts_tsv: Path) -> List[Dict[str, str]]:
-    """严格校验 contrasts.tsv 列名：contrast, case, control（不做别名）。"""
-    if not contrasts_tsv.exists():
-        raise FileNotFoundError(f"未找到 contrasts.tsv：{contrasts_tsv}")
+def read_contrasts(p: Path) -> List[Dict[str, str]]:
+    if not p.exists():
+        raise FileNotFoundError(f"未找到 contrasts.tsv：{p}")
     rows: List[Dict[str, str]] = []
-    with open(contrasts_tsv, "r", encoding="utf-8") as f:
+    with open(p, "r", encoding="utf-8") as f:
         reader = csv.DictReader(f, dialect=csv.excel_tab)
-        must = ["contrast", "case", "control"]
-        if reader.fieldnames is None or any(col not in reader.fieldnames for col in must):
-            raise ValueError(f"contrasts.tsv 必含列：{', '.join(must)}（现有列：{reader.fieldnames}）")
+        required = ["contrast", "case", "control"]
+        if reader.fieldnames is None or any(c not in reader.fieldnames for c in required):
+            raise ValueError(f"contrasts.tsv 必含列：{', '.join(required)}（契约）")
         for r in reader:
-            rows.append({k: (r.get(k, "") or "").strip()})
+            rows.append({k: (r.get(k, "") or "").strip() for k in required})
     if not rows:
         raise ValueError("contrasts.tsv 为空")
     return rows
 
-def run_cmd_stream(cmd: List[str], log_path: Path) -> int:
-    """流式执行外部命令：屏幕实时打印 + 写日志到 logs/06_deg_module.log"""
-    mkdir_p(log_path.parent)
+def run_cmd_stream(cmd: List[str], log_file: Path) -> int:
+    mkdir_p(log_file.parent)
     logging.info("[CMD] " + " ".join(cmd))
-    with open(log_path, "a", encoding="utf-8") as lf:
+    with open(log_file, "w", encoding="utf-8") as lf:
         lf.write("[CMD] " + " ".join(cmd) + "\n")
-        p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+        p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                             text=True, bufsize=1)
         assert p.stdout is not None
         for line in p.stdout:
             line = line.rstrip("\n")
@@ -100,30 +89,10 @@ def run_cmd_stream(cmd: List[str], log_path: Path) -> int:
         rc = p.wait()
         lf.write(f"[RC] {rc}\n")
     if rc != 0:
-        logging.error("命令执行失败，返回码=%d（详见 %s）", rc, log_path)
+        logging.error("命令执行失败（返回码=%d），详见：%s", rc, log_file)
     return rc
 
-def postcheck_outputs(deg_dir: Path, labels: List[str]) -> None:
-    """按契约逐对比检查 6 个产物是否存在，不存在即报错。"""
-    missing: List[str] = []
-    for lb in labels:
-        base = deg_dir / lb
-        exp = [
-            base / "DEG_all.tsv",
-            base / "DEG_up.tsv",
-            base / "DEG_down.tsv",
-            base / "varTop100.list",
-            base / "rle_range.tsv",
-            base / "design.txt",
-        ]
-        for p in exp:
-            if not p.exists():
-                missing.append(str(p))
-    if missing:
-        raise RuntimeError("06 产物缺失：\n  - " + "\n  - ".join(missing))
-
 def main() -> None:
-    # ---------- 日志 ----------
     cfg = load_yaml(Path(CONFIG_PATH))
     level = getattr(logging, (cfg.get("logging", {}).get("level") or "INFO").upper(), logging.INFO)
     logging.basicConfig(
@@ -132,42 +101,67 @@ def main() -> None:
                else "[%(levelname)s] %(message)s",
     )
 
-    logging.info("========== 06 — DEG 驱动（严格契约） ==========")
-    logging.info(f"[Info] data.samples_tsv   = {Path(cfg['data']['samples_tsv']).resolve()}")
-    logging.info(f"[Info] data.contrasts_tsv = {Path(cfg['data']['contrasts_tsv']).resolve()}")
-    logging.info(f"[Info] dirs.matrix        = {Path(cfg['dirs']['matrix']).resolve()}")
-    logging.info(f"[Info] dirs.deg           = {Path(cfg['dirs']['deg']).resolve()}")
-    logging.info(f"[Info] dirs.qc            = {Path(cfg['dirs']['qc']).resolve()}")
-    logging.info(f"[Info] binaries.Rscript   = {cfg['binaries']['Rscript']}")
-
-    # ---------- 关键文件存在性（严格路径） ----------
-    counts_fp = Path(cfg["dirs"]["matrix"]) / "counts" / "gene_counts.tsv"
-    if not counts_fp.exists():
-        raise FileNotFoundError(f"缺少计数矩阵：{counts_fp}（请先完成 05）")
+    samples_tsv   = Path(cfg["data"]["samples_tsv"])
     contrasts_tsv = Path(cfg["data"]["contrasts_tsv"])
-    labels = [r["contrast"] for r in read_contrasts(contrasts_tsv)]
+    matrix_dir    = Path(cfg["dirs"]["matrix"])
+    deg_root      = Path(cfg["dirs"]["deg"])
 
-    # ---------- 调用 R ----------
-    script_dir = Path(__file__).resolve().parent
-    r_fp = script_dir / "06_f_deg.R"
-    if not r_fp.exists():
-        raise FileNotFoundError(f"未找到 R 脚本：{r_fp}（应与本 Python 同目录）")
-    mkdir_p(Path(cfg["dirs"]["deg"]))
-    mkdir_p(Path(cfg["dirs"]["logs"]))
+    # 打印关键信息
+    logging.info("========== 06 — DEG 驱动（严格契约） ==========")
+    logging.info("[Info] data.samples_tsv   = %s", str(samples_tsv.resolve()))
+    logging.info("[Info] data.contrasts_tsv = %s", str(contrasts_tsv.resolve()))
+    logging.info("[Info] dirs.matrix        = %s", str(matrix_dir.resolve()))
+    logging.info("[Info] dirs.deg           = %s", str(deg_root.resolve()))
+    logging.info("[Info] dirs.qc            = %s", str(Path(cfg["dirs"]["qc"]).resolve()))
+    logging.info("[Info] binaries.Rscript   = %s", cfg["binaries"]["Rscript"])
 
-    rc = run_cmd_stream([cfg["binaries"]["Rscript"], str(r_fp)],
-                        Path(cfg["dirs"]["logs"]) / "06_deg_module.log")
+    # 05 产物契约检查
+    required_paths = {
+        "counts": matrix_dir / "counts" / "gene_counts.tsv",
+        "tpms":   matrix_dir / "tpms"   / "gene_tpm.tsv",
+        "meta":   matrix_dir / "tximport_meta.tsv"
+    }
+    missing_names = [name for name, path in required_paths.items() if not path.exists()]
+    if missing_names:
+        raise SystemExit(f"[ERR] 06 执行失败：缺少以下契约产物：{', '.join(missing_names)} "
+                         f"(请先完成 05)")
+
+    # contrasts 表头契约
+    contrasts = read_contrasts(contrasts_tsv)
+
+    # 建日志目录
+    mkdir_p(deg_root)
+    log_path = Path(cfg["dirs"]["logs"]) / "06_deg.log"
+    mkdir_p(log_path.parent)
+
+    # 调用 R
+    rscript = cfg["binaries"]["Rscript"]
+    r_driver = Path(__file__).resolve().parent / "06_f_deg.R"
+    if not r_driver.exists():
+        raise SystemExit(f"[ERR] 未找到 R 脚本：{r_driver}")
+    rc = run_cmd_stream([rscript, str(r_driver)], log_path)
     if rc != 0:
-        raise RuntimeError("R 侧 DEG 计算失败，请查看屏幕输出与 logs/06_deg_module.log")
+        raise SystemExit("[ERR] 06-R 侧差异分析失败，请查看日志")
 
-    # ---------- 产物验收 ----------
-    postcheck_outputs(Path(cfg["dirs"]["deg"]), labels)
-    logging.info("========== 06 完成；所有对比的 6 件套已就位 ==========")
+    # 事后契约自检：每个对比必须有 5 个文件
+    must_files = ["DEG_all.tsv", "DEG_up.tsv", "DEG_down.tsv",
+                  "varTop100.list", "rle_range.tsv", "design.txt"]
+    bad = []
+    for row in contrasts:
+        label = row["contrast"]
+        deg_dir = deg_root / label
+        for fn in must_files:
+            if not (deg_dir / fn).exists():
+                bad.append(f"{label}/{fn}")
+    if bad:
+        raise SystemExit("[ERR] 06 完成但契约产物缺失：\n  - " + "\n  - ".join(bad))
+
+    logging.info("========== 06 完成：所有对比契约产物就位 ==========")
 
 if __name__ == "__main__":
     try:
         main()
+    except SystemExit as e:
+        print(str(e), file=sys.stderr); sys.exit(1)
     except Exception as e:
-        print(f"[ERR] 06 执行失败：{e}", file=sys.stderr)
-        sys.exit(1)
-
+        print(f"[ERR] 06 执行失败：{e}", file=sys.stderr); sys.exit(1)
