@@ -2,17 +2,17 @@
 # -*- coding: utf-8 -*-
 
 """
-07_prepare_emapper_annotations.py —— emapper 注释整理（严格契约 + 路径规范化 + 表头自愈）
-契约要点：
-  * 只读 config.yaml（项目根），不收命令行参数
-  * 关键键：annotations.emapper, dirs.maps, dirs.annot, logging
-  * 仅接受这四列：query, GOs, KEGG_ko, KEGG_Pathway（允许表头两处常见病自愈：#query→query；KEGG_PathwayKEGG_Module 拆列）
-  * 以 tx2gene.clean.tsv 的 transcript_id ↔ emapper 的 query 映射；默认不改 query，除非在 config 开启 emapper.query_id_clean.enable
-  * 输出：gene2go.tsv / gene2ko.tsv / gene2pathway.tsv / universe_coverage.tsv；若触发表头修补，写 _diag/header_fix.note
+07_prepare_emapper_annotations.py —— emapper 注释整理（契约：reference.emapper）
+要点：
+  * 只读 config.yaml；只认 reference.emapper（不找别名）
+  * 用 tx2gene.clean.tsv 的 transcript_id ↔ emapper 的 query 映射
+  * 输出：gene2go.tsv / gene2ko.tsv / gene2pathway.tsv / universe_coverage.tsv
+  * 表头自愈（两处）：#query→query；KEGG_PathwayKEGG_Module → KEGG_Pathway + KEGG_Module
+  * 可选的 query 前后缀清理（默认关闭，需在 config.emapper.query_id_clean.enable: true 才启用）
 """
 
 from __future__ import annotations
-import sys, os, csv, gzip, logging, re
+import sys, csv, gzip, logging, re
 from pathlib import Path
 from typing import Dict, Any, List, Tuple
 
@@ -20,31 +20,27 @@ CONFIG_PATH = "config.yaml"
 
 DEFAULTS: Dict[str, Any] = {
     "dirs": {"maps": "results/03_maps", "annot": "results/07_annot", "logs": "logs"},
-    "annotations": {"emapper": "ref/annotations/annotations.tsv"},
+    "reference": {"emapper": "ref/annotations/annotations.tsv"},
     "emapper": {
         "query_id_clean": {
-            "enable": False,           # 默认关闭，不改动 query
+            "enable": False,
             "remove_prefixes": [],
             "remove_suffixes": [],
-            "regex_suffixes": []       # 例：r"\.[0-9]+$", r"_t\d+$"
+            "regex_suffixes": []  # 例：r"\.[0-9]+$", r"_t\d+$"
         }
     },
     "logging": {"level": "INFO", "timestamp": True}
 }
 
-# ============== 工具 ==============
-
 def load_yaml(path: Path) -> Dict[str, Any]:
     try:
         import yaml
     except Exception:
-        print("[ERR] 需要 PyYAML：mamba/conda install pyyaml", file=sys.stderr)
-        raise
+        print("[ERR] 需要 PyYAML：mamba/conda install pyyaml", file=sys.stderr); raise
     if not path.exists():
         raise FileNotFoundError(f"未找到配置文件：{path}")
     with open(path, "r", encoding="utf-8") as f:
         user = (yaml.safe_load(f) or {})
-
     def merge(u, d):
         out = dict(d)
         for k, v in u.items():
@@ -53,19 +49,14 @@ def load_yaml(path: Path) -> Dict[str, Any]:
             else:
                 out[k] = v
         return out
-
     return merge(user, DEFAULTS)
 
 def mkdir_p(p: Path) -> None:
     p.mkdir(parents=True, exist_ok=True)
 
-def norm_path(pval: str) -> Path:
-    """路径规范化：strip → expanduser；resolve 仅用于日志展示。"""
-    s = (pval or "").strip()
-    if not s:
-        return Path("")
-    p = Path(s).expanduser()
-    return p
+def norm_path(s: str) -> Path:
+    val = (s or "").strip()
+    return Path(val).expanduser() if val else Path("")
 
 def show_resolved(p: Path) -> str:
     try:
@@ -120,42 +111,33 @@ def fix_header_line(line: str) -> Tuple[str, List[str]]:
         notes.append("header: KEGG_PathwayKEGG_Module -> KEGG_Pathway + KEGG_Module")
     return s + "\n", notes
 
-# ============== 主流程 ==============
-
 def main() -> None:
-    # 读取契约配置
+    # 读取契约配置（臣妾已阅读约定文件并按其键名实现）
     cfg = load_yaml(Path(CONFIG_PATH))
     # 日志
     level = getattr(logging, (cfg.get("logging", {}).get("level") or "INFO").upper(), logging.INFO)
-    logging.basicConfig(
-        level=level,
+    logging.basicConfig(level=level,
         format="%(asctime)s [%(levelname)s] %(message)s" if cfg.get("logging", {}).get("timestamp", True)
-        else "[%(levelname)s] %(message)s",
-    )
+        else "[%(levelname)s] %(message)s")
 
-    logging.info("========== 07 — emapper 注释整理（严格契约） ==========")
+    logging.info("========== 07 — emapper 注释整理（reference.emapper） ==========")
 
-    # 路径规范化（strip/expanduser），exists 后再打印 resolve()
-    emapper_fp = norm_path(cfg["annotations"]["emapper"])
+    emapper_fp = norm_path(cfg["reference"]["emapper"])
     maps_dir   = norm_path(cfg["dirs"]["maps"])
     out_dir    = norm_path(cfg["dirs"]["annot"])
-    mkdir_p(out_dir)
-    diag_dir = out_dir / "_diag"
-    mkdir_p(diag_dir)
+    mkdir_p(out_dir); mkdir_p(out_dir / "_diag")
 
-    logging.info(f"[Info] annotations.emapper = {show_resolved(emapper_fp)}")
-    logging.info(f"[Info] dirs.maps            = {show_resolved(maps_dir)}")
-    logging.info(f"[Info] dirs.annot           = {show_resolved(out_dir)}")
+    logging.info(f"[Info] reference.emapper = {show_resolved(emapper_fp)}")
+    logging.info(f"[Info] dirs.maps         = {show_resolved(maps_dir)}")
+    logging.info(f"[Info] dirs.annot        = {show_resolved(out_dir)}")
 
     if not emapper_fp or not emapper_fp.exists():
         raise FileNotFoundError(f"未找到 emapper 注释文件：{emapper_fp}")
 
-    # 读 tx2gene
     tx2gene_fp = maps_dir / "tx2gene.clean.tsv"
-    tx2gene_map = read_tx2gene(tx2gene_fp)
-    logging.info(f"[Info] tx2gene 映射条目数 = {len(tx2gene_map)}")
+    tx2map = read_tx2gene(tx2gene_fp)
+    logging.info(f"[Info] tx2gene 映射条目数 = {len(tx2map)}")
 
-    # 读取 emapper：修补表头，再解析
     header_fixed_notes: List[str] = []
     header: List[str] = []
     data_lines: List[str] = []
@@ -171,21 +153,19 @@ def main() -> None:
                 continue
             data_lines.append(line.rstrip("\n"))
 
-    # 必需列
     required = ["query", "GOs", "KEGG_ko", "KEGG_Pathway"]
     missing = [c for c in required if c not in header]
     if missing:
         raise ValueError(f"emapper 注释必须包含列：{', '.join(required)}（现有列：{header}）")
 
     if header_fixed_notes:
-        with open(diag_dir / "header_fix.note", "w", encoding="utf-8") as nf:
+        with open(out_dir / "_diag" / "header_fix.note", "w", encoding="utf-8") as nf:
             nf.write("\n".join(header_fixed_notes) + "\n")
         for n in header_fixed_notes:
             logging.warning(f"[Fix] {n}")
 
     idx = {c: header.index(c) for c in required}
 
-    # 输出文件
     go_fp = out_dir / "gene2go.tsv"
     ko_fp = out_dir / "gene2ko.tsv"
     pw_fp = out_dir / "gene2pathway.tsv"
@@ -207,8 +187,8 @@ def main() -> None:
         if not q_raw: continue
         total += 1
 
-        q = clean_query(q_raw, cfg)
-        gid = tx2gene_map.get(q)
+        q = clean_query(q_raw, cfg)  # 默认不改动；只有 enable:true 才生效
+        gid = tx2map.get(q)
         if not gid:
             if len(unmapped_examples) < 10:
                 unmapped_examples.append(q_raw)
@@ -251,11 +231,10 @@ def main() -> None:
     logging.info(f"[Out] {cov_fp}")
     if unmapped_examples:
         logging.warning(f"[Warn] 未映射示例（≤10）：{unmapped_examples}")
-        logging.warning("        若是蛋白/含前缀 ID，请在 config.emapper.query_id_clean.* 中显式配置后再启用 enable:true")
+        logging.warning("        若为蛋白/含前缀ID，请在 config.emapper.query_id_clean.* 中配置后再启用 enable:true")
 
 if __name__ == "__main__":
     try:
         main()
     except Exception as e:
-        print(f"[ERR] 07 执行失败：{e}", file=sys.stderr)
-        sys.exit(1)
+        print(f"[ERR] 07 执行失败：{e}", file=sys.stderr); sys.exit(1)
