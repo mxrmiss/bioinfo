@@ -98,6 +98,7 @@ if [[ ! -s "$GENE2KO" ]]; then
   exit 2
 fi
 
+# —— 重要修正：生成 gene2ko.clean 文件，确保清洗过程正确 —— 
 awk -vOFS='\t' '
   NR==1 { next }  # 忽略表头
   NF>=2 {
