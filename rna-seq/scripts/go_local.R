@@ -22,13 +22,11 @@ suppressPackageStartupMessages({
 # 1) 顶部参数（可手动修改）
 # =========================
 DEFAULTS <- list(
-  paths = list(
-    anno_dir = "results/07_annot/go",              # [改动] 统一到约定目录
-    gene2go  = "ref/annotations/gene2go.tsv",      # 由 07_prepare_emapper_annotations.py 产出（未改）
-    logs_dir = "logs"                               # 日志目录（固定文件名：go_local.log）
+  dirs = list(
+    annotations = "results/07_annot"  # [改动] 统一到约定目录
   ),
   go_local = list(
-    export_all = FALSE                              # TRUE：导出 GO.db 全量；FALSE：仅导出 gene2go 中出现的 GO
+    export_all = FALSE  # TRUE：导出 GO.db 全量；FALSE：仅导出 gene2go 中出现的 GO
   )
 )
 
@@ -38,13 +36,13 @@ DEFAULTS <- list(
 cfg <- DEFAULTS
 if (file.exists("config.yaml")) {
   y <- yaml::read_yaml("config.yaml")
-  if (!is.null(y$paths))         cfg$paths         <- modifyList(cfg$paths,         y$paths)
-  if (!is.null(y$go_local))      cfg$go_local      <- modifyList(cfg$go_local,      y$go_local)
+  if (!is.null(y$dirs))        cfg$dirs        <- modifyList(cfg$dirs,        y$dirs)
+  if (!is.null(y$go_local))    cfg$go_local    <- modifyList(cfg$go_local,    y$go_local)
 }
 
-anno_dir <- cfg$paths$anno_dir
-gene2go  <- cfg$paths$gene2go
-logs_dir <- cfg$paths$logs_dir
+anno_dir <- cfg$dirs$annotations
+gene2go  <- file.path(anno_dir, "gene2go.tsv")  # 读取 gene2go 的路径
+logs_dir <- "logs"  # 日志目录（固定文件名：go_local.log）
 export_all <- isTRUE(cfg$go_local$export_all)
 
 dir.create(anno_dir, recursive = TRUE, showWarnings = FALSE)
