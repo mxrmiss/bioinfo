@@ -99,19 +99,22 @@ if [[ ! -s "$GENE2KO" ]]; then
 fi
 
 # —— 修正：严格解析 gene2ko.tsv，确保正确生成 gene2ko.clean 文件 —— 
-awk -vOFS='\t' '
-  NR==1 { next }  # 忽略表头
-  NF>=2 {
-    g=$1; kc=$2;
-    gsub(/\r/,"",g); gsub(/^[ \t]+|[ \t]+$/,"",g);
-    if (g=="") next;
+awk '
+  BEGIN{FS="[\t, ]+"; OFS="\t"}
+  NR==1{
+    for(i=1;i<=NF;i++){
+      low=tolower($i)
+      if(low=="gene_id"||low=="gene"||low=="id") gc=i
+      if(low=="ko_id" ||low=="ko")               kc=i
+    }
+    if(!gc) gc=1; if(!kc) kc=2; next
   }
   {
-    g=$gc; sub(/\|.*/,"",g); sub(/\.[0-9]+$/,"",g);
-    n=split($kc,arr,/[;, ]+/);
+    g=$gc                       # 不删基因后缀
+    n=split($kc,arr,/[;, ]+/)
     for(i=1;i<=n;i++){
-      x=arr[i]; gsub(/^ko:/,"",x); x=toupper(x);
-      if (x ~ /^K[0-9]{5}$/ && g!="") print g,x;
+      x=arr[i]; gsub(/^ko:/,"",x); x=toupper(x)
+      if (x ~ /^K[0-9]{5}$/ && g!="") print g,x
     }
   }
 ' "$GENE2KO" | LC_ALL=C sort -u > "$REF/.gene2ko.clean"
