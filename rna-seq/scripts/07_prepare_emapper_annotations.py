@@ -2,20 +2,18 @@
 # -*- coding: utf-8 -*-
 
 """
-07_prepare_emapper_annotations.py —— 整理 eggNOG-mapper 注释为“基因层映射”（手工前/后缀契约版）
+07_prepare_emapper_annotations.py —— 整理 eggNOG-mapper 注释为“基因层映射”（遵循约定版）
 
-契约要点：
-  * 仅按 config.yaml 的“手工前/后缀开关 + 字面量列表”清理 emapper 的 query；不开关则不改动。
-  * 不做任何“自动去数字/正则猜测/智能识别”。
-  * 优先按（清理后）query == transcript_id 命中 → gene_id；若 allow_gene_space_match=true，则允许 query 直接等于 gene_id 命中。
-  * 列名默认：query, GOs, KEGG_ko, KEGG_Pathway；可在 config.annotations.*_col 覆盖。
-  * 输出：
-      - results/07_annot/gene2go.tsv（gene_id, go_id）
-      - results/07_annot/gene2ko.tsv（gene_id, ko_id）
-      - results/07_annot/gene2pathway.tsv（gene_id, pathway_id）
+要点（与约定一致）：
+  * 仅按 config.yaml 指定的列名读取 emapper 表，不做任何启发式猜测。
+  * 不改写、不清洗 ID：query 原样匹配 transcript_id→gene_id；若 allow_gene_space_match=true，则再允许 query 直接等于 gene_id 命中。
+  * 输出（制表符分隔，表头固定）：
+      - results/07_annot/gene2go.tsv         （gene_id, go_id）
+      - results/07_annot/gene2ko.tsv         （gene_id, ko_id）
+      - results/07_annot/gene2pathway.tsv    （gene_id, pathway_id）
       - results/07_annot/universe_coverage.tsv（覆盖率审计）
       - results/07_annot/unmapped_queries.list（未命中原始 query）
-      - results/07_annot/id_cleanup.audit.tsv（raw→prefix→suffix 的命中率）
+      - results/07_annot/id_cleanup.audit.tsv（命中率审计：仅 raw 一行）
 """
 
 from __future__ import annotations
@@ -30,18 +28,13 @@ DEFAULTS: Dict[str, Any] = {
     "reference": {"emapper": ""},
     "dirs": {"maps": "results/03_maps", "annotations": "results/07_annot"},
     "annotations": {
+        # emapper 列名可在此覆盖；为空则使用下方默认
         "emapper_query_col": "",
         "emapper_gos_col": "",
         "emapper_ko_col": "",
         "emapper_pathway_col": "",
+        # query 是否可直接与 gene_id 进行匹配（除 transcript_id→gene_id 外）
         "allow_gene_space_match": True,
-        "id_cleanup": {
-            "strip_prefix": False,
-            "prefix": [],
-            "strip_suffix": False,
-            "suffix": [],
-            "order": ["prefix","suffix"]  # 默认先前缀再后缀
-        }
     },
     "logging": {"level": "INFO", "timestamp": True}
 }
@@ -70,54 +63,48 @@ def load_yaml(path: Path) -> Dict[str, Any]:
         return out
     return merge(user, DEFAULTS)
 
-def clean_id_literal(x: str, prefixes: List[str], suffixes: List[str], order: List[str]) -> str:
-    y = x
-    for step in order:
-        if step == "prefix":
-            for pfx in prefixes:
-                if y.startswith(pfx):
-                    y = y[len(pfx):]
-                    break
-        elif step == "suffix":
-            for sfx in suffixes:
-                if y.endswith(sfx):
-                    y = y[:-len(sfx)]
-                    break
-    return y
-
 def normalize_ko(tok: str) -> Optional[str]:
+    """统一 KO 号格式：接受 'Kxxxxx' 或 'ko:Kxxxxx' 等，返回大写 Kxxxxx。"""
     if not tok: return None
-    s = tok.strip().upper()
+    s = tok.strip()
+    s = s.replace("ko:", "").replace("KO:", "")
+    s = s.upper()
     return s if re.fullmatch(r"K\d{5}", s) else None
 
 def normalize_pathway(tok: str) -> Optional[str]:
+    """统一 Pathway 号格式：接受 'path:koxxxxx' / 'koxxxxx' / 'mapxxxxx'；返回 'koxxxxx'。"""
     if not tok: return None
-    s = tok.strip().replace("path:", "")
+    s = tok.strip()
+    s = s.replace("PATH:", "path:").replace("Path:", "path:")
+    s = s.replace("path:", "")
     if s.startswith("map"): s = "ko" + s[3:]
+    s = s.lower()
     return s if re.fullmatch(r"ko\d{5}", s) else None
 
 def main() -> None:
+    # 读取配置与日志设定
     cfg = load_yaml(Path(CONFIG_PATH))
     level = getattr(logging, (cfg.get("logging", {}).get("level") or "INFO").upper(), logging.INFO)
     logging.basicConfig(
         level=level,
         format="%(asctime)s [%(levelname)s] %(message)s" if cfg.get("logging", {}).get("timestamp", True) else "[%(levelname)s] %(message)s",
     )
-
-    logging.info("========== 07 — emapper 注释整理（手工前/后缀契约） ==========")
+    logging.info("========== 07 — emapper 注释整理（遵循约定） ==========")
 
     # 路径
     emapper_fp = Path((cfg.get("reference", {}).get("emapper") or "").strip())
     maps_dir   = Path(cfg["dirs"]["maps"])
     out_dir    = Path(cfg["dirs"]["annotations"])
     mkdir_p(out_dir)
+
     if not emapper_fp.exists():
         raise FileNotFoundError(f"未找到 emapper 注释文件：{emapper_fp}")
 
-    # 读取 tx2gene.clean.tsv
+    # 读取 tx2gene.clean.tsv（必须包含 transcript_id, gene_id）
     tx2gene_fp = maps_dir / "tx2gene.clean.tsv"
     if not tx2gene_fp.exists():
         raise FileNotFoundError(f"未找到 tx2gene.clean.tsv：{tx2gene_fp}")
+
     t2g: Dict[str, str] = {}
     gene_set: set = set()
     with open(tx2gene_fp, "r", encoding="utf-8") as f:
@@ -133,20 +120,7 @@ def main() -> None:
                 t2g[tid] = gid
                 gene_set.add(gid)
 
-    # 清理配置（仅按手工列表；不开关就不动）
-    icfg = cfg["annotations"]["id_cleanup"]
-    do_prefix = bool(icfg.get("strip_prefix", False))
-    do_suffix = bool(icfg.get("strip_suffix", False))
-    order    = list(icfg.get("order", ["prefix","suffix"]))
-    pfx_list = list(icfg.get("prefix", [])) if do_prefix else []
-    sfx_list = list(icfg.get("suffix", [])) if do_suffix else []
-    allow_gene_space = bool(cfg["annotations"].get("allow_gene_space_match", True))
-    logging.info("[Rule] 顺序=%s；strip_prefix=%s；strip_suffix=%s；allow_gene_space_match=%s",
-                 order, do_prefix, do_suffix, allow_gene_space)
-    if pfx_list: logging.info("[Rule] prefix=%s", pfx_list)
-    if sfx_list: logging.info("[Rule] suffix=%s", sfx_list)
-
-    # 解析 emapper 表头（仅认 '#query\t...' 行）
+    # 解析 emapper 表头（仅认 '#query\t...' 行；列名可在 config.annotations.* 覆盖）
     header: Optional[List[str]] = None
     idx: Dict[str, int] = {}
     want = {
@@ -165,7 +139,6 @@ def main() -> None:
                     out[k] = i; break
         return out
 
-    # 先收集所有 query（便于审计 raw→prefix→suffix 的命中率）
     queries_raw: List[str] = []
     with open_maybe_gz(emapper_fp) as f:
         for line in f:
@@ -181,34 +154,11 @@ def main() -> None:
             if s.startswith("#") or not s:
                 continue
             parts = s.split("\t")
-            queries_raw.append(parts[idx["query"]].strip())
-
-    def apply_stage(x: str, stage: str) -> str:
-        if stage == "prefix" and do_prefix:
-            for pfx in pfx_list:
-                if x.startswith(pfx):
-                    return x[len(pfx):]
-        if stage == "suffix" and do_suffix:
-            for sfx in sfx_list:
-                if x.endswith(sfx):
-                    return x[:-len(sfx)]
-        return x
-
-    # 审计：raw→prefix→suffix 命中率（命中 = 命中任一集合 {transcript_id, gene_id(可选)}）
-    audit_rows: List[List[str]] = [["stage","matched","total","match_rate"]]
-    for stage in ["raw"] + order:
-        matched = 0
-        for q in queries_raw:
-            qq = apply_stage(q, stage) if stage != "raw" else q
-            if (qq in t2g) or (allow_gene_space and (qq in gene_set)):
-                matched += 1
-        total = len(queries_raw) if queries_raw else 1
-        rate = matched / total
-        audit_rows.append([stage, str(matched), str(total), f"{rate:.6f}"])
+            if idx["query"] >= 0 and idx["query"] < len(parts):
+                queries_raw.append(parts[idx["query"]].strip())
 
     # 正式产出
-    def final_clean(x: str) -> str:
-        return clean_id_literal(x, pfx_list if do_prefix else [], sfx_list if do_suffix else [], order)
+    allow_gene_space = bool(cfg["annotations"].get("allow_gene_space_match", True))
 
     gene2go: Dict[str, set] = {}
     gene2ko: Dict[str, set] = {}
@@ -240,27 +190,31 @@ def main() -> None:
                 continue
 
             parts = s.split("\t")
+            if qcol < 0 or qcol >= len(parts):
+                continue
             q_raw = parts[qcol].strip()
-            q = final_clean(q_raw)
 
+            # 匹配策略：优先 transcript_id→gene_id；若允许，再尝试 query == gene_id
             gid: Optional[str] = None
-            if q in t2g:
-                gid = t2g[q]; mapped_tx += 1
-            elif allow_gene_space and (q in gene_set):
-                gid = q; mapped_gene += 1
+            if q_raw in t2g:
+                gid = t2g[q_raw]; mapped_tx += 1
+            elif allow_gene_space and (q_raw in gene_set):
+                gid = q_raw; mapped_gene += 1
             else:
                 unmapped += 1
                 if len(unmapped_examples) < 50000:
                     unmapped_examples.append(q_raw)
                 continue
 
+            # 解析 GO
             if gos_col is not None and gos_col >= 0 and gos_col < len(parts):
                 s_g = parts[gos_col].strip()
                 if s_g and s_g != "-":
                     for tok in _SPLIT_RE.split(s_g):
-                        if tok and tok.startswith("GO:") and re.fullmatch(r"GO:\d{7}", tok):
+                        if tok and re.fullmatch(r"GO:\d{7}", tok):
                             gene2go.setdefault(gid, set()).add(tok)
 
+            # 解析 KO
             if ko_col is not None and ko_col >= 0 and ko_col < len(parts):
                 s_k = parts[ko_col].strip()
                 if s_k and s_k != "-":
@@ -269,6 +223,7 @@ def main() -> None:
                         if k:
                             gene2ko.setdefault(gid, set()).add(k)
 
+            # 解析 Pathway
             if path_col is not None and path_col >= 0 and path_col < len(parts):
                 s_p = parts[path_col].strip()
                 if s_p and s_p != "-":
@@ -277,7 +232,7 @@ def main() -> None:
                         if p:
                             gene2path.setdefault(gid, set()).add(p)
 
-    out_dir = Path(cfg["dirs"]["annotations"])
+    # 写出
     mkdir_p(out_dir)
 
     def write_pairs(fp: Path, hdr: List[str], d: Dict[str, set]) -> None:
@@ -292,10 +247,11 @@ def main() -> None:
     g2go_fp   = out_dir / "gene2go.tsv"
     g2ko_fp   = out_dir / "gene2ko.tsv"
     g2path_fp = out_dir / "gene2pathway.tsv"
-    write_pairs(g2go_fp, ["gene_id","go_id"], gene2go)
-    write_pairs(g2ko_fp, ["gene_id","ko_id"], gene2ko)
-    write_pairs(g2path_fp, ["gene_id","pathway_id"], gene2path)
+    write_pairs(g2go_fp,   ["gene_id","go_id"],        gene2go)
+    write_pairs(g2ko_fp,   ["gene_id","ko_id"],        gene2ko)
+    write_pairs(g2path_fp, ["gene_id","pathway_id"],   gene2path)
 
+    # 覆盖率审计
     cov_fp   = out_dir / "universe_coverage.tsv"
     with open(cov_fp, "w", encoding="utf-8", newline="") as f:
         w = csv.writer(f, dialect=csv.excel_tab)
@@ -308,12 +264,23 @@ def main() -> None:
         w.writerow(["unique_genes_mapped", str(uniq_genes)])
     logging.info("[Out] %s", cov_fp)
 
+    # 命中率审计（仅 raw 一行，用于保留既有产物名）
+    audit_rows: List[List[str]] = [["stage","matched","total","match_rate"]]
+    matched = 0
+    for q in queries_raw:
+        if (q in t2g) or (allow_gene_space and (q in gene_set)):
+            matched += 1
+    total = len(queries_raw) if queries_raw else 1
+    rate = matched / total
+    audit_rows.append(["raw", str(matched), str(total), f"{rate:.6f}"])
+
     audit_fp = out_dir / "id_cleanup.audit.tsv"
     with open(audit_fp, "w", encoding="utf-8", newline="") as f:
         w = csv.writer(f, dialect=csv.excel_tab)
         w.writerows(audit_rows)
     logging.info("[Out] %s", audit_fp)
 
+    # 未命中列表
     if unmapped_examples:
         with open(out_dir / "unmapped_queries.list", "w", encoding="utf-8") as f:
             f.write("\n".join(unmapped_examples))
@@ -327,4 +294,3 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"[ERR] 07 执行失败：{e}", file=sys.stderr)
         sys.exit(1)
-
