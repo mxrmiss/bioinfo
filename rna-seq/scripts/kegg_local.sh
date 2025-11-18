@@ -1,180 +1,296 @@
-#!/usr/bin/env bash
-set -euo pipefail
-# =============================================================================
-# kegg_local.sh  v9.2 — 自愈构建器（最小化口径统一：表头与落点）
-# - 手工基准映射优先：ref/ko_to_pathway.tsv.manual 若存在，直接用，不覆盖
-# - 若无手工表：若缺 RAW 自动下载，再规范化为 ko_to_pathway.tsv
-# - 生成：results/07_annot/kegg/term2gene.tsv / results/07_annot/kegg/term2name.tsv
-# - 可选：KEGG-MODULE（term2gene_kegg_module.tsv / term2name_kegg_module.tsv）
-# - 统一表头：
-#     term2name.tsv                 -> pathway_id\tterm_name
-#     term2gene.tsv                  -> pathway_id\tgene_id
-# =============================================================================
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 
-# ==== 开关 ====
-ENABLE_MODULE=1   # 1=生成 MODULE，0=跳过
+"""
+07_prepare_emapper_annotations.py —— 整理 eggNOG-mapper 注释为“基因层映射”（遵循约定版）
 
-# ==== 路径 ====
-REF="ref/annotations"
-OUTDIR="results/07_annot/kegg"
-RAW_PATH="$REF/kegg_offline/ko_to_pathway.raw"
-RAW_MOD="$REF/kegg_offline/ko_to_module.raw"
-MANUAL="$REF/ko_to_pathway.tsv.manual"
+要点（与约定一致）：
+  * 仅按 config.yaml 指定的列名读取 emapper 表，不做任何启发式猜测。
+  * 不改写、不清洗 ID：query 原样匹配 transcript_id→gene_id；若 allow_gene_space_match=true，则再允许 query 直接等于 gene_id 命中。
+  * 输出（制表符分隔，表头固定）：
+      - results/07_annot/gene2go.tsv         （gene_id, go_id）
+      - results/07_annot/gene2ko.tsv         （gene_id, ko_id）
+      - results/07_annot/gene2pathway.tsv    （gene_id, pathway_id）
+      - results/07_annot/universe_coverage.tsv（覆盖率审计）
+      - results/07_annot/unmapped_queries.list（未命中原始 query）
+      - results/07_annot/id_cleanup.audit.tsv（命中率审计：仅 raw 一行）
+"""
 
-KO2PATH_TSV="$REF/ko_to_pathway.tsv"
-PATHNAME_TSV="$REF/kegg_pathway.tsv"
+from __future__ import annotations
+import sys, csv, gzip, logging, re
+from pathlib import Path
+from typing import Dict, Any, List, Optional
+import yaml
 
-# —— 改动：输入路径改为 results/07_annot —— 
-GENE2KO="results/07_annot/gene2ko.tsv"  # [修改] 输入路径改为正确的路径
-T2G_PW="$OUTDIR/term2gene.tsv"  # 输出路径改为 results/07_annot/kegg
-T2N_PW="$OUTDIR/term2name.tsv"  # 输出路径改为 results/07_annot/kegg
+CONFIG_PATH = "config.yaml"
 
-T2G_MOD="$REF/kegg_legacy/term2gene_kegg_module.tsv"
-T2N_MOD="$REF/kegg_legacy/term2name_kegg_module.tsv"
-
-LOG="$REF/.kegg_build.log"
-
-mkdir -p "$REF/kegg_offline" "$REF/kegg_legacy" "$OUTDIR"
-: > "$LOG"
-log(){ echo "$*" | tee -a "$LOG"; }
-
-# ==== 函数：规范化 RAW -> TSV（两列：Kxxxxx \t koYYYYY）====
-norm_ko_path(){
-  awk -vOFS='\t' '{
-    gsub(/\r/,"");
-    k=$1; p=$2;
-    gsub(/^ko:/,"",k); k=toupper(k);
-    gsub(/^path:/,"",p); sub(/^map/,"ko",p);
-    if (k ~ /^K[0-9]{5}$/ && p ~ /^ko[0-9]{5}$/) print k,p;
-  }' "$1" | LC_ALL=C sort -u
+DEFAULTS: Dict[str, Any] = {
+    "reference": {"emapper": ""},
+    "dirs": {"maps": "results/03_maps", "annotations": "results/07_annot"},
+    "annotations": {
+        # emapper 列名可在此覆盖；为空则使用下方默认
+        "emapper_query_col": "",
+        "emapper_gos_col": "",
+        "emapper_ko_col": "",
+        "emapper_pathway_col": "",
+        # query 是否可直接与 gene_id 进行匹配（除 transcript_id→gene_id 外）
+        "allow_gene_space_match": True,
+    },
+    "logging": {"level": "INFO", "timestamp": True}
 }
 
-# ==== A) 准备 ko_to_pathway.tsv ====
-if [[ -s "$MANUAL" ]]; then
-  log "[1] 检测到手工基准映射：$MANUAL  （直接使用，不覆盖）"
-  cp -f "$MANUAL" "$KO2PATH_TSV"
-else
-  if [[ ! -s "$RAW_PATH" ]]; then
-    log "[1] 自动下载 raw: KO→Pathway"
-    curl -sSL --retry 3 --retry-delay 2 "https://rest.kegg.jp/link/pathway/ko" -o "$RAW_PATH"
-  else
-    log "[1] 使用本地 raw: $RAW_PATH"
-  fi
-  log "[1] 规范化为 $KO2PATH_TSV"
-  norm_ko_path "$RAW_PATH" > "$KO2PATH_TSV"
-fi
+_SPLIT_RE = re.compile(r"[,\|\s;]+")
 
-pairs=$(wc -l < "$KO2PATH_TSV")
-kos=$(cut -f1 "$KO2PATH_TSV" | LC_ALL=C sort -u | wc -l)
-paths=$(cut -f2 "$KO2PATH_TSV" | LC_ALL=C sort -u | wc -l)
-log "[✔] ko_to_pathway.tsv: pairs=$pairs  KO=$kos  pathways=$paths"
+def mkdir_p(p: Path) -> None:
+    p.mkdir(parents=True, exist_ok=True)
 
-# ==== B) pathway_names.tsv ====
-if [[ ! -s "$PATHNAME_TSV" ]]; then
-  log "[2] 获取 pathway_names.tsv"
-  if curl -sSL --max-time 60 "https://rest.kegg.jp/list/pathway/ko" \
-    | awk -vOFS='\t' '{gsub(/\r/,""); gsub(/^path:/,"",$1); sub(/^map/,"ko",$1); if ($1 ~ /^ko[0-9]{5}$/) print $1,$2}' \
-    | LC_ALL=C sort -u > "$PATHNAME_TSV"; then
-    :
-  else
-    log "[W] 在线获取失败，将用 ko_to_pathway.tsv 的路径集合构造名称占位"
-    cut -f2 "$KO2PATH_TSV" | LC_ALL=C sort -u | awk -vOFS='\t' '{print $1,$1}' > "$PATHNAME_TSV"
-  fi
-fi
+def open_maybe_gz(p: Path):
+    return gzip.open(p, "rt", encoding="utf-8", errors="ignore") if str(p).lower().endswith(".gz") \
+           else open(p, "r", encoding="utf-8", errors="ignore")
 
-# —— 改动①：确保 kegg_pathway.tsv 带表头 —— 
-if [[ -s "$PATHNAME_TSV" ]]; then
-  if [[ "$(head -n1 "$PATHNAME_TSV")" != $'pathway_id\tname' ]]; then
-    { echo -e "pathway_id\tname"; cat "$PATHNAME_TSV"; } > "$REF/.kegg_pathway.with_header.tsv"
-    mv -f "$REF/.kegg_pathway.with_header.tsv" "$PATHNAME_TSV"
-  fi
-fi
-log "[✔] pathway_names.tsv: $(wc -l < "$PATHNAME_TSV") 行"
+def load_yaml(path: Path) -> Dict[str, Any]:
+    if not path.exists():
+        raise FileNotFoundError(f"未找到配置文件：{path}")
+    with open(path, "r", encoding="utf-8") as f:
+        user = (yaml.safe_load(f) or {})
+    def merge(u, d):
+        out = dict(d)
+        for k, v in u.items():
+            if isinstance(v, dict) and isinstance(out.get(k), dict):
+                out[k] = merge(v, out[k])
+            else:
+                out[k] = v
+        return out
+    return merge(user, DEFAULTS)
 
-# ==== C) gene→KO 预处理：任意分隔符→TAB、多 KO 拆分、清洗 ====
-if [[ ! -s "$GENE2KO" ]]; then
-  log "[3] 未发现 gene2ko.tsv：$GENE2KO"
-  log "[❌] 缺少 gene2ko.tsv，无法展开 Pathway→gene。请先准备 results/07_annot/gene2ko.tsv"
-  exit 2
-fi
+def normalize_ko(tok: str) -> Optional[str]:
+    """统一 KO 号格式：接受 'Kxxxxx' 或 'ko:Kxxxxx' 等，返回大写 Kxxxxx。"""
+    if not tok: return None
+    s = tok.strip()
+    s = s.replace("ko:", "").replace("KO:", "")
+    s = s.upper()
+    return s if re.fullmatch(r"K\d{5}", s) else None
 
-# —— 修正：严格解析 gene2ko.tsv，确保正确生成 gene2ko.clean 文件 —— 
-awk -vOFS='\t' '
-  NR==1 { next }  # 忽略表头
-  NF>=2 {
-    g=$1; kc=$2;
-    gsub(/\r/,"",g); gsub(/^[ \t]+|[ \t]+$/,"",g);
-    if (g=="") next;
-  }
-  {
-    g=$gc; sub(/\|.*/,"",g); sub(/\.[0-9]+$/,"",g);
-    n=split($kc,arr,/[;, ]+/);
-    for(i=1;i<=n;i++){
-      x=arr[i]; gsub(/^ko:/,"",x); x=toupper(x);
-      if (x ~ /^K[0-9]{5}$/ && g!="") print g,x;
+def normalize_pathway(tok: str) -> Optional[str]:
+    """统一 Pathway 号格式：接受 'path:koxxxxx' / 'koxxxxx' / 'mapxxxxx'；返回 'koxxxxx'。"""
+    if not tok: return None
+    s = tok.strip()
+    s = s.replace("PATH:", "path:").replace("Path:", "path:")
+    s = s.replace("path:", "")
+    if s.startswith("map"): s = "ko" + s[3:]
+    s = s.lower()
+    return s if re.fullmatch(r"ko\d{5}", s) else None
+
+def main() -> None:
+    # 读取配置与日志设定
+    cfg = load_yaml(Path(CONFIG_PATH))
+    level = getattr(logging, (cfg.get("logging", {}).get("level") or "INFO").upper(), logging.INFO)
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s [%(levelname)s] %(message)s" if cfg.get("logging", {}).get("timestamp", True) else "[%(levelname)s] %(message)s",
+    )
+    logging.info("========== 07 — emapper 注释整理（遵循约定） ==========")
+
+    # 路径
+    emapper_fp = Path((cfg.get("reference", {}).get("emapper") or "").strip())
+    maps_dir   = Path(cfg["dirs"]["maps"])
+    out_dir    = Path(cfg["dirs"]["annotations"])
+    mkdir_p(out_dir)
+
+    if not emapper_fp.exists():
+        raise FileNotFoundError(f"未找到 emapper 注释文件：{emapper_fp}")
+
+    # 读取 tx2gene.clean.tsv（必须包含 transcript_id, gene_id）
+    tx2gene_fp = maps_dir / "tx2gene.clean.tsv"
+    if not tx2gene_fp.exists():
+        raise FileNotFoundError(f"未找到 tx2gene.clean.tsv：{tx2gene_fp}")
+
+    t2g: Dict[str, str] = {}
+    gene_set: set = set()
+    with open(tx2gene_fp, "r", encoding="utf-8") as f:
+        rdr = csv.DictReader(f, dialect=csv.excel_tab)
+        need = ["transcript_id", "gene_id"]
+        for c in need:
+            if c not in (rdr.fieldnames or []):
+                raise ValueError(f"tx2gene.clean.tsv 缺少必要列：{c}")
+        for r in rdr:
+            tid = (r["transcript_id"] or "").strip()
+            gid = (r["gene_id"] or "").strip()
+            if tid and gid:
+                t2g[tid] = gid
+                gene_set.add(gid)
+
+    # 解析 emapper 表头（仅认 '#query\t...' 行；列名可在 config.annotations.* 覆盖）
+    header: Optional[List[str]] = None
+    idx: Dict[str, int] = {}
+    want = {
+        "query": (cfg["annotations"].get("emapper_query_col") or "query"),
+        "gos": (cfg["annotations"].get("emapper_gos_col") or "GOs"),
+        "ko": (cfg["annotations"].get("emapper_ko_col") or "KEGG_ko"),
+        "path": (cfg["annotations"].get("emapper_pathway_col") or "KEGG_Pathway"),
     }
-  }
-' "$GENE2KO" | LC_ALL=C sort -u > "$REF/.gene2ko.clean"
 
-g2k_pairs=$(wc -l < "$REF/.gene2ko.clean")
-g2k_genes=$(cut -f1 "$REF/.gene2ko.clean" | LC_ALL=C sort -u | wc -l)
-g2k_kos=$(cut -f2 "$REF/.gene2ko.clean"  | LC_ALL=C sort -u | wc -l)
-log "[✔] gene2ko.clean: pairs=$g2k_pairs  genes=$g2k_genes  KO=$g2k_kos"
+    def locate(h: List[str]) -> Dict[str, int]:
+        lo = [x.lower() for x in h]
+        out = { "query": -1, "gos": -1, "ko": -1, "path": -1 }
+        for k, nm in want.items():
+            for i, v in enumerate(lo):
+                if v == nm.lower():
+                    out[k] = i; break
+        return out
 
-# ==== D) join：Pathway→gene ====
-log "[4] 连接 KO→Pathway × gene→KO → Pathway→gene"
-tmp_t2g="$REF/.term2gene_kegg_pathway.tmp"
-join -t $'\t' -1 1 -2 2 \
-  <(LC_ALL=C sort -k1,1 "$KO2PATH_TSV") \
-  <(LC_ALL=C sort -k2,2 "$REF/.gene2ko.clean") \
-| awk -vOFS='\t' '{print $2,$3}' | LC_ALL=C sort -u > "$tmp_t2g"
+    queries_raw: List[str] = []
+    with open_maybe_gz(emapper_fp) as f:
+        for line in f:
+            if not line: continue
+            s = line.rstrip("\n")
+            if header is None:
+                if s.startswith("#query\t") or s.startswith("#Query\t") or s.startswith("#QUERY\t"):
+                    header = s[1:].split("\t")
+                    idx = locate(header)
+                    if idx["query"] < 0:
+                        raise RuntimeError("未在 emapper 表头中找到 'query' 列")
+                continue
+            if s.startswith("#") or not s:
+                continue
+            parts = s.split("\t")
+            if idx["query"] >= 0 and idx["query"] < len(parts):
+                queries_raw.append(parts[idx["query"]].strip())
 
-# —— 改动②：确保 term2gene 表头与落点一致 —— 
-{ echo -e "pathway_id\tgene_id"; cat "$tmp_t2g"; } > "$T2G_PW"
-rm -f "$tmp_t2g"
+    # 正式产出
+    allow_gene_space = bool(cfg["annotations"].get("allow_gene_space_match", True))
 
-t2g_lines=$(wc -l < "$T2G_PW")
-if [[ $t2g_lines -le 1 ]]; then
-  log "[❌] term2gene.tsv 为空，打印未命中 KO 样例："
-  comm -23 \
-    <(cut -f2 "$REF/.gene2ko.clean" | LC_ALL=C sort -u) \
-    <(cut -f1 "$KO2PATH_TSV"       | LC_ALL=C sort -u) | head -n 10 | sed 's/^/[KO 未映射] /' | tee -a "$LOG"
-else
-  log "[✔] term2gene.tsv: $t2g_lines 行"
-fi
+    gene2go: Dict[str, set] = {}
+    gene2ko: Dict[str, set] = {}
+    gene2path: Dict[str, set] = {}
+    mapped_tx = mapped_gene = unmapped = 0
+    unmapped_examples: List[str] = []
 
-# —— 改动③：名称字典落到约定目录，并改成 term_name 表头 —— 
-{ echo -e "pathway_id\tterm_name"; tail -n +2 "$PATHNAME_TSV"; } > "$T2N_PW"
-log "[✔] term2name.tsv: $(wc -l < "$T2N_PW") 行"
+    with open_maybe_gz(emapper_fp) as f:
+        qcol = gos_col = ko_col = path_col = None
+        for line in f:
+            if not line: continue
+            s = line.rstrip("\n")
+            if qcol is None:
+                if s.startswith("#query\t") or s.startswith("#Query\t") or s.startswith("#QUERY\t"):
+                    hdr = s[1:].split("\t")
+                    if header is None:
+                        header = hdr
+                    idx = locate(hdr)
+                    qcol, gos_col, ko_col, path_col = idx["query"], idx["gos"], idx["ko"], idx["path"]
+                    logging.info("[Info] 表头命中：query=%s, GOs=%s, KEGG_ko=%s, KEGG_Pathway=%s",
+                                 hdr[qcol] if qcol>=0 else "NA",
+                                 hdr[gos_col] if gos_col>=0 else "NA",
+                                 hdr[ko_col]  if ko_col>=0  else "NA",
+                                 hdr[path_col]if path_col>=0 else "NA")
+                    continue
+                else:
+                    continue
+            if s.startswith("#") or not s:
+                continue
 
-# ==== E) 可选：MODULE（原逻辑不动，仍落在 legacy 目录） ====
-if [[ "$ENABLE_MODULE" -eq 1 ]]; then
-  log "[5] 生成 KEGG-MODULE（可用于补充分析）"
-  if [[ -s "$RAW_MOD" ]]; then
-    if [[ ! -s "$REF/ko_to_module.tsv" ]]; then
-      log "[5] 规范化 RAW: KO→MODULE"
-      awk -vOFS='\t' '{
-        gsub(/\r/,"");
-        k=$1; m=$2;
-        gsub(/^ko:/,"",k); k=toupper(k);
-        gsub(/^md:/,"",m); m=toupper(m);
-        if (k ~ /^K[0-9]{5}$/ && m ~ /^M[0-9]{5}$/) print k,m;
-      }' "$RAW_MOD" | LC_ALL=C sort -u > "$REF/ko_to_module.tsv"
-    fi
+            parts = s.split("\t")
+            if qcol < 0 or qcol >= len(parts):
+                continue
+            q_raw = parts[qcol].strip()
 
-    join -t $'\t' -1 1 -2 2 \
-      <(LC_ALL=C sort -k1,1 "$REF/ko_to_module.tsv") \
-      <(LC_ALL=C sort -k2,2 "$REF/.gene2ko.clean") \
-    | awk -vOFS='\t' '{print $2,$3}' | LC_ALL=C sort -u > "$T2G_MOD"
+            # 匹配策略：优先 transcript_id→gene_id；若允许，再尝试 query == gene_id
+            gid: Optional[str] = None
+            if q_raw in t2g:
+                gid = t2g[q_raw]; mapped_tx += 1
+            elif allow_gene_space and (q_raw in gene_set):
+                gid = q_raw; mapped_gene += 1
+            else:
+                unmapped += 1
+                if len(unmapped_examples) < 50000:
+                    unmapped_examples.append(q_raw)
+                continue
 
-    cut -f2 "$REF/ko_to_module.tsv" | LC_ALL=C sort -u \
-      | awk -vOFS='\t' '{print $1,$1}' > "$T2N_MOD"
+            # 解析 GO
+            if gos_col is not None and gos_col >= 0 and gos_col < len(parts):
+                s_g = parts[gos_col].strip()
+                if s_g and s_g != "-":
+                    for tok in _SPLIT_RE.split(s_g):
+                        if tok and re.fullmatch(r"GO:\d{7}", tok):
+                            gene2go.setdefault(gid, set()).add(tok)
 
-    log "[✔] term2gene_kegg_module.tsv: $(wc -l < "$T2G_MOD") 行"
-    log "[✔] term2name_kegg_module.tsv: $(wc -l < "$T2N_MOD") 行"
-  else
-    log "[W] KO→MODULE 原始文件缺失，跳过 MODULE"
-  fi
-fi
+            # 解析 KO
+            if ko_col is not None and ko_col >= 0 and ko_col < len(parts):
+                s_k = parts[ko_col].strip()
+                if s_k and s_k != "-":
+                    for tok in _SPLIT_RE.split(s_k):
+                        k = normalize_ko(tok)
+                        if k:
+                            gene2ko.setdefault(gid, set()).add(k)
 
-log "[完成] 构建日志：$LOG"
+            # 解析 Pathway
+            if path_col is not None and path_col >= 0 and path_col < len(parts):
+                s_p = parts[path_col].strip()
+                if s_p and s_p != "-":
+                    for tok in _SPLIT_RE.split(s_p):
+                        p = normalize_pathway(tok)
+                        if p:
+                            gene2path.setdefault(gid, set()).add(p)
+
+    # 写出
+    mkdir_p(out_dir)
+
+    def write_pairs(fp: Path, hdr: List[str], d: Dict[str, set]) -> None:
+        with open(fp, "w", encoding="utf-8", newline="") as f:
+            w = csv.writer(f, dialect=csv.excel_tab)
+            w.writerow(hdr)
+            for k in sorted(d.keys()):
+                for v in sorted(d[k]):
+                    w.writerow([k, v])
+        logging.info("[Out] %s", fp)
+
+    g2go_fp   = out_dir / "gene2go.tsv"
+    g2ko_fp   = out_dir / "gene2ko.tsv"
+    g2path_fp = out_dir / "gene2pathway.tsv"
+    write_pairs(g2go_fp,   ["gene_id","go_id"],        gene2go)
+    write_pairs(g2ko_fp,   ["gene_id","ko_id"],        gene2ko)
+    write_pairs(g2path_fp, ["gene_id","pathway_id"],   gene2path)
+
+    # 覆盖率审计
+    cov_fp   = out_dir / "universe_coverage.tsv"
+    with open(cov_fp, "w", encoding="utf-8", newline="") as f:
+        w = csv.writer(f, dialect=csv.excel_tab)
+        w.writerow(["metric","value"])
+        w.writerow(["emapper_data_rows", str(len(queries_raw))])
+        w.writerow(["mapped_via_transcript", str(mapped_tx)])
+        w.writerow(["mapped_via_gene", str(mapped_gene)])
+        w.writerow(["unmapped", str(unmapped)])
+        uniq_genes = len(set(list(gene2go.keys()) + list(gene2ko.keys()) + list(gene2path.keys())))
+        w.writerow(["unique_genes_mapped", str(uniq_genes)])
+    logging.info("[Out] %s", cov_fp)
+
+    # 命中率审计（仅 raw 一行，用于保留既有产物名）
+    audit_rows: List[List[str]] = [["stage","matched","total","match_rate"]]
+    matched = 0
+    for q in queries_raw:
+        if (q in t2g) or (allow_gene_space and (q in gene_set)):
+            matched += 1
+    total = len(queries_raw) if queries_raw else 1
+    rate = matched / total
+    audit_rows.append(["raw", str(matched), str(total), f"{rate:.6f}"])
+
+    audit_fp = out_dir / "id_cleanup.audit.tsv"
+    with open(audit_fp, "w", encoding="utf-8", newline="") as f:
+        w = csv.writer(f, dialect=csv.excel_tab)
+        w.writerows(audit_rows)
+    logging.info("[Out] %s", audit_fp)
+
+    # 未命中列表
+    if unmapped_examples:
+        with open(out_dir / "unmapped_queries.list", "w", encoding="utf-8") as f:
+            f.write("\n".join(unmapped_examples))
+        logging.info("[Out] %s", out_dir / "unmapped_queries.list")
+
+    logging.info("========== 07 完成 ==========")
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as e:
+        print(f"[ERR] 07 执行失败：{e}", file=sys.stderr)
+        sys.exit(1)
