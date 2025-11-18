@@ -4,6 +4,7 @@
 # go_local.R —— 离线导出 GO ID → 英文名称（term name）字典（只产原材料 TSV，不画图）
 # 运行方式：Rscript scripts/go_local.R
 # 产物：results/07_annot/go/term2name.tsv（两列：go_id, term_name）
+#         results/07_annot/go/obsolete_map.tsv（旧GO号、action、替代GO号）
 # 日志：logs/go_local.log（固定文件名，无时间戳，追加写入）
 # 依赖：yaml、readr、dplyr、stringr、tidyr、AnnotationDbi、GO.db
 # 约定：所有参数集中在脚本顶部；若 config.yaml 存在则优先读取覆盖默认值
@@ -40,8 +41,8 @@ if (file.exists("config.yaml")) {
   if (!is.null(y$go_local))    cfg$go_local    <- modifyList(cfg$go_local,    y$go_local)
 }
 
-anno_dir <- cfg$dirs$annotations
-gene2go  <- file.path(anno_dir, "gene2go.tsv")  # 读取 gene2go 的路径
+anno_dir <- file.path(cfg$dirs$annotations, "go")  # 输出路径改为 results/07_annot/go
+gene2go  <- file.path(cfg$dirs$annotations, "gene2go.tsv")  # 读取 gene2go 的路径
 logs_dir <- "logs"  # 日志目录（固定文件名：go_local.log）
 export_all <- isTRUE(cfg$go_local$export_all)
 
@@ -160,11 +161,55 @@ out_fp <- file.path(anno_dir, "term2name.tsv")
 # [改动] 写出前统一列名为约定口径（仅改表头，不改数据）
 res <- res %>% dplyr::rename(go_id = GO, term_name = name)
 
+# 输出 term2name.tsv
 tryCatch({
   readr::write_tsv(res, out_fp)
   log_info("写出：", norm_path(out_fp), " （", nrow(res), " 行）")
-  log_info("DONE: go_local 完成（模式：", ifelse(export_all, "export_all=TRUE", "严格模式"), "）")
 }, error = function(e) {
   log_error("写出失败：", conditionMessage(e))
   quit(status = 2)
 })
+
+# =========================
+# 8) 处理废弃GO ID（产出 obsolete_map.tsv）
+# =========================
+log_info("开始处理废弃GO ID，产出 obsolete_map.tsv")
+
+# 从 GO.db 中读取 `replaced_by` 或 `consider` 列表，生成 obsolete_map
+obsolete_map <- tibble(old_go_id = character(), action = character(), new_go_id = character())
+
+# 查询 GO.db 中的替换与考虑列
+for (go_id in go_ids) {
+  term <- tryCatch(GO.db::Term(GO.db::GOTERM[[go_id]]), error = function(e) NULL)
+  if (is.null(term)) next
+  replaced_by <- tryCatch(GO.db::replacedBy(GO.db::GOTERM[[go_id]]), error = function(e) NULL)
+  consider <- tryCatch(GO.db::consider(GO.db::GOTERM[[go_id]]), error = function(e) NULL)
+  
+  if (!is.null(replaced_by)) {
+    obsolete_map <- bind_rows(obsolete_map, tibble(
+      old_go_id = go_id,
+      action = "replaced_by",
+      new_go_id = replaced_by
+    ))
+  }
+  
+  if (!is.null(consider)) {
+    obsolete_map <- bind_rows(obsolete_map, tibble(
+      old_go_id = go_id,
+      action = "consider",
+      new_go_id = consider
+    ))
+  }
+}
+
+# 输出 obsolete_map.tsv
+obsolete_map_fp <- file.path(anno_dir, "obsolete_map.tsv")
+tryCatch({
+  readr::write_tsv(obsolete_map, obsolete_map_fp)
+  log_info("写出：", norm_path(obsolete_map_fp), " （", nrow(obsolete_map), " 行）")
+}, error = function(e) {
+  log_error("写出失败：", conditionMessage(e))
+  quit(status = 2)
+})
+
+log_info("DONE: go_local 完成")
