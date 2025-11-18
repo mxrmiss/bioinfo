@@ -24,7 +24,8 @@ MANUAL="$REF/ko_to_pathway.tsv.manual"
 KO2PATH_TSV="$REF/ko_to_pathway.tsv"
 PATHNAME_TSV="$REF/kegg_pathway.tsv"
 
-GENE2KO="$OUTDIR/gene2ko.tsv"  # [改动] 输入路径改为 results/07_annot
+# —— 改动：输入路径改为 results/07_annot —— 
+GENE2KO="results/07_annot/gene2ko.tsv"  # [修改] 输入路径改为正确的路径
 T2G_PW="$OUTDIR/term2gene.tsv"  # 输出路径改为 results/07_annot/kegg
 T2N_PW="$OUTDIR/term2name.tsv"  # 输出路径改为 results/07_annot/kegg
 
@@ -93,7 +94,7 @@ log "[✔] pathway_names.tsv: $(wc -l < "$PATHNAME_TSV") 行"
 # ==== C) gene→KO 预处理：任意分隔符→TAB、多 KO 拆分、清洗 ====
 if [[ ! -s "$GENE2KO" ]]; then
   log "[3] 未发现 gene2ko.tsv：$GENE2KO"
-  log "[❌] 缺少 gene2ko.tsv，无法展开 Pathway→gene。请先准备 ref/annotations/gene2ko.tsv"
+  log "[❌] 缺少 gene2ko.tsv，无法展开 Pathway→gene。请先准备 results/07_annot/gene2ko.tsv"
   exit 2
 fi
 
