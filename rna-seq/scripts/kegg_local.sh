@@ -4,11 +4,11 @@ set -euo pipefail
 # kegg_local.sh  v9.2 — 自愈构建器（最小化口径统一：表头与落点）
 # - 手工基准映射优先：ref/ko_to_pathway.tsv.manual 若存在，直接用，不覆盖
 # - 若无手工表：若缺 RAW 自动下载，再规范化为 ko_to_pathway.tsv
-# - 生成：term2gene_kegg_pathway.tsv / kegg_pathway.tsv（名称字典）
+# - 生成：results/07_annot/kegg/term2gene.tsv / results/07_annot/kegg/term2name.tsv
 # - 可选：KEGG-MODULE（term2gene_kegg_module.tsv / term2name_kegg_module.tsv）
 # - 统一表头：
-#     kegg_pathway.tsv               -> pathway_id\tname
-#     term2gene_kegg_pathway.tsv     -> pathway_id\tgene
+#     term2name.tsv                 -> pathway_id\tterm_name
+#     term2gene.tsv                  -> pathway_id\tgene_id
 # =============================================================================
 
 # ==== 开关 ====
@@ -16,6 +16,7 @@ ENABLE_MODULE=1   # 1=生成 MODULE，0=跳过
 
 # ==== 路径 ====
 REF="ref/annotations"
+OUTDIR="results/07_annot/kegg"
 RAW_PATH="$REF/kegg_offline/ko_to_pathway.raw"
 RAW_MOD="$REF/kegg_offline/ko_to_module.raw"
 MANUAL="$REF/ko_to_pathway.tsv.manual"
@@ -23,9 +24,9 @@ MANUAL="$REF/ko_to_pathway.tsv.manual"
 KO2PATH_TSV="$REF/ko_to_pathway.tsv"
 PATHNAME_TSV="$REF/kegg_pathway.tsv"
 
-# —— 改动①：term2gene 产到顶层（原来在 kegg_legacy 下）——
-T2G_PW="$REF/term2gene_kegg_pathway.tsv"
-T2N_PW="$REF/kegg_pathway_bak.tsv"
+# —— 改动①：产物位置与文件名统一到约定 —— 
+T2G_PW="$OUTDIR/term2gene.tsv"
+T2N_PW="$OUTDIR/term2name.tsv"
 
 T2G_MOD="$REF/kegg_legacy/term2gene_kegg_module.tsv"
 T2N_MOD="$REF/kegg_legacy/term2name_kegg_module.tsv"
@@ -33,7 +34,7 @@ T2N_MOD="$REF/kegg_legacy/term2name_kegg_module.tsv"
 GENE2KO="$REF/gene2ko.tsv"
 LOG="$REF/.kegg_build.log"
 
-mkdir -p "$REF/kegg_offline" "$REF/kegg_legacy"
+mkdir -p "$REF/kegg_offline" "$REF/kegg_legacy" "$OUTDIR"
 : > "$LOG"
 log(){ echo "$*" | tee -a "$LOG"; }
 
@@ -75,9 +76,8 @@ if [[ ! -s "$PATHNAME_TSV" ]]; then
     | awk -vOFS='\t' '{gsub(/\r/,""); gsub(/^path:/,"",$1); sub(/^map/,"ko",$1); if ($1 ~ /^ko[0-9]{5}$/) print $1,$2}' \
     | LC_ALL=C sort -u > "$PATHNAME_TSV"; then
     :
-  fi
-  if [[ ! -s "$PATHNAME_TSV" ]]; then
-    log "[W] 在线失败，使用 ID=Name 兜底"
+  else
+    log "[W] 在线获取失败，将用 ko_to_pathway.tsv 的路径集合构造名称占位"
     cut -f2 "$KO2PATH_TSV" | LC_ALL=C sort -u | awk -vOFS='\t' '{print $1,$1}' > "$PATHNAME_TSV"
   fi
 fi
@@ -93,16 +93,17 @@ log "[✔] pathway_names.tsv: $(wc -l < "$PATHNAME_TSV") 行"
 
 # ==== C) gene→KO 预处理：任意分隔符→TAB、多 KO 拆分、清洗 ====
 if [[ ! -s "$GENE2KO" ]]; then
-  log "[致命] 缺少 $GENE2KO"
-  exit 1
+  log "[3] 未发现 gene2ko.tsv：$GENE2KO"
+  log "[❌] 缺少 gene2ko.tsv，无法展开 Pathway→gene。请先准备 ref/annotations/gene2ko.tsv"
+  exit 2
 fi
-log "[3] 预处理 gene2ko"
-awk '
-  BEGIN{FS="[\t, ]+"; OFS="\t"}
-  NR==1{
-    for(i=1;i<=NF;i++){low=tolower($i); if(low=="gene_id"||low=="gene"||low=="id") gc=i;
-                       if(low=="ko_id"||low=="ko") kc=i}
-    if(!gc) gc=1; if(!kc) kc=2; next
+
+awk -vOFS='\t' '
+  NR==1 { next }  # 忽略表头
+  NF>=2 {
+    g=$1; kc=$2;
+    gsub(/\r/,"",g); gsub(/^[ \t]+|[ \t]+$/,"",g);
+    if (g=="") next;
   }
   {
     g=$gc; sub(/\|.*/,"",g); sub(/\.[0-9]+$/,"",g);
@@ -127,39 +128,38 @@ join -t $'\t' -1 1 -2 2 \
   <(LC_ALL=C sort -k2,2 "$REF/.gene2ko.clean") \
 | awk -vOFS='\t' '{print $2,$3}' | LC_ALL=C sort -u > "$tmp_t2g"
 
-# —— 改动③：确保 term2gene 带表头，并落到顶层 —— 
-{ echo -e "pathway_id\tgene"; cat "$tmp_t2g"; } > "$T2G_PW"
+# —— 改动③：确保 term2gene 表头与落点一致 —— 
+{ echo -e "pathway_id\tgene_id"; cat "$tmp_t2g"; } > "$T2G_PW"
 rm -f "$tmp_t2g"
 
 t2g_lines=$(wc -l < "$T2G_PW")
 if [[ $t2g_lines -le 1 ]]; then
-  log "[❌] term2gene_kegg_pathway.tsv 为空，打印未命中 KO 样例："
+  log "[❌] term2gene.tsv 为空，打印未命中 KO 样例："
   comm -23 \
     <(cut -f2 "$REF/.gene2ko.clean" | LC_ALL=C sort -u) \
     <(cut -f1 "$KO2PATH_TSV"       | LC_ALL=C sort -u) | head -n 10 | sed 's/^/[KO 未映射] /' | tee -a "$LOG"
 else
-  log "[✔] term2gene_kegg_pathway.tsv: $t2g_lines 行"
+  log "[✔] term2gene.tsv: $t2g_lines 行"
 fi
 
-# 备份一份名称表（保持原行为，不影响口径）
-cp -f "$PATHNAME_TSV" "$T2N_PW"
-log "[✔] term2name_kegg_pathway.tsv: $(wc -l < "$T2N_PW") 行"
+# —— 改动④：名称字典落到约定目录，并改成 term_name 表头 —— 
+{ echo -e "pathway_id\tterm_name"; tail -n +2 "$PATHNAME_TSV"; } > "$T2N_PW"
+log "[✔] term2name.tsv: $(wc -l < "$T2N_PW") 行"
 
-# ==== E) 可选：MODULE ====
+# ==== E) 可选：MODULE（原逻辑不动，仍落在 legacy 目录） ====
 if [[ "$ENABLE_MODULE" -eq 1 ]]; then
   log "[5] 生成 KEGG-MODULE（可用于补充分析）"
-  if [[ ! -s "$RAW_MOD" ]]; then
-    log "[5] 自动下载 raw: KO→MODULE"
-    curl -sSL --retry 3 --retry-delay 2 "https://rest.kegg.jp/link/module/ko" -o "$RAW_MOD" || true
-  fi
   if [[ -s "$RAW_MOD" ]]; then
-    awk -vOFS='\t' '{
-      gsub(/\r/,"");
-      k=$1; m=$2;
-      gsub(/^ko:/,"",k); k=toupper(k);
-      gsub(/^md:/,"",m);
-      if (k ~ /^K[0-9]{5}$/ && m ~ /^M[0-9]+$/) print k,m;
-    }' "$RAW_MOD" | LC_ALL=C sort -u > "$REF/ko_to_module.tsv"
+    if [[ ! -s "$REF/ko_to_module.tsv" ]]; then
+      log "[5] 规范化 RAW: KO→MODULE"
+      awk -vOFS='\t' '{
+        gsub(/\r/,"");
+        k=$1; m=$2;
+        gsub(/^ko:/,"",k); k=toupper(k);
+        gsub(/^md:/,"",m); m=toupper(m);
+        if (k ~ /^K[0-9]{5}$/ && m ~ /^M[0-9]{5}$/) print k,m;
+      }' "$RAW_MOD" | LC_ALL=C sort -u > "$REF/ko_to_module.tsv"
+    fi
 
     join -t $'\t' -1 1 -2 2 \
       <(LC_ALL=C sort -k1,1 "$REF/ko_to_module.tsv") \
@@ -177,4 +177,3 @@ if [[ "$ENABLE_MODULE" -eq 1 ]]; then
 fi
 
 log "[完成] 构建日志：$LOG"
-
