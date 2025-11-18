@@ -24,14 +24,13 @@ MANUAL="$REF/ko_to_pathway.tsv.manual"
 KO2PATH_TSV="$REF/ko_to_pathway.tsv"
 PATHNAME_TSV="$REF/kegg_pathway.tsv"
 
-# —— 改动①：产物位置与文件名统一到约定 —— 
-T2G_PW="$OUTDIR/term2gene.tsv"
-T2N_PW="$OUTDIR/term2name.tsv"
+GENE2KO="$OUTDIR/gene2ko.tsv"  # [改动] 输入路径改为 results/07_annot
+T2G_PW="$OUTDIR/term2gene.tsv"  # 输出路径改为 results/07_annot/kegg
+T2N_PW="$OUTDIR/term2name.tsv"  # 输出路径改为 results/07_annot/kegg
 
 T2G_MOD="$REF/kegg_legacy/term2gene_kegg_module.tsv"
 T2N_MOD="$REF/kegg_legacy/term2name_kegg_module.tsv"
 
-GENE2KO="$REF/gene2ko.tsv"
 LOG="$REF/.kegg_build.log"
 
 mkdir -p "$REF/kegg_offline" "$REF/kegg_legacy" "$OUTDIR"
@@ -82,7 +81,7 @@ if [[ ! -s "$PATHNAME_TSV" ]]; then
   fi
 fi
 
-# —— 改动②：确保 kegg_pathway.tsv 带表头 —— 
+# —— 改动①：确保 kegg_pathway.tsv 带表头 —— 
 if [[ -s "$PATHNAME_TSV" ]]; then
   if [[ "$(head -n1 "$PATHNAME_TSV")" != $'pathway_id\tname' ]]; then
     { echo -e "pathway_id\tname"; cat "$PATHNAME_TSV"; } > "$REF/.kegg_pathway.with_header.tsv"
@@ -128,7 +127,7 @@ join -t $'\t' -1 1 -2 2 \
   <(LC_ALL=C sort -k2,2 "$REF/.gene2ko.clean") \
 | awk -vOFS='\t' '{print $2,$3}' | LC_ALL=C sort -u > "$tmp_t2g"
 
-# —— 改动③：确保 term2gene 表头与落点一致 —— 
+# —— 改动②：确保 term2gene 表头与落点一致 —— 
 { echo -e "pathway_id\tgene_id"; cat "$tmp_t2g"; } > "$T2G_PW"
 rm -f "$tmp_t2g"
 
@@ -142,7 +141,7 @@ else
   log "[✔] term2gene.tsv: $t2g_lines 行"
 fi
 
-# —— 改动④：名称字典落到约定目录，并改成 term_name 表头 —— 
+# —— 改动③：名称字典落到约定目录，并改成 term_name 表头 —— 
 { echo -e "pathway_id\tterm_name"; tail -n +2 "$PATHNAME_TSV"; } > "$T2N_PW"
 log "[✔] term2name.tsv: $(wc -l < "$T2N_PW") 行"
 
