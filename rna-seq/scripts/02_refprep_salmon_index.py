@@ -2,315 +2,354 @@
 # -*- coding: utf-8 -*-
 
 """
-02_refprep_salmon_index.py —— 构建 Salmon decoy-aware 索引（严格契约 + 流式输出）
+02_refprep_salmon_index.py —— 构建 Salmon decoy-aware 索引（vNext 版）
 
-契约（来自《转录组计划1.md》）：
+契约（来自《转录组计划 vNext》）：
   • 仅读 config.yaml 指定键：
       - reference.ref_fasta（必需）
       - reference.ref_gtf   （必需）
       - reference.salmon.index_dir（必需）
-      - reference.salmon.kmer_len（默认 31）
-      - reference.salmon.decoy_list（可选；留空则本脚本生成）
-      - reference.salmon.gentrome_fa（可选；留空则本脚本生成）
-      - resources.threads.salmon（必需；线程数）
+      - reference.salmon.kmer_len
+      - reference.salmon.decoy_list
+      - reference.salmon.gentrome_fa
+      - reference.salmon.rebuild
+      - resources.threads.salmon
+      - binaries.salmon, binaries.gffread
+      - annotations.id_cleanup（统一 ID 清理开关）
+      - dirs.refprep
   • 构建摘要写入：results/02_ref/gentrome_decoy_summary.tsv
-  • 中间产物（若需生成）：ref/transcripts.fa 、（缺省）ref/decoys.txt、ref/gentrome.fa
-  • 屏幕“流式输出” + 写日志 logs/02_refprep_salmon_index.log
-  • 不接受命令行参数；一切以 config.yaml 为准
+  • 中间产物（若需生成）：ref/transcripts.fa 、ref/decoys.txt、ref/gentrome.fa
+  • 只从 config 读取参数；不接受命令行参数。
+  • transcript_id 如需修剪，只能走 annotations.id_cleanup 这一处开关。
 """
 
 from __future__ import annotations
-import sys, os, csv, subprocess, shutil, hashlib
+import sys
+import subprocess
+import logging
 from pathlib import Path
-from typing import Dict, Any, List
-from datetime import datetime
+from typing import Dict, Any, List, Tuple
+import datetime
 
-# 依赖：PyYAML
-try:
-    import yaml
-except Exception:
-    print("[ERR] 缺少 PyYAML，请先安装：mamba/conda install pyyaml", file=sys.stderr)
-    sys.exit(1)
+DEFAULT_CONFIG = "config.yaml"
 
-# ================= 顶部参数（其余全部从 config 读取） =================
-CONFIG_PATH = "config.yaml"
+# ============================= 工具函数：加载配置 =============================
+
 DEFAULTS: Dict[str, Any] = {
     "reference": {
+        "ref_fasta": "",
+        "ref_gtf": "",
         "salmon": {
+            "index_dir": "ref/salmon_index",
             "kmer_len": 31,
-            # decoy_list / gentrome_fa 若在 config 留空，脚本将使用默认路径生成
-            "decoy_list": "",
-            "gentrome_fa": "",
-            "rebuild": "if_missing"  # always / if_missing / never
-        }
+            "decoy_list": "ref/decoys.txt",
+            "gentrome_fa": "ref/gentrome.fa",
+            "rebuild": "if_missing",  # always / if_missing / never
+        },
     },
     "resources": {
         "threads": {
-            # 线程必须由 resources.threads.salmon 提供，若缺失→报错
-            # 此处不设默认，避免静默回落
+            "salmon": 1,
         }
     },
     "binaries": {
         "salmon": "salmon",
-        "gffread": "gffread"
+        "gffread": "gffread",
+    },
+    "annotations": {
+        "id_cleanup": {
+            "strip_prefix": False,
+            "prefix": [],
+            "strip_suffix": False,
+            "suffix": [],
+            "order": ["prefix", "suffix"],
+        }
     },
     "dirs": {
-        "logs": "logs"
+        "refprep": "results/02_ref",
     },
-    "logging": { "timestamp": True }
+    "logging": {
+        "level": "INFO",
+        "timestamp": True,
+    },
 }
-# =====================================================================
 
-CFG: Dict[str, Any] = {}
 
-def now_ts() -> str:
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+def load_config(path: Path) -> Dict[str, Any]:
+    """读取 config.yaml，并用 DEFAULTS 做浅层合并。"""
+    try:
+        import yaml
+    except Exception as e:
+        print("[ERR] 需要 PyYAML 支持：pip install pyyaml", file=sys.stderr)
+        raise e
 
-def log(msg: str) -> None:
-    """屏幕日志（是否带时间戳由配置控制）"""
-    if CFG.get("logging", {}).get("timestamp", True):
-        print(f"{now_ts()} {msg}")
-    else:
-        print(msg)
-
-def load_cfg(path: Path) -> Dict[str, Any]:
     if not path.exists():
-        print(f"[ERR] 未找到配置文件：{path}", file=sys.stderr); sys.exit(1)
+        print(f"[ERR] 未找到配置文件：{path}", file=sys.stderr)
+        sys.exit(1)
+
     with open(path, "r", encoding="utf-8") as f:
         user = yaml.safe_load(f) or {}
 
-    # 浅合并：user 覆盖 defaults
-    def merge(u: Dict[str, Any], base: Dict[str, Any]) -> Dict[str, Any]:
+    def merge(base: Dict[str, Any], u: Dict[str, Any]) -> Dict[str, Any]:
         out = dict(base)
         for k, v in u.items():
             if isinstance(v, dict) and isinstance(out.get(k), dict):
-                out[k] = merge(v, out[k])
+                out[k] = merge(out[k], v)
             else:
                 out[k] = v
         return out
 
-    cfg = merge(user, DEFAULTS)
+    return merge(DEFAULTS, user)
 
-    # 严格取值：参考路径
-    ref = cfg.get("reference", {}) or {}
-    ref_fa = Path(str(ref.get("ref_fasta", "")).strip())
-    ref_gtf = Path(str(ref.get("ref_gtf", "")).strip())
-    sal = ref.get("salmon", {}) or {}
-    index_dir = Path(str(sal.get("index_dir", "")).strip())
-    if not ref_fa or not ref_fa.exists():
-        print(f"[ERR] 缺少或无法读取 reference.ref_fasta：{ref_fa}", file=sys.stderr); sys.exit(1)
-    if not ref_gtf or not ref_gtf.exists():
-        print(f"[ERR] 缺少或无法读取 reference.ref_gtf：{ref_gtf}", file=sys.stderr); sys.exit(1)
-    if not index_dir:
-        print("[ERR] 缺少 reference.salmon.index_dir（必须）", file=sys.stderr); sys.exit(1)
 
-    # 线程：严格来自 resources.threads.salmon（契约规定）
-    threads_block = (cfg.get("resources", {}).get("threads", {}) or {})
-    if "salmon" not in threads_block:
-        print("[ERR] 缺少线程配置：resources.threads.salmon（必须）", file=sys.stderr); sys.exit(1)
-    try:
-        threads = int(threads_block["salmon"])
-    except Exception:
-        print("[ERR] resources.threads.salmon 不是有效整数", file=sys.stderr); sys.exit(1)
-    if threads <= 0:
-        print("[ERR] resources.threads.salmon 必须为正整数", file=sys.stderr); sys.exit(1)
+# ============================= ID 清理工具 =============================
 
-    # 其它 Salmon 参数
-    kmer = int(sal.get("kmer_len", 31))
-    rebuild = str(sal.get("rebuild", "if_missing")).lower()
-    if rebuild not in ("always", "if_missing", "never"):
-        rebuild = "if_missing"
+def apply_id_cleanup(raw: str, policy: Dict[str, Any]) -> str:
+    """
+    按 annotations.id_cleanup 规则对单个 ID 进行清理。
+    仅用于 transcript_id，不应用于 gene_id。
+    """
+    s = raw
+    order = policy.get("order") or ["prefix", "suffix"]
+    strip_prefix = bool(policy.get("strip_prefix"))
+    strip_suffix = bool(policy.get("strip_suffix"))
+    prefixes: List[str] = policy.get("prefix") or []
+    suffixes: List[str] = policy.get("suffix") or []
 
-    # decoy_list 与 gentrome_fa：若为空则采用脚本默认路径
-    decoy_path = Path(str(sal.get("decoy_list", "")).strip() or "ref/decoys.txt")
-    gentrome_fa = Path(str(sal.get("gentrome_fa", "")).strip() or "ref/gentrome.fa")
+    for step in order:
+        if step == "prefix" and strip_prefix:
+            for p in prefixes:
+                if p and s.startswith(p):
+                    s = s[len(p):]
+        if step == "suffix" and strip_suffix:
+            for suf in suffixes:
+                if suf and s.endswith(suf):
+                    s = s[:-len(suf)]
+    return s
 
-    # 中间转录本导出路径（固定）
-    transcripts_fa = Path("ref/transcripts.fa")
 
-    # 日志与二进制
-    salmon_bin = Path(str(cfg.get("binaries", {}).get("salmon", "salmon")))
-    gffread_bin = Path(str(cfg.get("binaries", {}).get("gffread", "gffread")))
-    log_file = Path(cfg.get("dirs", {}).get("logs", "logs")) / "02_refprep_salmon_index.log"
+# ============================= FASTA 处理 =============================
 
-    # 摘要表路径（契约：results/02_ref）
-    summary_tsv = Path("results/02_ref") / "gentrome_decoy_summary.tsv"
+def rewrite_fasta_headers(fa_in: Path, fa_out: Path, policy: Dict[str, Any]) -> Tuple[int, int]:
+    """
+    读取 FASTA，按 ID 清理规则重写头部。
+    返回： (记录数, 被修改的 header 数量)
+    """
+    changed = 0
+    total = 0
+    with fa_in.open("r", encoding="utf-8") as fin, fa_out.open("w", encoding="utf-8") as fout:
+        for line in fin:
+            if line.startswith(">"):
+                total += 1
+                header = line[1:].strip()
+                # 一般格式：id 后跟空格描述；我们只对第一个 token 做清理
+                if not header:
+                    fout.write(line)
+                    continue
+                parts = header.split(maxsplit=1)
+                tid = parts[0]
+                rest = parts[1] if len(parts) > 1 else ""
+                new_tid = apply_id_cleanup(tid, policy)
+                if new_tid != tid:
+                    changed += 1
+                new_header = new_tid + ((" " + rest) if rest else "")
+                fout.write(">" + new_header + "\n")
+            else:
+                fout.write(line)
+    return total, changed
 
-    # 把解析后的关键值塞回 cfg 便于后续使用/打印
-    cfg["_RESOLVED"] = {
-        "ref_fa": ref_fa, "ref_gtf": ref_gtf, "index_dir": index_dir,
-        "threads": threads, "kmer": kmer, "rebuild": rebuild,
-        "decoy_path": decoy_path, "gentrome_fa": gentrome_fa,
-        "transcripts_fa": transcripts_fa, "salmon_bin": salmon_bin,
-        "gffread_bin": gffread_bin, "log_file": log_file, "summary_tsv": summary_tsv
-    }
-    return cfg
 
-def mkdir_p(p: Path) -> None:
-    p.mkdir(parents=True, exist_ok=True)
-
-def run_cmd_stream(cmd: List[str], log_file: Path) -> int:
-    """流式执行外部命令：屏幕实时打印 + 追加写日志文件"""
-    mkdir_p(log_file.parent)
-    log(f"[CMD] {' '.join(cmd)}")
-    with open(log_file, "a", encoding="utf-8") as lf:
-        lf.write(f"[{now_ts()}] [CMD] {' '.join(cmd)}\n")
-        p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
-        assert p.stdout is not None
-        for line in p.stdout:
-            line = line.rstrip("\n")
-            print(line)
-            lf.write(line + "\n")
-        rc = p.wait()
-        lf.write(f"[{now_ts()}] [RC] {rc}\n")
-    if rc != 0:
-        log(f"[ERR] 命令执行失败，返回码={rc}（详见 {log_file}）")
-    return rc
-
-def fasta_headers(fa: Path) -> List[str]:
-    """读取 FASTA 的所有头（取 > 后到第一个空白为止）"""
-    names: List[str] = []
-    with open(fa, "r", encoding="utf-8", errors="ignore") as f:
+def extract_decoys_from_genome(genome_fa: Path, decoy_list: Path) -> int:
+    """
+    从基因组 FASTA 的 header 中提取所有序列 ID，写入 decoy_list。
+    用于 Salmon decoy-aware。
+    """
+    ids = []
+    with genome_fa.open("r", encoding="utf-8") as f:
         for line in f:
             if line.startswith(">"):
-                name = line[1:].strip().split()[0]
-                if name:
-                    names.append(name)
-    return names
+                h = line[1:].strip()
+                if not h:
+                    continue
+                ids.append(h.split(maxsplit=1)[0])
+    ids = sorted(set(ids))
+    decoy_list.parent.mkdir(parents=True, exist_ok=True)
+    with decoy_list.open("w", encoding="utf-8") as out:
+        for i in ids:
+            out.write(i + "\n")
+    return len(ids)
 
-def file_md5(path: Path) -> str:
-    h = hashlib.md5()
-    with open(path, "rb") as f:
-        for ch in iter(lambda: f.read(8192), b""):
-            h.update(ch)
-    return h.hexdigest()
+
+# ============================= 主流程 =============================
+
+def run_cmd(cmd: List[str], log: logging.Logger) -> None:
+    """运行外部命令，失败则退出。"""
+    log.info("运行命令：%s", " ".join(cmd))
+    proc = subprocess.run(cmd)
+    if proc.returncode != 0:
+        log.error("命令执行失败，退出码：%s", proc.returncode)
+        sys.exit(proc.returncode)
+
 
 def main() -> None:
-    global CFG
-    CFG = load_cfg(Path(CONFIG_PATH))
-    R = CFG["_RESOLVED"]
+    cfg = load_config(Path(DEFAULT_CONFIG))
 
-    # 打印“来源键路径”以便您审核
-    log("========== 02 — 构建 Salmon decoy-aware 索引 ==========")
-    log(f"[Info] reference.ref_fasta      = {R['ref_fa'].resolve()}")
-    log(f"[Info] reference.ref_gtf        = {R['ref_gtf'].resolve()}")
-    log(f"[Info] reference.salmon.index_dir = {R['index_dir'].resolve()}")
-    log(f"[Info] reference.salmon.kmer_len  = {R['kmer']}")
-    log(f"[Info] resources.threads.salmon   = {R['threads']}（严格来自 resources.*）")
-    log(f"[Info] decoy_list path             = {R['decoy_path']}（来自 reference.salmon.decoy_list 或默认）")
-    log(f"[Info] gentrome_fa path           = {R['gentrome_fa']}（来自 reference.salmon.gentrome_fa 或默认）")
-    log(f"[Info] rebuild policy             = {R['rebuild']}")
+    # 日志初始化
+    log_level = getattr(logging, str(cfg.get("logging", {}).get("level", "INFO")).upper(), logging.INFO)
+    logging.basicConfig(
+        level=log_level,
+        format="%(asctime)s [02_refprep] %(levelname)s: %(message)s" if cfg["logging"].get("timestamp") else "[02_refprep] %(levelname)s: %(message)s",
+    )
+    log = logging.getLogger("refprep")
 
-    # 准备目录
-    mkdir_p(Path("ref"))
-    mkdir_p(R["index_dir"])
-    mkdir_p(R["summary_tsv"].parent)
+    ref_fa = Path(cfg["reference"]["ref_fasta"])
+    ref_gtf = Path(cfg["reference"]["ref_gtf"])
+    salmon_cfg = cfg["reference"]["salmon"]
+    index_dir = Path(salmon_cfg["index_dir"])
+    kmer_len = int(salmon_cfg.get("kmer_len", 31))
 
-    # 1) 若 gentrome_fa/decoy_list 未给或不存在，则生成
-    # 1.1 提取 transcripts.fa
-    need_tx = (R["rebuild"] == "always") or (not R["transcripts_fa"].exists())
-    if need_tx:
-        if R["transcripts_fa"].exists():
-            R["transcripts_fa"].unlink()
-        rc = run_cmd_stream([
-            str(R["gffread_bin"]),
-            "-w", str(R["transcripts_fa"]),
-            "-g", str(R["ref_fa"]),
-            str(R["ref_gtf"])
-        ], R["log_file"])
-        if rc != 0 or not R["transcripts_fa"].exists() or R["transcripts_fa"].stat().st_size == 0:
-            print("[ERR] gffread 未生成有效的 transcripts.fa", file=sys.stderr); sys.exit(1)
-    else:
-        log(f"[Skip] 已存在：{R['transcripts_fa']}（按 rebuild 策略跳过）")
+    # gentrome / decoys 路径允许为空，需回退到默认
+    decoy_list = salmon_cfg.get("decoy_list") or "ref/decoys.txt"
+    gentrome_fa = salmon_cfg.get("gentrome_fa") or "ref/gentrome.fa"
+    decoy_list = Path(decoy_list)
+    gentrome_fa = Path(gentrome_fa)
 
-    # 1.2 decoy_list
-    need_decoy = (R["rebuild"] == "always") or (not R["decoy_path"].exists())
-    if need_decoy:
-        if R["decoy_path"].exists():
-            R["decoy_path"].unlink()
-        names = fasta_headers(R["ref_fa"])
-        if not names:
-            print("[ERR] ref_fasta 未解析到任何序列头，无法生成 decoys.txt", file=sys.stderr); sys.exit(1)
-        with open(R["decoy_path"], "w", encoding="utf-8") as f:
-            for n in names:
-                f.write(n + "\n")
-        log(f"[Out] 生成 decoys：{R['decoy_path']}（{len(names)} 条）")
-    else:
-        log(f"[Skip] 已存在：{R['decoy_path']}（按 rebuild 策略跳过）")
+    threads = int(cfg["resources"]["threads"].get("salmon", 1))
+    salmon_bin = cfg["binaries"].get("salmon", "salmon")
+    gffread_bin = cfg["binaries"].get("gffread", "gffread")
 
-    # 1.3 gentrome.fa
-    need_gentrome = (R["rebuild"] == "always") or (not R["gentrome_fa"].exists())
-    if need_gentrome:
-        if R["gentrome_fa"].exists():
-            R["gentrome_fa"].unlink()
-        with open(R["gentrome_fa"], "wb") as out, \
-             open(R["transcripts_fa"], "rb") as f1, \
-             open(R["ref_fa"], "rb") as f2:
-            shutil.copyfileobj(f1, out)
-            shutil.copyfileobj(f2, out)
-        log(f"[Out] 生成 gentrome：{R['gentrome_fa']}")
-    else:
-        log(f"[Skip] 已存在：{R['gentrome_fa']}（按 rebuild 策略跳过）")
+    refprep_dir = Path(cfg["dirs"]["refprep"])
+    refprep_dir.mkdir(parents=True, exist_ok=True)
+    summary_tsv = refprep_dir / "gentrome_decoy_summary.tsv"
 
-    # 2) 构建索引（若需要）
-    need_index = True
-    if R["index_dir"].exists():
-        marker = R["index_dir"] / "hash.bin"
-        if R["rebuild"] == "never":
-            need_index = False
-        elif R["rebuild"] == "if_missing":
-            need_index = not marker.exists()
-        elif R["rebuild"] == "always":
-            # 清空重建
-            for p in R["index_dir"].glob("*"):
-                if p.is_file(): p.unlink()
-    if need_index:
-        cmd = [
-            str(R["salmon_bin"]), "index",
-            "-t", str(R["gentrome_fa"]),
-            "-i", str(R["index_dir"]),
-            "-k", str(R["kmer"]),
-            "-p", str(R["threads"]),
-            "--decoys", str(R["decoy_path"])
-        ]
-        rc = run_cmd_stream(cmd, R["log_file"])
-        if rc != 0:
-            sys.exit(1)
-    else:
-        log(f"[Skip] 索引已存在且 rebuild={R['rebuild']}：{R['index_dir']}")
+    # ID 清理策略（仅对 transcripts.fa 生效）
+    id_policy = cfg.get("annotations", {}).get("id_cleanup", {}) or DEFAULTS["annotations"]["id_cleanup"]
 
-    # 3) 构建摘要（契约：results/02_ref/gentrome_decoy_summary.tsv）
-    def count_fasta(fp: Path) -> int:
-        c = 0
-        with open(fp, "r", encoding="utf-8", errors="ignore") as f:
-            for line in f:
-                if line.startswith(">"): c += 1
-        return c
-    tx_n = count_fasta(R["transcripts_fa"])
-    decoy_n = sum(1 for _ in open(R["decoy_path"], "r", encoding="utf-8"))
-    g_size = R["gentrome_fa"].stat().st_size if R["gentrome_fa"].exists() else 0
+    log.info("ref_fasta: %s", ref_fa)
+    log.info("ref_gtf:   %s", ref_gtf)
+    log.info("index_dir: %s", index_dir)
+    log.info("decoy_list: %s", decoy_list)
+    log.info("gentrome_fa: %s", gentrome_fa)
 
-    with open(R["summary_tsv"], "w", encoding="utf-8", newline="") as f:
-        w = csv.writer(f, dialect=csv.excel_tab)
-        w.writerow(["timestamp", "transcripts_fa", "transcript_count",
-                    "genome_fa", "decoy_list", "decoy_count",
-                    "gentrome_fa", "gentrome_bytes",
-                    "index_dir", "kmer_len", "threads",
-                    "ref_fasta_md5", "ref_gtf_md5"])
-        w.writerow([
-            now_ts(), str(R["transcripts_fa"]), tx_n,
-            str(R["ref_fa"]), str(R["decoy_path"]), decoy_n,
-            str(R["gentrome_fa"]), g_size,
-            str(R["index_dir"]), R["kmer"], R["threads"],
-            file_md5(R["ref_fa"]), file_md5(R["ref_gtf"])
-        ])
-    log(f"[Out] 摘要：{R['summary_tsv']}")
-    log("========== 02 完成 ✅ ==========")
-
-if __name__ == "__main__":
-    try:
-        main()
-    except Exception as e:
-        print(f"[ERR] 02 执行失败：{e}", file=sys.stderr)
+    if not ref_fa.exists():
+        log.error("参考基因组 FASTA 不存在：%s", ref_fa)
+        sys.exit(1)
+    if not ref_gtf.exists():
+        log.error("注释 GFF3/GTF 不存在：%s", ref_gtf)
         sys.exit(1)
 
+    rebuild_mode = salmon_cfg.get("rebuild", "if_missing")
+    index_exists = index_dir.exists() and any(index_dir.iterdir())
+    log.info("索引目录状态：exists=%s, rebuild_mode=%s", index_exists, rebuild_mode)
+
+    # 1) 生成 transcripts.fa
+    transcripts_fa = Path("ref/transcripts.fa")
+    transcripts_fa.parent.mkdir(parents=True, exist_ok=True)
+
+    if not transcripts_fa.exists() or rebuild_mode == "always":
+        log.info("生成转录本 FASTA：%s", transcripts_fa)
+        run_cmd(
+            [
+                gffread_bin,
+                "-g",
+                str(ref_fa),
+                "-w",
+                str(transcripts_fa),
+                str(ref_gtf),
+            ],
+            log,
+        )
+    else:
+        log.info("发现已有 transcripts.fa，按 rebuild_mode=%s 保留", rebuild_mode)
+
+    # 2) 按 ID 清理策略重写 transcripts.fa 头部（仅当策略开启）
+    use_cleanup = bool(id_policy.get("strip_prefix") or id_policy.get("strip_suffix"))
+    cleaned_transcripts = transcripts_fa
+
+    total_tx = 0
+    changed_tx = 0
+    if use_cleanup:
+        cleaned_transcripts = Path("ref/transcripts.cleaned.fa")
+        log.info("启用 ID 清理策略，对 transcripts.fa 的 header 进行修剪")
+        total_tx, changed_tx = rewrite_fasta_headers(transcripts_fa, cleaned_transcripts, id_policy)
+        log.info("transcript 记录数：%d；其中被修改 ID 数量：%d", total_tx, changed_tx)
+    else:
+        # 粗略统计一下转录本数量
+        t = 0
+        with transcripts_fa.open("r", encoding="utf-8") as f:
+            for line in f:
+                if line.startswith(">"):
+                    t += 1
+        total_tx = t
+        log.info("未启用 ID 清理；transcript 记录数：%d", total_tx)
+
+    # 3) 生成 decoy_list
+    if not decoy_list.exists() or rebuild_mode == "always":
+        log.info("生成 decoy_list：%s", decoy_list)
+        n_decoys = extract_decoys_from_genome(ref_fa, decoy_list)
+        log.info("decoy 序列数：%d", n_decoys)
+    else:
+        log.info("发现已有 decoy_list，按 rebuild_mode=%s 保留", rebuild_mode)
+        # 估个数
+        n_decoys = sum(1 for _ in decoy_list.open("r", encoding="utf-8"))
+
+    # 4) 生成 gentrome.fa（转录本 + 基因组）
+    if not gentrome_fa.exists() or rebuild_mode == "always":
+        log.info("生成 gentrome.fa：%s", gentrome_fa)
+        gentrome_fa.parent.mkdir(parents=True, exist_ok=True)
+        with gentrome_fa.open("w", encoding="utf-8") as out:
+            with cleaned_transcripts.open("r", encoding="utf-8") as f_tx:
+                for line in f_tx:
+                    out.write(line)
+            with ref_fa.open("r", encoding="utf-8") as f_ref:
+                for line in f_ref:
+                    out.write(line)
+    else:
+        log.info("发现已有 gentrome.fa，按 rebuild_mode=%s 保留", rebuild_mode)
+
+    # 5) 构建 salmon 索引
+    if rebuild_mode == "never" and index_exists:
+        log.info("索引已存在且 rebuild_mode=never，跳过构建")
+    elif rebuild_mode == "if_missing" and index_exists:
+        log.info("索引已存在且 rebuild_mode=if_missing，跳过构建")
+    else:
+        index_dir.mkdir(parents=True, exist_ok=True)
+        cmd = [
+            salmon_bin,
+            "index",
+            "-t",
+            str(gentrome_fa),
+            "-d",
+            str(decoy_list),
+            "-i",
+            str(index_dir),
+            "-k",
+            str(kmer_len),
+            "-p",
+            str(threads),
+        ]
+        run_cmd(cmd, log)
+
+    # 6) 写 gentrome_decoy_summary.tsv
+    summary_tsv.parent.mkdir(parents=True, exist_ok=True)
+    with summary_tsv.open("w", encoding="utf-8") as out:
+        out.write("key\tvalue\n")
+        out.write(f"ref_fasta\t{ref_fa}\n")
+        out.write(f"ref_gtf\t{ref_gtf}\n")
+        out.write(f"index_dir\t{index_dir}\n")
+        out.write(f"kmer_len\t{kmer_len}\n")
+        out.write(f"transcript_fasta\t{cleaned_transcripts}\n")
+        out.write(f"n_transcripts\t{total_tx}\n")
+        out.write(f"n_transcripts_id_changed\t{changed_tx}\n")
+        out.write(f"genome_decoys_fasta\t{ref_fa}\n")
+        out.write(f"n_decoys\t{n_decoys}\n")
+        out.write(f"decoy_list\t{decoy_list}\n")
+        out.write(f"gentrome_fa\t{gentrome_fa}\n")
+        out.write(f"id_cleanup_enabled\t{use_cleanup}\n")
+        out.write(f"timestamp\t{datetime.datetime.now().isoformat()}\n")
+
+    log.info("gentrome/decoy 构建完成，摘要写入：%s", summary_tsv)
+
+
+if __name__ == "__main__":
+    main()
