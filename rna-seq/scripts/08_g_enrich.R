@@ -147,26 +147,31 @@ format_go_sub <- function(dt_sub, ontology, test_set, universe_size,
   )
 }
 
+# ★★★ KEGG 表头完全 vNext 版 + gene_names + ontology=KEGG ★★★
 format_kegg_res <- function(dt, test_set, universe_size,
                             minGS, maxGS, gene_name_map, count_mode) {
+  # vNext 约定核心列顺序：
+  # pathway_id, term_name, test_set, count_mode,
+  # gene_ids, gene_names, gene_count, bg_size, gene_ratio, bg_ratio,
+  # p_value, p_adjust, universe_size, min_gs, max_gs, ontology
   if (is.null(dt) || nrow(dt) == 0L) {
     return(data.table(
-      term_id        = character(),
-      term_name      = character(),
-      test_set       = character(),
-      ontology       = character(),
-      gene_ids       = character(),
-      gene_names     = character(),
-      gene_count     = integer(),
-      bg_size        = integer(),
-      gene_ratio     = numeric(),
-      bg_ratio       = numeric(),
-      p_value        = numeric(),
-      p_adjust       = numeric(),
-      universe_size  = integer(),
-      min_gs         = integer(),
-      max_gs         = integer(),
-      count_mode     = character()
+      pathway_id    = character(),
+      term_name     = character(),
+      test_set      = character(),
+      count_mode    = character(),
+      gene_ids      = character(),
+      gene_names    = character(),
+      gene_count    = integer(),
+      bg_size       = integer(),
+      gene_ratio    = numeric(),
+      bg_ratio      = numeric(),
+      p_value       = numeric(),
+      p_adjust      = numeric(),
+      universe_size = integer(),
+      min_gs        = integer(),
+      max_gs        = integer(),
+      ontology      = character()
     ))
   }
 
@@ -191,10 +196,10 @@ format_kegg_res <- function(dt, test_set, universe_size,
   bg_ratio_num   <- parse_ratio_vec(dt$BgRatio)
 
   data.table(
-    term_id       = dt$ID,
+    pathway_id    = dt$ID,
     term_name     = dt$Description,
     test_set      = test_set,
-    ontology      = "KEGG",
+    count_mode    = count_mode,
     gene_ids      = gene_ids_vec,
     gene_names    = gene_names_vec,
     gene_count    = dt$Count,
@@ -206,7 +211,7 @@ format_kegg_res <- function(dt, test_set, universe_size,
     universe_size = universe_size,
     min_gs        = minGS,
     max_gs        = maxGS,
-    count_mode    = count_mode
+    ontology      = "KEGG"
   )
 }
 
