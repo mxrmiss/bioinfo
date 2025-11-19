@@ -1,7 +1,6 @@
 # =============================================================================
 # config.yaml —— RNA-seq 自用·顶刊口径版（不产图，集中参数）
 # 约定：所有脚本只从本文件读取参数；不在命令行传参。
-# 目录结构：与我们定稿的 project/data|ref|results|scripts 完全一致。
 # =============================================================================
 
 project:
@@ -15,19 +14,16 @@ data:
 
 # ------------------------------ 参考与注释 ------------------------------
 reference:
-  ref_fasta: "ref/Sinonovacula_constricta_genome.fa"   # 您之前点名的基因组FA
-  ref_gtf:   "ref/Sinonovacula_constricta_genome.gff3" # GTF/GFF3 皆可；脚本自适配
-  # eggNOG/本地注释（07 使用）：确保 gene_id 与全流程一致
-  emapper: "ref/annotations/Sinonovacula_constricta_annotations.tsv"
-
-  # Salmon 索引/decoys（02 使用）；若 index_dir 不存在，将由 02 构建
+  ref_fasta: "ref/Sinonovacula_constricta_genome.fa"
+  ref_gtf:   "ref/Sinonovacula_constricta_genome.gff3"
+  emapper:   "ref/annotations/Sinonovacula_constricta_annotations.tsv"
   salmon:
-    index_dir: "ref/salmon_index"
-    kmer_len: 31                  # Salmon 索引k（按默认即可）
-    decoy_list: "ref/decoys.txt"  # 可为空；若留空则 02 自动生成
-    gentrome_fa: "ref/gentrome.fa"  # 02 生成；若已存在将复用
-    libtype: "A"                  # 自动推断；04 会记录推断结果
-    force_rebuild: true           # 无条件重建索引
+    index_dir:   "ref/salmon_index"
+    kmer_len:    31
+    decoy_list:  "ref/decoys.txt"
+    gentrome_fa: "ref/gentrome.fa"
+    libtype:     "A"
+    force_rebuild: true        # 为 true 时可强制重建索引（若 info 变更）
 
 # ------------------------------ 运行资源 ------------------------------
 resources:
@@ -44,66 +40,60 @@ resources:
     deg: 90
     enrich: 90
 
-# ------------------------------ 工具二进制路径（可用环境PATH时保留可执行名） ------------------------------
+# ------------------------------ 工具二进制路径 ------------------------------
 binaries:
-  fastp: "fastp"
-  cutadapt: "cutadapt"
-  salmon: "salmon"
+  fastp:   "fastp"
+  cutadapt:"cutadapt"
+  salmon:  "salmon"
   Rscript: "Rscript"
 
 # ------------------------------ 质控（01 使用） ------------------------------
 qc:
-  # 硬门槛（Fail-Fast）：触发则写入 rejects.tsv，并在下游自动排除
   thresholds:
-    min_retention_rate: 0.50      # 保留率 <50% → 淘汰
-    min_raw_reads: 5000000        # 原始读数 <5M → 淘汰
-    min_mean_read_len: 40         # 平均读长 <40bp → 淘汰
-  # 离群判定（仅写入 outliers.tsv，供参考，不强制淘汰）
+    min_retention_rate: 0.50
+    min_raw_reads: 5000000
+    min_mean_read_len: 40
   outlier_rules:
     max_adapter_percent: 30
     max_dup_percent: 60
-  # fastp 常用开关（01 内部使用）
   fastp_opts:
     trim_poly_g: true
     detect_adapter: true
     qualified_quality_phred: 15
     unqualified_percent_limit: 40
-  # 是否生成clean序列
   write_clean_fastq: true
 
-# ------------------------------ quant（04使用）-------------------------------------
+# ------------------------------ quant（04 使用） ------------------------------
 quant:
-  prefer_clean_fastq: true   # 04 优先使用 01 产出的 clean FASTQ；缺失则回退 raw
-  require_clean_fastq: false # 若设为 true，找不到 clean 就报错退出（一般不建议）
-  overwrite: false           # 已存在 quant 结果时是否覆盖重跑
+  prefer_clean_fastq: true
+  require_clean_fastq: false
+  overwrite: false
   salmon_opts:
-    validate_mappings: true  # --validateMappings
-    gc_bias: false           # --gcBias
-    seq_bias: false          # --seqBias
-    libtype: "A"             # -l A 让 Salmon 自动推断链特异/文库型
-    extra: ""                # 额外透传参数（留空即可） 
+    validate_mappings: true
+    gc_bias: false
+    seq_bias: false
+    libtype: "A"
+    extra: ""
 
 # ------------------------------ tximport 聚合（05 使用） ------------------------------
 tximport:
-  counts_from_abundance: "no"      # no/scaling/scaling_scaled/lengthScaledTPM（保持统计可比）
-  # 体检表统计的采样数/分位
+  counts_from_abundance: "no"        # no/scaling/scaling_scaled/lengthScaledTPM
   matrix_stats:
     report_libsize_quantiles: [0.25, 0.5, 0.75]
 
 # ------------------------------ 差异分析（06 使用） ------------------------------
 deg:
-  lfc: 1.0                         # |log2FC| 阈值
-  fdr: 0.05                        # FDR 阈值（BH）
-  use_apeglm: true                 # LFC 收缩方法 apeglm
-  independent_filter: true         # DESeq2 独立过滤
-  allow_batch: true                # 样本允许时将 batch 纳入模型
-  min_samples_per_group: 3         # 低于此值将提示功效不足（不中断）
-  # 诊断产物（不画图）
+  lfc: 1.0
+  fdr: 0.05
+  use_apeglm: true
+  independent_filter: true
+  allow_batch: true
+  min_samples_per_group: 3
   diagnostics:
-    varTopN: 100                   # varTop100.list
+    varTopN: 100
     rle_summary: true
 
-# ------------------------------ 注释文件（07 使用）------------------------------------
+# ------------------------------ 注释文件与 ID 清理（02/03/07 共用） ------------------------------
 annotations:
   allow_gene_space_match: true
   id_cleanup:
@@ -112,31 +102,29 @@ annotations:
     strip_suffix: false
     suffix: []
     order: ["prefix","suffix"]
+  # 说明：ID 清理开关默认全关。02/03/07 若需清理 ID，必须统一读取此块。
 
 # ------------------------------ 背景集合（08 使用 · 关键） ------------------------------
 background:
-  # RNA 对比默认背景规则：对比样本内“可检测”∩“可注释”
   rule: "per_contrast_detectable_AND_annotated"
-  detectable: "TPM>0_or_count>0_in>=1_sample"   # 判定可检测的规则描述（落盘 meta）
-  # 外部通用 ORA 引擎入口（自带 test.list / up&down.list 与 background.list）
+  detectable: "TPM>0_or_count>0_in>=1_sample"
   ora_inputs_dir: "results/08_enrich/inputs"
 
 # ------------------------------ GO 富集（08 使用） ------------------------------
 go:
-  minGS: 10                       # term最小大小
-  maxGS: 500                      # term最大大小
-  p_adjust_method: "BH"           # 与顶刊常用一致
-  obsolete_policy: "replace_or_consider"  # 通过 go/obsolete_map.tsv 处理废弃术语
-  ontologies: ["bp", "cc", "mf"]  # 三本体分层独立校正
-  # 词典来源（07 产物）；保持与我们目录契约一致
+  minGS: 10
+  maxGS: 500
+  p_adjust_method: "BH"
+  obsolete_policy: "replace_or_consider"
+  ontologies: ["bp", "cc", "mf"]
   dict:
-    gene2go: "results/07_annot/gene2go.tsv"
-    term2name: "results/07_annot/go/term2name.tsv"
-    obsolete_map: "results/07_annot/go/obsolete_map.tsv"
+    gene2go:     "results/07_annot/gene2go.tsv"
+    term2name:   "results/07_annot/go/term2name.tsv"
+    obsolete_map:"results/07_annot/go/obsolete_map.tsv"
 
 # ------------------------------ KEGG 富集（08 使用） ------------------------------
 kegg:
-  count_mode: "by_gene"           # 固定一种：by_gene 或 by_ko
+  count_mode: "by_gene"     # 或 "by_ko"，项目内固定一种
   p_adjust_method: "BH"
   dict:
     term2gene: "results/07_annot/kegg/term2gene.tsv"
@@ -144,32 +132,31 @@ kegg:
 
 # ------------------------------ 富集通用设置（08 使用） ------------------------------
 enrich:
-  fdr: 0.05                       # 显著性阈值（用于 GO_sig_* 与 by-term 过滤）
-  add_go_sig_tables: true         # 产出 GO_sig_all/up/down 三张总表
-  output_sig_sorted: true         # 总表按 p_adjust 升序，再 gene_count 降序
-  write_universe_meta: true       # 写入 universe_size 与 meta（对比或外部tag）
+  fdr: 0.05
+  add_go_sig_tables: true
+  output_sig_sorted: true
+  write_universe_meta: true
 
 # ------------------------------ 发布与装订（09 使用） ------------------------------
 publish:
   source_data_dir: "results/09_publish/source_data"
-  methods_readme: "results/09_publish/source_data/METHODS_README.txt"
-  xlsx: false                     # true 则额外生成 <contrast>.xlsx（便于人工浏览）
+  methods_readme:   "results/09_publish/source_data/METHODS_README.txt"
+  xlsx: false
 
-# ------------------------------ 目录（各脚本按契约写出到此） ------------------------------
+# ------------------------------ 目录 ------------------------------
 dirs:
-  qc: "results/01_qc"
+  qc:      "results/01_qc"
   refprep: "results/02_ref"
-  maps: "results/03_maps"
-  quant: "results/04_quant"
-  matrix: "results/05_matrix"
-  deg: "results/06_deg"
-  annot: "results/07_annot"
-  enrich: "results/08_enrich"
+  maps:    "results/03_maps"
+  quant:   "results/04_quant"
+  matrix:  "results/05_matrix"
+  deg:     "results/06_deg"
+  annot:   "results/07_annot"
+  enrich:  "results/08_enrich"
   publish: "results/09_publish"
 
-# ------------------------------ 日志（可选） ------------------------------
+# ------------------------------ 日志 ------------------------------
 logging:
-  level: "INFO"                    # DEBUG/INFO/WARNING/ERROR
+  level: "INFO"
   timestamp: true
-  # 如需文件日志可指定路径；为空表示仅标准输出
   file: ""
