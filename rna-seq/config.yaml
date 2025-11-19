@@ -16,35 +16,38 @@ data:
 reference:
   ref_fasta: "ref/Sinonovacula_constricta_genome.fa"
   ref_gtf:   "ref/Sinonovacula_constricta_genome.gff3"
+  # eggNOG/本地注释（07 使用）：确保 gene_id 与全流程一致
   emapper:   "ref/annotations/Sinonovacula_constricta_annotations.tsv"
+
+  # Salmon 索引/decoys（02 使用）；若 index_dir 不存在，将由 02 构建
   salmon:
     index_dir:   "ref/salmon_index"
     kmer_len:    31
-    decoy_list:  "ref/decoys.txt"
-    gentrome_fa: "ref/gentrome.fa"
-    libtype:     "A"
-    force_rebuild: true        # 为 true 时可强制重建索引（若 info 变更）
+    decoy_list:  "ref/decoys.txt"     # 可为空字符串，02 将自动生成
+    gentrome_fa: "ref/gentrome.fa"    # 可为空字符串，02 将自动生成
+    rebuild:     "if_missing"         # always / if_missing / never
 
 # ------------------------------ 运行资源 ------------------------------
 resources:
   threads:
-    qc: 40
-    salmon: 40
-    tximport: 40
-    deg: 40
-    enrich: 40
+    qc:      40
+    salmon:  40
+    tximport:40
+    deg:     40
+    enrich:  40
   memory_gb:
-    qc: 90
-    salmon: 90
-    tximport: 90
-    deg: 90
-    enrich: 90
+    qc:      90
+    salmon:  90
+    tximport:90
+    deg:     90
+    enrich:  90
 
 # ------------------------------ 工具二进制路径 ------------------------------
 binaries:
   fastp:   "fastp"
   cutadapt:"cutadapt"
   salmon:  "salmon"
+  gffread: "gffread"
   Rscript: "Rscript"
 
 # ------------------------------ 质控（01 使用） ------------------------------
@@ -72,7 +75,7 @@ quant:
     validate_mappings: true
     gc_bias: false
     seq_bias: false
-    libtype: "A"
+    libtype: "A"   # -l A 自动推断文库型
     extra: ""
 
 # ------------------------------ tximport 聚合（05 使用） ------------------------------
@@ -93,18 +96,18 @@ deg:
     varTopN: 100
     rle_summary: true
 
-# ------------------------------ 注释文件与 ID 清理（02/03/07 共用） ------------------------------
+# ------------------------------ 注释与 ID 清理（02/03/07 共用） ----------------------
 annotations:
   allow_gene_space_match: true
+  # 统一 ID 清理开关：模式 A=全关（默认），模式 B=按前/后缀统一修剪
   id_cleanup:
-    strip_prefix: false
-    prefix: []
-    strip_suffix: false
-    suffix: []
-    order: ["prefix","suffix"]
-  # 说明：ID 清理开关默认全关。02/03/07 若需清理 ID，必须统一读取此块。
+    strip_prefix: false     # 是否去前缀
+    prefix: []              # 要剥掉的前缀列表（完全匹配）
+    strip_suffix: false     # 是否去后缀
+    suffix: []              # 要剥掉的后缀列表（完全匹配，如 ".t1"）
+    order: ["prefix","suffix"]   # 应用顺序，通常保持默认即可
 
-# ------------------------------ 背景集合（08 使用 · 关键） ------------------------------
+# ------------------------------ 背景集合（08 使用 · 关键） --------------------------
 background:
   rule: "per_contrast_detectable_AND_annotated"
   detectable: "TPM>0_or_count>0_in>=1_sample"
@@ -118,9 +121,9 @@ go:
   obsolete_policy: "replace_or_consider"
   ontologies: ["bp", "cc", "mf"]
   dict:
-    gene2go:     "results/07_annot/gene2go.tsv"
-    term2name:   "results/07_annot/go/term2name.tsv"
-    obsolete_map:"results/07_annot/go/obsolete_map.tsv"
+    gene2go:      "results/07_annot/gene2go.tsv"
+    term2name:    "results/07_annot/go/term2name.tsv"
+    obsolete_map: "results/07_annot/go/obsolete_map.tsv"
 
 # ------------------------------ KEGG 富集（08 使用） ------------------------------
 kegg:
