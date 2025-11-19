@@ -599,4 +599,253 @@ for (lb in labels_unique) {
         p_value = numeric(),
         p_adjust = numeric(),
         universe_size = integer(),
-        min_gs
+        min_gs = integer(),
+        max_gs = integer()
+      )
+      out_sig_fp <- file.path(outdir_label, sprintf("GO_sig_%s.tsv", set_name))
+      data.table::fwrite(empty_dt, file = out_sig_fp, sep = "\t",
+                         quote = FALSE, na = "NA")
+      next
+    }
+    merged <- data.table::rbindlist(go_dt_list, use.names = TRUE, fill = TRUE)
+    sig <- merged[p_adjust <= enrich_fdr]
+    if (nrow(sig) > 0L && isTRUE(enrich_output_sig_sorted)) {
+      sig <- sig[order(p_adjust, -gene_count)]
+    }
+    out_sig_fp <- file.path(outdir_label, sprintf("GO_sig_%s.tsv", set_name))
+    data.table::fwrite(sig, file = out_sig_fp, sep = "\t",
+                       quote = FALSE, na = "NA")
+  }
+
+  # -------- ORA 显著数统计（summary 用） --------
+  # GO_sig_*
+  go_sig_all_n <- 0L
+  go_sig_up_n <- 0L
+  go_sig_down_n <- 0L
+  for (set_name in c("all", "up", "down")) {
+    fp <- file.path(outdir_label, sprintf("GO_sig_%s.tsv", set_name))
+    if (file.exists(fp)) {
+      dt <- data.table::fread(fp, sep = "\t", header = TRUE)
+      n_sig <- nrow(dt)
+      if (set_name == "all") go_sig_all_n <- n_sig
+      if (set_name == "up")  go_sig_up_n  <- n_sig
+      if (set_name == "down")go_sig_down_n<- n_sig
+    }
+  }
+
+  # KEGG：对 all/up/down 的 by-term 表中 p_adjust<=FDR 的条目数
+  kegg_sig_all_n <- 0L
+  kegg_sig_up_n  <- 0L
+  kegg_sig_down_n<- 0L
+  for (set_name in c("all", "up", "down")) {
+    fp <- file.path(outdir_label, sprintf("KEGG_by_term_%s.tsv", set_name))
+    if (!file.exists(fp)) next
+    dt <- data.table::fread(fp, sep = "\t", header = TRUE)
+    if (nrow(dt) == 0L) next
+    n_sig <- nrow(dt[p_adjust <= enrich_fdr])
+    if (set_name == "all") kegg_sig_all_n <- n_sig
+    if (set_name == "up")  kegg_sig_up_n  <- n_sig
+    if (set_name == "down")kegg_sig_down_n<- n_sig
+  }
+
+  # -------- GSEA：若开启且为 RNA label，则执行 --------
+  go_gsea_sig_n <- NA_integer_
+  kegg_gsea_sig_n <- NA_integer_
+
+  type_lb <- as.character(tasks_lb$type[1])
+  if (gsea_enable && identical(type_lb, "rna")) {
+    ranks_fp <- file.path(outdir_label, "gsea_ranks.tsv")
+    if (!file.exists(ranks_fp)) {
+      log_msg("INFO", "label=", lb, " 未找到 gsea_ranks.tsv，跳过 GSEA。")
+    } else {
+      log_msg("INFO", "GSEA: label=", lb, "，使用排名文件：", ranks_fp)
+      ranks_dt <- data.table::fread(ranks_fp, sep = "\t", header = TRUE)
+      if (!all(c("gene_id", "score") %in% colnames(ranks_dt))) {
+        log_msg("WARNING", "gsea_ranks.tsv 格式不正确（需要 gene_id, score），跳过 label=", lb)
+      } else {
+        ranks_dt <- ranks_dt[!is.na(score)]
+        ranks_dt <- ranks_dt[!is.na(gene_id) & nzchar(gene_id)]
+        if (nrow(ranks_dt) >= 2L) {
+          # 构建 geneList（按 score 降序）
+          ranks_dt <- ranks_dt[order(-score)]
+          geneList <- ranks_dt$score
+          names(geneList) <- ranks_dt$gene_id
+
+          # ---- GSEA-GO ----
+          go_gsea_res <- NULL
+          go_gsea_sig_n <- NA_integer_
+          if (length(intersect(names(geneList), go_gene_universe)) >= gsea_minGS) {
+            go_gsea <- tryCatch(
+              clusterProfiler::GSEA(
+                geneList      = geneList,
+                TERM2GENE     = go_term2gene,
+                TERM2NAME     = go_term2name,
+                pAdjustMethod = gsea_padj_method,
+                minGS         = gsea_minGS,
+                maxGS         = gsea_maxGS,
+                pvalueCutoff  = 1.0,
+                verbose       = FALSE
+              ),
+              error = function(e) {
+                log_msg("WARNING", "GSEA-GO 失败：label=", lb, "；原因：", e$message)
+                NULL
+              }
+            )
+            if (!is.null(go_gsea) && nrow(as.data.frame(go_gsea)) > 0L) {
+              dt <- as.data.table(as.data.frame(go_gsea))
+              # 添加 ontology
+              dt[, ontology := go_ontology_map[as.character(ID)]]
+              dt <- dt[ontology %in% gsea_ontologies]
+              if (nrow(dt) > 0L) {
+                # qvalues 列名在 GSEA 中一般叫 "qvalues"
+                if (!"qvalues" %in% colnames(dt)) {
+                  dt[, qvalues := p.adjust(p.adjust, method = "BH")]
+                }
+                go_gsea_sig_n <- nrow(dt[qvalues <= gsea_fdr])
+                # 格式化输出
+                go_gsea_out <- data.table(
+                  term_id          = dt$ID,
+                  term_name        = dt$Description,
+                  ontology         = dt$ontology,
+                  nes              = dt$NES,
+                  enrichment_score = dt$enrichmentScore,
+                  p_value          = dt$pvalue,
+                  p_adjust         = dt$p.adjust,
+                  q_value          = dt$qvalues,
+                  core_enriched    = dt$core_enrichment,
+                  size             = dt$setSize
+                )
+                gsea_dir <- file.path(outdir_label, "gsea")
+                ensure_dir(gsea_dir)
+                go_gsea_fp <- file.path(gsea_dir, "GO_gsea.tsv")
+                data.table::fwrite(go_gsea_out, file = go_gsea_fp, sep = "\t",
+                                   quote = FALSE, na = "NA")
+              } else {
+                go_gsea_sig_n <- 0L
+                gsea_dir <- file.path(outdir_label, "gsea")
+                ensure_dir(gsea_dir)
+                go_gsea_fp <- file.path(gsea_dir, "GO_gsea.tsv")
+                empty_dt <- data.table(
+                  term_id          = character(),
+                  term_name        = character(),
+                  ontology         = character(),
+                  nes              = numeric(),
+                  enrichment_score = numeric(),
+                  p_value          = numeric(),
+                  p_adjust         = numeric(),
+                  q_value          = numeric(),
+                  core_enriched    = character(),
+                  size             = integer()
+                )
+                data.table::fwrite(empty_dt, file = go_gsea_fp, sep = "\t",
+                                   quote = FALSE, na = "NA")
+              }
+            }
+          }
+
+          # ---- GSEA-KEGG ----
+          kegg_gsea_res <- NULL
+          kegg_gsea_sig_n <- NA_integer_
+          if (length(intersect(names(geneList), kegg_gene_universe)) >= gsea_minGS) {
+            kegg_gsea <- tryCatch(
+              clusterProfiler::GSEA(
+                geneList      = geneList,
+                TERM2GENE     = kegg_term2gene2,
+                TERM2NAME     = kegg_term2name,
+                pAdjustMethod = gsea_padj_method,
+                minGS         = gsea_minGS,
+                maxGS         = gsea_maxGS,
+                pvalueCutoff  = 1.0,
+                verbose       = FALSE
+              ),
+              error = function(e) {
+                log_msg("WARNING", "GSEA-KEGG 失败：label=", lb, "；原因：", e$message)
+                NULL
+              }
+            )
+            if (!is.null(kegg_gsea) && nrow(as.data.frame(kegg_gsea)) > 0L) {
+              dtk <- as.data.table(as.data.frame(kegg_gsea))
+              if (!"qvalues" %in% colnames(dtk)) {
+                dtk[, qvalues := p.adjust(p.adjust, method = "BH")]
+              }
+              kegg_gsea_sig_n <- nrow(dtk[qvalues <= gsea_fdr])
+              kegg_gsea_out <- data.table(
+                term_id          = dtk$ID,
+                term_name        = dtk$Description,
+                ontology         = "KEGG",
+                nes              = dtk$NES,
+                enrichment_score = dtk$enrichmentScore,
+                p_value          = dtk$pvalue,
+                p_adjust         = dtk$p.adjust,
+                q_value          = dtk$qvalues,
+                core_enriched    = dtk$core_enrichment,
+                size             = dtk$setSize,
+                count_mode       = kegg_count_mode
+              )
+              gsea_dir <- file.path(outdir_label, "gsea")
+              ensure_dir(gsea_dir)
+              kegg_gsea_fp <- file.path(gsea_dir, "KEGG_gsea.tsv")
+              data.table::fwrite(kegg_gsea_out, file = kegg_gsea_fp, sep = "\t",
+                                 quote = FALSE, na = "NA")
+            } else {
+              kegg_gsea_sig_n <- 0L
+              gsea_dir <- file.path(outdir_label, "gsea")
+              ensure_dir(gsea_dir)
+              kegg_gsea_fp <- file.path(gsea_dir, "KEGG_gsea.tsv")
+              empty_dt <- data.table(
+                term_id          = character(),
+                term_name        = character(),
+                ontology         = character(),
+                nes              = numeric(),
+                enrichment_score = numeric(),
+                p_value          = numeric(),
+                p_adjust         = numeric(),
+                q_value          = numeric(),
+                core_enriched    = character(),
+                size             = integer(),
+                count_mode       = character()
+              )
+              data.table::fwrite(empty_dt, file = kegg_gsea_fp, sep = "\t",
+                                 quote = FALSE, na = "NA")
+            }
+          }
+
+          go_gsea_sig_n <- go_gsea_sig_n
+          kegg_gsea_sig_n <- kegg_gsea_sig_n
+        } else {
+          log_msg("WARNING", "label=", lb, " 的 GSEA 排名有效行数不足，跳过 GSEA。")
+        }
+      }
+    }
+  }
+
+  # -------- 写 summary 行 --------
+  n_deg_all_lb <- as.character(tasks_lb$n_deg_all[1])
+
+  summary_rows[[lb]] <- data.table(
+    label          = lb,
+    type           = type_lb,
+    n_deg_all      = n_deg_all_lb,
+    go_sig_all     = go_sig_all_n,
+    go_sig_up      = go_sig_up_n,
+    go_sig_down    = go_sig_down_n,
+    kegg_sig_all   = kegg_sig_all_n,
+    kegg_sig_up    = kegg_sig_up_n,
+    kegg_sig_down  = kegg_sig_down_n,
+    go_gsea_sig    = go_gsea_sig_n,
+    kegg_gsea_sig  = kegg_gsea_sig_n,
+    universe_size  = if (!is.na(universe_size_meta)) universe_size_meta else NA_integer_,
+    coverage       = if (!is.na(coverage_meta)) coverage_meta else NA_real_
+  )
+}
+
+#------------------------- 写 summary.tsv -------------------------#
+
+summary_dt <- data.table::rbindlist(summary_rows, use.names = TRUE, fill = TRUE)
+summary_fp <- file.path(dir_enrich, "summary.tsv")
+data.table::fwrite(summary_dt, file = summary_fp, sep = "\t",
+                   quote = FALSE, na = "NA")
+
+log_msg("INFO", "已写出富集汇总表：", summary_fp)
+log_msg("INFO", "===== 08_g_enrich.R 执行完成 =====")
+

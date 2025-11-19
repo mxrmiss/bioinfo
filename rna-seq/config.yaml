@@ -32,20 +32,20 @@ resources:
   threads:
     qc:      40
     salmon:  40
-    tximport:40
+    tximport: 40
     deg:     40
     enrich:  40
   memory_gb:
     qc:      90
     salmon:  90
-    tximport:90
+    tximport: 90
     deg:     90
     enrich:  90
 
 # ------------------------------ 工具二进制路径 ------------------------------
 binaries:
   fastp:   "fastp"
-  cutadapt:"cutadapt"
+  cutadapt: "cutadapt"
   salmon:  "salmon"
   gffread: "gffread"
   Rscript: "Rscript"
@@ -101,8 +101,8 @@ annotations:
   allow_gene_space_match: true
   # 统一 ID 清理开关：模式 A=全关（默认），模式 B=按前/后缀统一修剪
   id_cleanup:
-    strip_prefix: false     # 是否去前缀
-    prefix: []              # 要剥掉的前缀列表（完全匹配）
+    strip_prefix: true     # 是否去前缀
+    prefix: ["Sinonovacula_constricta|"]              # 要剥掉的前缀列表（完全匹配）
     strip_suffix: false     # 是否去后缀
     suffix: []              # 要剥掉的后缀列表（完全匹配，如 ".t1"）
     order: ["prefix","suffix"]   # 应用顺序，通常保持默认即可
@@ -125,13 +125,24 @@ go:
     term2name:    "results/07_annot/go/term2name.tsv"
     obsolete_map: "results/07_annot/go/obsolete_map.tsv"
 
-# ------------------------------ KEGG 富集（08 使用） ------------------------------
+# ------------------------------ KEGG 富集（08 使用）--------------------------------
 kegg:
   count_mode: "by_gene"     # 或 "by_ko"，项目内固定一种
   p_adjust_method: "BH"
   dict:
     term2gene: "results/07_annot/kegg/term2gene.tsv"
     term2name: "results/07_annot/kegg/term2name.tsv"
+
+# ------------------------------ GSEA 富集（08使用） --------------------------------
+gsea:
+  enable: true            # 是否启用 GSEA 通道
+  score_from: "stat"      # 使用 DESeq2 的哪一列作为排名：stat 或 log2fc
+  minGS: 10               # 基因集最小大小（与 GO ORA 保持一致即可）
+  maxGS: 500              # 基因集最大大小（一般不用改）
+  p_adjust_method: "BH"   # GSEA 中 p.adjust 的方法
+  fdr: 0.25               # GSEA 的 FDR 阈值（常规 0.25）
+  ontologies: ["BP"]      # GSEA-GO 只看哪些本体：BP/CC/MF 的组合
+
 
 # ------------------------------ 富集通用设置（08 使用） ------------------------------
 enrich:
