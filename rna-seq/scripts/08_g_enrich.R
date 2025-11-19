@@ -1,19 +1,21 @@
 #!/usr/bin/env Rscript
 # -*- coding: utf-8 -*-
 
-# 08_g_enrich.R —— GO/KEGG ORA + GSEA 执行模块（vNext + GSEA 最终版）
+# 08_g_enrich.R —— GO/KEGG ORA + GSEA 执行模块（vNext + GSEA + obsolete 安全版）
 #
 # 职责：
 #   1) 读取 config.yaml 与 results/08_enrich/tasks.tsv；
 #   2) 读取注释词典（gene2go/gene2pathway/GO term2name/obsolete_map/KEGG term2gene/term2name）；
 #   3) 对每个任务（label + test_set）执行 ORA（GO + KEGG），输出统一表头的 by-term 表；
-#   4) 为每个 label 生成 GO_sig_all/up/down（GO 三本体纵合 + FDR 过滤）；
+#   4) 生成 GO_sig_all/up/down（GO 三本体纵合 + FDR 过滤）；
 #   5) 若存在 gene_id → gene_name 词典，则在 ORA 结果中增加 gene_names 列；
-#   6) 若 config.gsea.enable = TRUE，则对每个 RNA label 运行 GSEA：
-#        - 读 results/08_enrich/<label>/gsea_ranks.tsv
-#        - 对 GO（可配置本体）和 KEGG 执行 GSEA
-#        - 输出 gsea/GO_gsea.tsv / gsea/KEGG_gsea.tsv
+#   6) 若 config.gsea.enable = TRUE，则对每个 RNA label 运行 GSEA（GO + KEGG）；
 #   7) 汇总所有 label 的 ORA + GSEA 显著条目数，写出 results/08_enrich/summary.tsv。
+#
+# 本版新增：对 go/obsolete_map.tsv 做更稳健处理：
+#   - 文件不存在：跳过 obsolete 替换，直接使用 gene2go；
+#   - 文件存在但为空 / 列类型非字符：打 WARNING，跳过替换；
+#   - 只有在文件存在、非空且列名完整时才尝试进行 obsolete 替换。
 
 suppressPackageStartupMessages({
   library(yaml)
@@ -257,14 +259,12 @@ kegg_term2name_fp <- file.path(annot_dir, "kegg", "term2name.tsv")
 if (!file.exists(gene2go_fp))        stop_with("缺少 gene2go.tsv：", gene2go_fp)
 if (!file.exists(gene2pathway_fp))   stop_with("缺少 gene2pathway.tsv：", gene2pathway_fp)
 if (!file.exists(go_term2name_fp))   stop_with("缺少 go/term2name.tsv：", go_term2name_fp)
-if (!file.exists(go_obsolete_fp))    stop_with("缺少 go/obsolete_map.tsv：", go_obsolete_fp)
 if (!file.exists(kegg_term2gene_fp)) stop_with("缺少 kegg/term2gene.tsv：", kegg_term2gene_fp)
 if (!file.exists(kegg_term2name_fp)) stop_with("缺少 kegg/term2name.tsv：", kegg_term2name_fp)
 
 gene2go        <- data.table::fread(gene2go_fp, sep = "\t", header = TRUE)
 gene2pathway   <- data.table::fread(gene2pathway_fp, sep = "\t", header = TRUE)
 go_term2name   <- data.table::fread(go_term2name_fp, sep = "\t", header = TRUE)
-go_obsolete    <- data.table::fread(go_obsolete_fp, sep = "\t", header = TRUE)
 kegg_term2gene <- data.table::fread(kegg_term2gene_fp, sep = "\t", header = TRUE)
 kegg_term2name <- data.table::fread(kegg_term2name_fp, sep = "\t", header = TRUE)
 
@@ -308,44 +308,62 @@ gsea_padj_method <- gsea_cfg$p_adjust_method %||% "BH"
 gsea_fdr <- gsea_cfg$fdr %||% 0.25
 gsea_ontologies <- gsea_cfg$ontologies
 if (is.null(gsea_ontologies)) {
-  gsea_ontologies <- c("BP")  # 默认只看 BP
+  gsea_ontologies <- c("BP")
 }
 
-# GO obsolete 处理
-if (!all(c("old_go_id", "action", "new_go_id") %in% colnames(go_obsolete))) {
-  log_msg("WARNING", "go/obsolete_map.tsv 列不完整，将不进行 obsolete 替换。")
+# ---------- 安全处理 obsolete_map.tsv，生成 gene2go_clean ---------- #
+
+if (!file.exists(go_obsolete_fp)) {
+  log_msg("WARNING", "未找到 go/obsolete_map.tsv，将跳过 obsolete GO term 处理，直接使用 gene2go。")
   gene2go_clean <- gene2go
 } else {
-  obsolete_map <- go_obsolete
-  colnames(obsolete_map) <- c("old", "action", "new")
+  go_obsolete <- data.table::fread(go_obsolete_fp, sep = "\t", header = TRUE)
+  if (nrow(go_obsolete) == 0L) {
+    log_msg("WARNING", "go/obsolete_map.tsv 为空，将跳过 obsolete GO term 处理，直接使用 gene2go。")
+    gene2go_clean <- gene2go
+  } else if (!all(c("old_go_id", "action", "new_go_id") %in% colnames(go_obsolete))) {
+    log_msg("WARNING", "go/obsolete_map.tsv 列名不完整（需 old_go_id/action/new_go_id），将跳过 obsolete 处理，直接使用 gene2go。")
+    gene2go_clean <- gene2go
+  } else {
+    obsolete_map <- copy(go_obsolete)
+    setnames(obsolete_map, c("old_go_id", "action", "new_go_id"),
+             c("old", "action", "new"))
+    # 将关键列强制转为字符，避免出现 logical 类型
+    obsolete_map[, old := as.character(old)]
+    obsolete_map[, action := as.character(action)]
+    obsolete_map[, new := as.character(new)]
 
-  gene2go_clean <- gene2go[, .(gene_id, go_id)]
-  gene2go_clean <- merge(
-    gene2go_clean,
-    obsolete_map,
-    by.x = "go_id",
-    by.y = "old",
-    all.x = TRUE
-  )
-  gene2go_clean[, final_go := go_id]
+    gene2go_clean <- gene2go[, .(gene_id, go_id)]
+    gene2go_clean[, go_id := as.character(go_id)]
 
-  idx_replace <- !is.na(action) & action == "replace"
-  gene2go_clean[idx_replace & nzchar(new), final_go := new]
+    gene2go_clean <- merge(
+      gene2go_clean,
+      obsolete_map,
+      by.x = "go_id",
+      by.y = "old",
+      all.x = TRUE
+    )
+    gene2go_clean[, final_go := go_id]
 
-  idx_consider <- !is.na(action) & action == "consider"
-  if (go_obsolete_policy == "replace_or_consider") {
-    gene2go_clean[idx_consider & nzchar(new), final_go := new]
+    idx_replace <- !is.na(action) & action == "replace"
+    gene2go_clean[idx_replace & nzchar(new), final_go := new]
+
+    idx_consider <- !is.na(action) & action == "consider"
+    if (go_obsolete_policy == "replace_or_consider") {
+      gene2go_clean[idx_consider & nzchar(new), final_go := new]
+    }
+
+    idx_remove <- !is.na(action) & action == "remove"
+    gene2go_clean <- gene2go_clean[!idx_remove]
+    gene2go_clean <- gene2go_clean[!is.na(final_go) & nzchar(final_go)]
+    gene2go_clean <- unique(gene2go_clean[, .(gene_id, go_id = final_go)])
+
+    log_msg("INFO", "GO obsolete 处理完成：原始行数=", nrow(gene2go),
+            "，处理后行数=", nrow(gene2go_clean))
   }
-
-  idx_remove <- !is.na(action) & action == "remove"
-  gene2go_clean <- gene2go_clean[!idx_remove]
-  gene2go_clean <- gene2go_clean[!is.na(final_go) & nzchar(final_go)]
-  gene2go_clean <- unique(gene2go_clean[, .(gene_id, go_id = final_go)])
-
-  log_msg("INFO", "GO obsolete 处理完成：原始行数=", nrow(gene2go),
-          "，处理后行数=", nrow(gene2go_clean))
 }
 
+# 接下来所有 GO 分析统一使用 gene2go_clean
 go_term2gene <- gene2go_clean[, .(go_id, gene_id)]
 colnames(go_term2gene) <- c("term_id", "gene_id")
 colnames(go_term2name) <- c("term_id", "term_name")
@@ -354,7 +372,7 @@ kegg_term2gene2 <- kegg_term2gene[, .(pathway_id, gene_id)]
 colnames(kegg_term2gene2) <- c("term_id", "gene_id")
 colnames(kegg_term2name) <- c("term_id", "term_name")
 
-# GO ontology 从 GO.db 查（term2name 本身没有 ontology 列）
+# GO ontology 从 GO.db 查
 go_ids_all <- unique(go_term2name$term_id)
 ont_df <- AnnotationDbi::select(
   GO.db,
@@ -368,7 +386,7 @@ go_ontology_map <- ont_df$ontology
 names(go_ontology_map) <- ont_df$term_id
 
 # GO / KEGG 的 gene 宇宙
-go_gene_universe <- unique(go_term2gene$gene_id)
+go_gene_universe   <- unique(go_term2gene$gene_id)
 kegg_gene_universe <- unique(kegg_term2gene2$gene_id)
 
 #------------------------- 主循环：按 label 处理 ORA + GSEA -------------------------#
@@ -380,7 +398,6 @@ for (lb in labels_unique) {
   tasks_lb <- tasks[label == lb]
   log_msg("INFO", "开始处理 label=", lb, "，任务数=", nrow(tasks_lb))
 
-  # meta 信息（背景）
   meta_path <- unique(tasks_lb$universe_meta)
   if (length(meta_path) != 1L) {
     log_msg("WARNING", "label=", lb, " 的 universe_meta 不唯一，将使用第一项：", meta_path[1])
@@ -425,8 +442,7 @@ for (lb in labels_unique) {
     test_go        <- intersect(test_genes, universe_go)
     test_kegg      <- intersect(test_genes, universe_kegg)
 
-    # universe_size：优先 meta，其次实际 universe
-    universe_size_go <- if (!is.na(universe_size_meta)) universe_size_meta else length(universe_go)
+    universe_size_go   <- if (!is.na(universe_size_meta)) universe_size_meta else length(universe_go)
     universe_size_kegg <- if (!is.na(universe_size_meta)) universe_size_meta else length(universe_kegg)
 
     # ---- GO ORA ----
@@ -451,9 +467,7 @@ for (lb in labels_unique) {
       )
       if (!is.null(eg) && nrow(as.data.frame(eg)) > 0L) {
         df <- as.data.table(as.data.frame(eg))
-        # 添加 ontology 信息
         df[, ontology := go_ontology_map[as.character(ID)]]
-        # 按本体拆分并重新做 BH
         for (ont in c("BP", "CC", "MF")) {
           sub <- df[ontology == ont]
           if (nrow(sub) == 0L) {
@@ -480,7 +494,6 @@ for (lb in labels_unique) {
           }
         }
       } else {
-        # 无结果
         for (ont in c("BP", "CC", "MF")) {
           go_res_list[[ont]] <- format_go_sub(
             dt_sub        = NULL,
@@ -494,7 +507,6 @@ for (lb in labels_unique) {
         }
       }
     } else {
-      # 样本太少或 universe 太小，直接空表
       for (ont in c("BP", "CC", "MF")) {
         go_res_list[[ont]] <- format_go_sub(
           dt_sub        = NULL,
@@ -508,7 +520,6 @@ for (lb in labels_unique) {
       }
     }
 
-    # 写 GO by-term
     for (ont in c("BP", "CC", "MF")) {
       out_fp <- file.path(outdir, sprintf("GO_%s_by_term_%s.tsv", ont, test_set))
       data.table::fwrite(go_res_list[[ont]], file = out_fp, sep = "\t",
@@ -571,7 +582,7 @@ for (lb in labels_unique) {
     kegg_out_fp <- file.path(outdir, sprintf("KEGG_by_term_%s.tsv", test_set))
     data.table::fwrite(kegg_res, file = kegg_out_fp, sep = "\t",
                        quote = FALSE, na = "NA")
-  } # end for tasks_lb (各 test_set)
+  }
 
   # -------- 生成 GO_sig_all/up/down（按 label） --------
   outdir_label <- tasks_lb$outdir[1]
@@ -623,7 +634,6 @@ for (lb in labels_unique) {
   }
 
   # -------- ORA 显著数统计（summary 用） --------
-  # GO_sig_*
   go_sig_all_n <- 0L
   go_sig_up_n <- 0L
   go_sig_down_n <- 0L
@@ -638,7 +648,6 @@ for (lb in labels_unique) {
     }
   }
 
-  # KEGG：对 all/up/down 的 by-term 表中 p_adjust<=FDR 的条目数
   kegg_sig_all_n <- 0L
   kegg_sig_up_n  <- 0L
   kegg_sig_down_n<- 0L
@@ -653,7 +662,7 @@ for (lb in labels_unique) {
     if (set_name == "down")kegg_sig_down_n<- n_sig
   }
 
-  # -------- GSEA：若开启且为 RNA label，则执行 --------
+  # -------- GSEA：若开启且为 RNA label --------
   go_gsea_sig_n <- NA_integer_
   kegg_gsea_sig_n <- NA_integer_
 
@@ -671,13 +680,11 @@ for (lb in labels_unique) {
         ranks_dt <- ranks_dt[!is.na(score)]
         ranks_dt <- ranks_dt[!is.na(gene_id) & nzchar(gene_id)]
         if (nrow(ranks_dt) >= 2L) {
-          # 构建 geneList（按 score 降序）
           ranks_dt <- ranks_dt[order(-score)]
           geneList <- ranks_dt$score
           names(geneList) <- ranks_dt$gene_id
 
           # ---- GSEA-GO ----
-          go_gsea_res <- NULL
           go_gsea_sig_n <- NA_integer_
           if (length(intersect(names(geneList), go_gene_universe)) >= gsea_minGS) {
             go_gsea <- tryCatch(
@@ -698,16 +705,13 @@ for (lb in labels_unique) {
             )
             if (!is.null(go_gsea) && nrow(as.data.frame(go_gsea)) > 0L) {
               dt <- as.data.table(as.data.frame(go_gsea))
-              # 添加 ontology
               dt[, ontology := go_ontology_map[as.character(ID)]]
               dt <- dt[ontology %in% gsea_ontologies]
               if (nrow(dt) > 0L) {
-                # qvalues 列名在 GSEA 中一般叫 "qvalues"
                 if (!"qvalues" %in% colnames(dt)) {
                   dt[, qvalues := p.adjust(p.adjust, method = "BH")]
                 }
                 go_gsea_sig_n <- nrow(dt[qvalues <= gsea_fdr])
-                # 格式化输出
                 go_gsea_out <- data.table(
                   term_id          = dt$ID,
                   term_name        = dt$Description,
@@ -749,7 +753,6 @@ for (lb in labels_unique) {
           }
 
           # ---- GSEA-KEGG ----
-          kegg_gsea_res <- NULL
           kegg_gsea_sig_n <- NA_integer_
           if (length(intersect(names(geneList), kegg_gene_universe)) >= gsea_minGS) {
             kegg_gsea <- tryCatch(
@@ -815,8 +818,6 @@ for (lb in labels_unique) {
             }
           }
 
-          go_gsea_sig_n <- go_gsea_sig_n
-          kegg_gsea_sig_n <- kegg_gsea_sig_n
         } else {
           log_msg("WARNING", "label=", lb, " 的 GSEA 排名有效行数不足，跳过 GSEA。")
         }
@@ -824,7 +825,6 @@ for (lb in labels_unique) {
     }
   }
 
-  # -------- 写 summary 行 --------
   n_deg_all_lb <- as.character(tasks_lb$n_deg_all[1])
 
   summary_rows[[lb]] <- data.table(
