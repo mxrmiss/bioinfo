@@ -29,26 +29,9 @@ ALLOWED_DB_PREFIXES: Set[str] = {
     "bbs","bbm","gim","gi","tpg","tpe","tpd","tpa","gnl"
 }
 _DB_PREFIXES_REGEX = r"(?:lcl|gb|emb|dbj|ref|sp|tr|pir|prf|pdb|pat|pgp|bbs|bbm|gim|gi|tpg|tpe|tpd|tpa|gnl)"
-# =====================================================================
 
-# ---------- 物种名规范化（与上游保持一致） ----------
-def canon_species(sp_raw: str, alias_map: Optional[Dict[str, str]] = None) -> str:
-    s = sp_raw.strip()
-    for _ in range(3):
-        toks = s.split('_')
-        if len(toks) % 2 != 0 or not toks:
-            break
-        half = len(toks)//2
-        left = '_'.join(toks[:half]); right = '_'.join(toks[half:])
-        if left == right and left:
-            s = left
-        else:
-            break
-    if alias_map:
-        s = alias_map.get(s, s)
-    return s
+# =======================
 
-# ---------- 常用工具 ----------
 def load_cfg(cfg_path: str = "config.yaml") -> dict:
     with open(cfg_path, "r", encoding="utf-8") as f:
         return yaml.safe_load(f) or {}
@@ -66,28 +49,52 @@ def copy_if_exists(src: Path, dst: Path):
         dst.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(src, dst)
 
+def canon_species(s: str, alias_map: Dict[str,str]) -> str:
+    """物种名统一：strip + alias 映射 + 防止“重复物种名拼接”"""
+    s = s.strip()
+    if not s:
+        return s
+    # 防御性：处理 "Sinonovacula_constricta_Sinonovacula_constricta" 这种偶然重复
+    for _ in range(3):
+        toks = s.split('_')
+        if len(toks) % 2 != 0 or not toks:
+            break
+        half = len(toks)//2
+        left = '_'.join(toks[:half]); right = '_'.join(toks[half:])
+        if left == right and left:
+            s = left
+        else:
+            break
+    if alias_map:
+        s = alias_map.get(s, s)
+    return s
+
+# ---------- 常用工具 ----------
+def load_yaml(path: Path) -> dict:
+    with open(path, "r", encoding="utf-8") as f:
+        return yaml.safe_load(f) or {}
+
 def read_results_anchor(of_root: Path) -> Path:
+    """
+    根据 RESULTS_DIR.txt 或唯一的 Results_* 子目录，确定 Orthofinder 结果目录。
+    优先读取 RESULTS_DIR.txt；否则在 of_root 下寻找唯一 Results_* 目录。
+    """
     anchor = of_root / "RESULTS_DIR.txt"
     if anchor.is_file():
         txt = anchor.read_text(encoding="utf-8").strip()
         p = Path(txt)
         if p.is_dir():
             return p
-    cand = sorted(of_root.glob("Results_*"))
-    if len(cand) == 1 and cand[0].is_dir():
-        return cand[0]
-    raise FileNotFoundError("[ERR] 无法确定唯一的 Orthofinder Results_* 目录；请检查 RESULTS_DIR.txt 或目录结构")
 
-def load_kept_ogs_from_filelist(sco_filelist: Path) -> List[Path]:
-    files: List[Path] = []
-    with open(sco_filelist, "r", encoding="utf-8") as f:
-        for line in f:
-            s = line.strip()
-            if s and not s.startswith("#"):
-                files.append(Path(s))
-    if not files:
-        raise RuntimeError("[ERR] sco_filelist.txt 中没有任何条目")
-    return files
+    cand = sorted(of_root.glob("Results_*"))
+    cand = [c for c in cand if c.is_dir()]
+    if len(cand) == 1:
+        return cand[0]
+
+    raise FileNotFoundError(
+        "[ERR] 无法确定唯一的 OrthoFinder 结果目录："
+        "既没有有效的 RESULTS_DIR.txt，也没有唯一一个 Results_* 目录"
+    )
 
 def og_id_from_name(name: str) -> str:
     m = re.match(r"^(OG\d+)", name)
@@ -111,25 +118,32 @@ def parse_newick_tips(nwk_text: str) -> List[str]:
 
     def commit():
         nonlocal token, prev_delim, tips
-        if not token: return
+        if not token:
+            return
         s = "".join(token).strip()
         token.clear()
-        if not s: return
-        if re.fullmatch(r"[\d.]+(?:/[\d.]+)?", s): return   # 纯数字 / 数字/数字
-        if prev_delim in (")", ":"): return                # 内部节点/分支长度
+        if not s:
+            return
+        # 内部节点名或支持值通常紧跟在 ')' 或 ':' 之后；叶节点则出现在 '(' 或 ',' 之后
+        if prev_delim in (")", ":"):
+            # 可能是内部节点名或支持值（纯数字 / 数字/数字）
+            if re.fullmatch(r"[\d.]+(?:/[\d.]+)?", s):
+                return
         tips.append(s)
 
     for ch in nwk_text:
         if in_quote:
             if ch == "'":
-                in_quote = False; commit()
+                in_quote = False
+                commit()
             else:
                 token.append(ch)
         else:
             if ch == "'":
                 in_quote = True
-            elif ch in ("(", ")", ",", ":", ";"):
-                commit(); prev_delim = ch
+            elif ch in "(),:;":
+                commit()
+                prev_delim = ch
             elif ch.isspace():
                 commit()
             else:
@@ -137,7 +151,7 @@ def parse_newick_tips(nwk_text: str) -> List[str]:
     commit()
     return sorted(set(tips))
 
-# ---------- SeqID 归一化与前缀检测 ----------
+# ---------- SeqID 归一化 & 数据库前缀剥离 ----------
 def _strip_dbprefix(s: str) -> str:
     return re.sub(rf"^{_DB_PREFIXES_REGEX}\|", "", s)
 
@@ -149,6 +163,7 @@ def _norm_first_token(s: str) -> str:
 def _norm_for_match(h: str) -> str:
     return _norm_first_token(_strip_dbprefix(h.strip()))
 
+# ---------- 前缀白名单检测 ----------
 def _detect_unknown_db_prefixes(peps_tsv: Path, cds_dir: Path, cds_suffix: str, extra: Set[str]) -> None:
     allow = set(ALLOWED_DB_PREFIXES) | set(extra or set())
     seen: Dict[str, List[str]] = {}
@@ -165,15 +180,17 @@ def _detect_unknown_db_prefixes(peps_tsv: Path, cds_dir: Path, cds_suffix: str, 
         with open(peps_tsv, "r", encoding="utf-8") as f:
             reader = csv.reader(f, delimiter="\t")
             header = next(reader, [])
-            lower = [x.lower() for x in header]
-            i_pid = lower.index("protein_id") if "protein_id" in lower else (1 if len(header) > 1 else -1)
-            i_cds = lower.index("cds_id")     if "cds_id"     in lower else (2 if len(header) > 2 else -1)
-            for row in reader:
-                if not row: continue
-                if 0 <= i_pid < len(row): collect(row[i_pid], "pep2cds.protein_id")
-                if 0 <= i_cds < len(row): collect(row[i_cds], "pep2cds.cds_id")
+            try:
+                i_pid = [x.lower() for x in header].index("protein_id")
+            except ValueError:
+                i_pid = 1 if len(header) > 1 else -1
+            if i_pid >= 0:
+                for row in reader:
+                    if not row:
+                        continue
+                    collect(row[i_pid], "pep2cds.tsv:protein_id")
 
-    # CDS FASTA（取每个物种一个示例）
+    # CDS FASTA 头（每个物种抽一个）
     for fa in sorted(Path(cds_dir).glob(f"*{cds_suffix}")):
         try:
             with open(fa, "r", encoding="utf-8", errors="ignore") as f:
@@ -185,14 +202,17 @@ def _detect_unknown_db_prefixes(peps_tsv: Path, cds_dir: Path, cds_suffix: str, 
             continue
 
     if seen:
-        msg = ["[ERR] 发现未知的数据库前缀（形如 'xxx|' 开头）。为避免静默错配，发布终止。"]
-        msg.append(f"[INFO] 白名单={sorted(allow)}；可在 config.publish.db_prefix_allowlist 扩展。")
-        for k, ex in seen.items():
-            msg.append(f"  - 前缀 '{k}|' 示例：")
-            for s in ex: msg.append(f"      {s}")
-        raise RuntimeError("\n".join(msg))
+        lines = [
+            "[ERR] 发现未知的数据库前缀（形如 'xxx|' 开头），为避免静默错配，发布终止。",
+            f"[INFO] 允许前缀白名单 = {sorted(allow)}；可在 config.publish.db_prefix_allowlist 扩展。"
+        ]
+        for pref, samples in seen.items():
+            lines.append(f"[HINT] 前缀 '{pref}|' 的示例：")
+            for s in samples:
+                lines.append(f"       {s}")
+        raise RuntimeError("\n".join(lines))
 
-# ---------- pep2cds 读取：为 protein_id 生成稳健候选键 ----------
+# ---------- pep2cds 全局映射 ----------
 def read_pep2cds_global(tsv: Path, alias_map: Dict[str, str]) -> Dict[Tuple[str,str], str]:
     mp: Dict[Tuple[str,str], str] = {}
 
@@ -209,7 +229,7 @@ def read_pep2cds_global(tsv: Path, alias_map: Dict[str, str]) -> Dict[Tuple[str,
         pid_base_u = pid_base.replace("|", "_")
         mp.setdefault((sp, pid_base_u), cds)
         mp.setdefault((sp, re.sub(r"_+", "_", pid_base_u)), cds)
-        # 最后一段 tail
+        # 尾段 tail
         if "|" in pid:
             tail = pid.rsplit("|", 1)[-1]
             mp.setdefault((sp, tail), cds)
@@ -217,6 +237,7 @@ def read_pep2cds_global(tsv: Path, alias_map: Dict[str, str]) -> Dict[Tuple[str,
             mp.setdefault((sp, tail_u), cds)
             mp.setdefault((sp, re.sub(r"_+", "_", tail_u)), cds)
 
+    need_file(tsv, "pep2cds 汇总表缺失")
     with open(tsv, "r", encoding="utf-8") as f:
         reader = csv.reader(f, delimiter="\t")
         header = next(reader, [])
@@ -241,6 +262,77 @@ def read_pep2cds_global(tsv: Path, alias_map: Dict[str, str]) -> Dict[Tuple[str,
     if not mp:
         raise RuntimeError(f"[ERR] 映射为空：{tsv}")
     return mp
+
+# ---------- Orthogroups 成员解析（用于 CAFE 全量家族映射） ----------
+def _sanitize_id_contract(x: str) -> str:
+    """
+    与 extract_longest_from_gff.py 中保持一致的 ID “合同化清洗”规则：
+    - 保留竖线 '|'（例如 gnl|WGS_AMQN|CAPTEDRAFT... 依然合法）
+    - 仅允许 [A-Za-z0-9._:-|]，其它字符替换为 '_'
+    - 去首尾空白
+    """
+    return re.sub(r"[^A-Za-z0-9._:\-\|]", "_", x.strip())
+
+
+def parse_orthogroups_members(tsv: Path,
+                              alias_map: Dict[str, str]) -> List[Tuple[str, str, str]]:
+    """
+    解析 OrthoFinder 的 Orthogroups.tsv：
+
+    输入表典型结构：
+        Orthogroup  SpeciesA  SpeciesB  ...
+        OG0000001   id1,id2   id3      ...
+
+    返回：
+        List[(OG, Species, protein_id)]
+
+    约束与约定：
+      - Species 列名按 alias_map 规范化；
+      - 每个单元格内允许以逗号/空格分隔多个蛋白；
+      - protein_id 取去除“Species|”前缀后的部分，
+        再应用 _sanitize_id_contract，与 pep2cds.tsv 的 protein_id 保持同一规范。
+    """
+    need_file(tsv, "Orthofinder Orthogroups.tsv 缺失")
+    triplets: List[Tuple[str, str, str]] = []
+
+    with open(tsv, "r", encoding="utf-8") as f:
+        reader = csv.reader(f, delimiter="\t")
+        header = next(reader, [])
+        if not header or header[0] != "Orthogroup":
+            raise RuntimeError(f"[ERR] Orthogroups.tsv 首列应为 Orthogroup：{tsv}")
+
+        species_cols = header[1:]
+        if not species_cols:
+            raise RuntimeError(f"[ERR] Orthogroups.tsv 中缺少物种列：{tsv}")
+
+        for row in reader:
+            if not row or not row[0].strip():
+                continue
+            og = row[0].strip()
+            # 遍历每个物种列
+            for idx_col, sp_raw in enumerate(species_cols, start=1):
+                if idx_col >= len(row):
+                    continue
+                cell = row[idx_col].strip()
+                if not cell:
+                    continue
+                sp = canon_species(sp_raw, alias_map)
+                # 拆分多个蛋白 ID（以逗号和空白符为分隔）
+                for token in re.split(r"[;,\s]+", cell):
+                    token = token.strip()
+                    if not token:
+                        continue
+                    # 去掉可能存在的 Species| 前缀，仅保留 SeqID 部分
+                    if "|" in token:
+                        _, seqid = token.split("|", 1)
+                    else:
+                        seqid = token
+                    seqid = _sanitize_id_contract(seqid)
+                    triplets.append((og, sp, seqid))
+
+    if not triplets:
+        raise RuntimeError(f"[ERR] 从 Orthogroups.tsv 未解析到任何 OG×物种×蛋白条目：{tsv}")
+    return triplets
 
 # ---------- FASTA 索引：同时按“整行 header”与“首 token”建键，并生成规范化别名 ----------
 class FastaIndex:
@@ -267,46 +359,67 @@ class FastaIndex:
         name: Optional[str] = None
         with open(path, "r", encoding="utf-8", errors="ignore") as f:
             for line in f:
-                if not line: continue
                 if line.startswith(">"):
-                    full = line[1:].strip()
-                    self.full_to_full[full] = full
-
-                    tok = self._first_token(full)
-                    # 主键
-                    self._put_key(tok, full)
-                    # 规范化与派生键
-                    base = _norm_for_match(tok)
-                    self._put_key(base, full)
-                    self._put_key(tok.replace("|","_"), full)
-                    self._put_key(re.sub(r"_+", "_", tok.replace("|","_")), full)
-                    self._put_key(base.replace("|","_"), full)
-                    self._put_key(re.sub(r"_+", "_", base.replace("|","_")), full)
-                    if "|" in tok:
-                        tail = tok.rsplit("|", 1)[-1]
-                        self._put_key(tail, full)
-                        self._put_key(re.sub(r"_+", "_", tail.replace("|","_")), full)
+                    name = line[1:].rstrip("\n")
+                    self.full_to_full[name] = name
+                    tok = self._first_token(name)
+                    if tok:
+                        base = _norm_for_match(tok)
+                        self._put_key(tok, name)
+                        self._put_key(base, name)
+                        # '|'→'_' 派生键
+                        for k in (tok, base):
+                            if not k:
+                                continue
+                            u = k.replace("|", "_")
+                            self._put_key(u, name)
+                            self._put_key(re.sub(r"_+", "_", u), name)
+                        # 尾段 tail
+                        if "|" in tok:
+                            tail = tok.rsplit("|", 1)[-1]
+                            self._put_key(tail, name)
+                            tu = tail.replace("|", "_")
+                            self._put_key(tu, name)
+                            self._put_key(re.sub(r"_+", "_", tu), name)
+                else:
+                    continue
 
     def resolve(self, cds_id: str) -> Optional[str]:
-        # 1) 精确等于某条“整行 header”
-        if cds_id in self.full_to_full:
-            return cds_id
-        # 2) 用候选键在 key_to_full 命中
         s = cds_id.strip()
+        if not s:
+            return None
+
+        # 1) 完全等于某条整行 header
+        if s in self.full_to_full:
+            return s
+
+        # 2) 尝试多种 token 别名
         cand: List[str] = []
+
         def add(x: str):
-            if x and x not in cand: cand.append(x)
+            if x and x not in cand:
+                cand.append(x)
+
         add(self._first_token(s))
         base = _norm_for_match(s)
         add(self._first_token(base))
-        add(s.replace("|","_")); add(re.sub(r"_+", "_", s.replace("|","_")))
-        add(base.replace("|","_")); add(re.sub(r"_+", "_", base.replace("|","_")))
+        for k in (s, base):
+            if not k:
+                continue
+            u = k.replace("|", "_")
+            add(u)
+            add(re.sub(r"_+", "_", u))
         if "|" in s:
-            tail = s.rsplit("|",1)[-1]
-            add(tail); add(re.sub(r"_+", "_", tail.replace("|","_")))
+            tail = s.rsplit("|", 1)[-1]
+            add(tail)
+            tu = tail.replace("|", "_")
+            add(tu)
+            add(re.sub(r"_+", "_", tu))
+
         for k in cand:
             full = self.key_to_full.get(k)
-            if full: return full
+            if full:
+                return full
         return None
 
 # ---------- 掩码：只接受 AA 位串 ----------
@@ -354,25 +467,15 @@ def main():
     species_tree = trees_dir / "species_tree.nwk"
 
     # CDS 仓库
-    cds_dir = (
-        Path(cfg.get("inputs", {}).get("cds_dir", "")) if "inputs" in cfg and "cds_dir" in cfg["inputs"]
-        else Path(P.get("cds_dir", "")) if "cds_dir" in P
-        else Path(DEFAULT_CDS_DIR)
-    )
-    cds_suffix = cfg.get("inputs", {}).get("cds_suffix", DEFAULT_CDS_SUFFIX)
-
-    # 存在性检查
-    need_file(ogs_selected, "严格 SCO 列表缺失")
-    need_file(sco_filelist, "SCO 文件清单缺失")
-    need_file(og_species_protein, "OG×Species×SeqID 对照缺失")
-    need_file(species_tree, "物种树缺失")
-    need_dir(species_only_dir, "species-only 目录缺失")
-    need_dir(cds_dir, "CDS 仓库缺失")
+    cds_dir = Path(cfg.get("input", {}).get("cds_dir", DEFAULT_CDS_DIR))
+    cds_suffix = cfg.get("input", {}).get("cds_suffix", DEFAULT_CDS_SUFFIX)
 
     # OrthoFinder 与 family.tsv
     of_results_dir = read_results_anchor(of_root)
     gene_count_src = of_results_dir / "Orthogroups" / "Orthogroups.GeneCount.tsv"
     need_file(gene_count_src, "OrthoFinder GeneCount 缺失")
+    orthogroups_src = of_results_dir / "Orthogroups" / "Orthogroups.tsv"
+    need_file(orthogroups_src, "OrthoFinder Orthogroups.tsv 缺失")
 
     # 物种叶集合
     leaves = set(parse_newick_tips(Path(species_tree).read_text(encoding="utf-8")))
@@ -389,11 +492,23 @@ def main():
         shutil.rmtree(pub)
     pub.mkdir(parents=True, exist_ok=True)
 
-    # ---------- A) 严格筛选 MSA ----------
-    cand_files: List[Path] = load_kept_ogs_from_filelist(sco_filelist)
+    # ---------- A) 严格 SCO MSA 发布 ----------
+    def load_kept_ogs_from_filelist(filelist: Path) -> List[Path]:
+        files: List[Path] = []
+        with open(filelist, "r", encoding="utf-8") as f:
+            for line in f:
+                s = line.strip()
+                if s:
+                    files.append(Path(s))
+        if not files:
+            raise RuntimeError(f"[ERR] sco_filelist.txt 为空：{filelist}")
+        return files
+
+    cand_files = load_kept_ogs_from_filelist(sco_filelist)
+
     kept_files: List[Path] = []
-    kept_ogs:   List[str]  = []
-    excluded:   List[Tuple[str,str]] = []
+    kept_ogs: List[str] = []
+    excluded: List[Tuple[str,str]] = []
 
     for raw_path in cand_files:
         p = raw_path if raw_path.is_file() else (species_only_dir / raw_path.name)
@@ -415,21 +530,18 @@ def main():
         shutil.copy2(src, sco_dir / src.name)
 
     # ---------- B) colmask（可无；若存在必须是 AA 位串且长度=AA） ----------
-    pub_colmask = pub / "colmask"
-    pub_colmask.mkdir(parents=True, exist_ok=True)
+    pub_colmask = pub / "colmask"; pub_colmask.mkdir(parents=True, exist_ok=True)
     mask_checked = 0
     if colmask_dir.is_dir():
         for ogid in kept_ogs:
             aa_path = sco_dir / f"{ogid}.trim.faa"
             mask_src = colmask_dir / f"{ogid}.colmask"
             if not mask_src.is_file():
-                # 允许缺失（不强制）
                 continue
             L = _aa_length_from_faa(aa_path)
             bits = _read_mask_bits_strict(mask_src)
             if len(bits) != L:
                 raise RuntimeError(f"[ERR] 掩码长度 != AA 列数：{mask_src}（mask={len(bits)} vs AA={L}）")
-            # 合规即复制
             shutil.copy2(mask_src, pub_colmask / mask_src.name)
             mask_checked += 1
 
@@ -443,7 +555,8 @@ def main():
 
     include_ultra = bool(cfg.get("publish", {}).get("include_ultrametric_tree", False))
     if include_ultra:
-        ultra_path = Path(P.get("ultrametric_tree", "")) if isinstance(P.get("ultrametric_tree", ""), str) else None
+        ultra_path_cfg = P.get("ultrametric_tree", "")
+        ultra_path = Path(ultra_path_cfg) if isinstance(ultra_path_cfg, str) and ultra_path_cfg else None
         if ultra_path and ultra_path.is_file():
             shutil.copy2(ultra_path, pub / "species_tree_ultrametric.nwk")
 
@@ -490,7 +603,7 @@ def main():
         return idx
 
     out_resolved = pub / "pep2cds_resolved.tsv"
-    unresolved = []
+    unresolved: List[Tuple[str,str,str,str]] = []
     n_out = 0
     keep_set = set(kept_ogs)
 
@@ -535,6 +648,35 @@ def main():
                 f"建议：检查该物种的 CDS 头写法与 pep2cds.tsv 的一致性，或在 config.publish.db_prefix_allowlist 扩展允许的数据库前缀。"
             )
 
+    # ---------- E2) all_pep2cds_resolved.tsv（全 OG，用于 CAFE 扩张/收缩分析） ----------
+    og_sp_pid_all_members = parse_orthogroups_members(orthogroups_src, alias_map)
+    all_out = pub / "all_pep2cds_resolved.tsv"
+    n_all_out = 0
+    with open(all_out, "w", encoding="utf-8", newline="") as w_all:
+        writer_all = csv.writer(w_all, delimiter="\t")
+        writer_all.writerow(["OG", "Species", "protein_id", "cds_id"])
+        for og, sp, pid in og_sp_pid_all_members:
+            # protein → cds 原始映射（多候选；不对缺失条目强制报错，仅跳过）
+            cds = None
+            for x in (pid, _norm_for_match(pid), pid.rsplit("|",1)[-1] if "|" in pid else None):
+                if not x:
+                    continue
+                cds = (sp_pid_to_cds.get((sp, x)) or
+                       sp_pid_to_cds.get((sp, x.replace("|","_"))) or
+                       sp_pid_to_cds.get((sp, re.sub(r"_+", "_", x.replace("|","_")))))
+                if cds:
+                    break
+            if cds is None:
+                continue
+
+            idx = cds_index_for(sp)
+            real_hdr = idx.resolve(cds)
+            if real_hdr is None:
+                continue
+
+            writer_all.writerow([og, sp, pid, real_hdr])
+            n_all_out += 1
+
     # ---------- F) 报告 ----------
     manifest = {
         "publish_dir": str(pub),
@@ -551,6 +693,8 @@ def main():
         "pep2cds_resolved": str(out_resolved),
         "pep2cds_resolved_lines": n_out,
         "pep2cds_unresolved_count": n_unres,
+        "all_pep2cds_resolved": str(all_out),
+        "all_pep2cds_resolved_lines": n_all_out,
         "excluded_count": len(excluded),
         "cds_dir": str(cds_dir),
         "cds_suffix": cds_suffix,
@@ -568,6 +712,7 @@ def main():
         f.write(f"[INFO] ogs_selected.list 是否存在：{(pub / 'ogs_selected.list').is_file()}\n")
         f.write(f"[INFO] sco_filelist.txt 是否存在：{(pub / 'sco_filelist.txt').is_file()}\n")
         f.write(f"[INFO] pep2cds_resolved.tsv 行数：{n_out}\n")
+        f.write(f"[INFO] all_pep2cds_resolved.tsv 行数：{n_all_out}\n")
         f.write(f"[INFO] colmask（AA 位串）严格校验通过：{mask_checked} 个\n")
         if excluded:
             f.write(f"[WARN] 剔除 OG 数量：{len(excluded)}（详见 excluded_reason.tsv）\n")
@@ -586,11 +731,10 @@ def main():
     (pub / 'colmask' / '.done').touch()
 
     print(f"[DONE] 发布完成：{pub}")
-    print(f"[STAT] strict_sco_msa: {len(kept_files)}；pep2cds_resolved: {n_out}；unresolved: {n_unres}")
+    print(f"[STAT] strict_sco_msa: {len(kept_files)}；pep2cds_resolved: {n_out}；unresolved: {n_unres}；all_pep2cds_resolved: {n_all_out}")
     if excluded:
         print(f"[STAT] 剔除 OG: {len(excluded)} —— {pub/'excluded_reason.tsv'}")
     print(f"[STAT] colmask（AA 位串）严格校验通过：{mask_checked}")
 
 if __name__ == "__main__":
     main()
-

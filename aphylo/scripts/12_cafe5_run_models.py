@@ -204,34 +204,34 @@ def parse_high_fail_from_runlog(logfile: Path, threshold_rate: float = 0.20) -> 
 def main():
     cfg = load_config()
     paths = cfg.get("paths", {})
-    cafes = cfg.get("cafes", {})
+    cafe5 = cfg.get("cafe5", {})
     bins  = cfg.get("binaries", {})
 
     cafe_bin = str(bins.get("cafe5", "cafe5"))
-    threads  = int(cafes.get("threads", 30))
+    threads  = int(cafe5.get("threads", 30))
     # —— 改动 1：支持把 k_cycles: 0 视为 Base（不传 -k） ——
-    _raw_k = cafes.get("k_cycles", None)
+    _raw_k = cafe5.get("k_cycles", None)
     k_cycles = int(_raw_k) if str(_raw_k).strip() not in ("", "None", "none", "0") else None
-    p_alpha  = float(cafes.get("p_alpha", 0.05))
-    models   = cafes.get("models", ["global"])
+    p_alpha  = float(cafe5.get("p_alpha", 0.05))
+    models   = cafe5.get("models", ["global"])
 
     # 两阶段：large
-    two_stage = cafes.get("two_stage_large", {}) or {}
+    two_stage = cafe5.get("two_stage_large", {}) or {}
     large_enable = bool(two_stage.get("enable", True))
     large_copy_thr = int(two_stage.get("copy_threshold", 100))
 
     # 自动修正轮数（仅 primary）
-    max_autofix = int(cafes.get("max_autofix_rounds", 3))
+    max_autofix = int(cafe5.get("max_autofix_rounds", 3))
 
     # 误差模型
-    em = cafes.get("error_model", {}) or {}
+    em = cafe5.get("error_model", {}) or {}
     em_enable  = bool(em.get("enable", False))
     em_mode    = str(em.get("mode", "off")).lower()   # off|estimate|use
     em_file    = em.get("file", None)
     em_apply   = str(em.get("apply_to", "primary")).lower()  # primary|both
 
     # 归档/清理
-    archive = cafes.get("archive_on_start", False)
+    archive = cafe5.get("archive_on_start", False)
 
     # 路径
     proj_root = Path(".").resolve()

@@ -1,0 +1,4 @@
+# 化石校准点时间除以100（供mcmctree使用）
+cd ~/project/aphylo/results/06_cafe/mcmctree
+perl -0777 -pe 's{\b[bB]\(\s*([0-9]+(?:\.[0-9]+)?)\s*,\s*([0-9]+(?:\.[0-9]+)?)\s*\)}{"B(" . sprintf("%.4f",$1/100) . ", " . sprintf("%.4f",$2/100) . ")"}ge' -i species_calib.nobl.trees
+

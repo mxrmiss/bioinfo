@@ -11,7 +11,8 @@ inputs:
   sco_msa_suffix: ".trim.faa"                     # 严格使用固定后缀
   colmask_dir: "<publish_dir>/colmask"            # 可选：不提供则跳过列同步
   colmask_suffix: ".colmask"
-  pep2cds_map: "<publish_dir>/pep2cds_resolved.tsv"
+  pep2cds_map: "<publish_dir>/pep2cds_resolved.tsv"       # 严格单拷贝
+  all_members_tsv: "<publish_dir>/all_pep2cds_resolved.tsv"   # 全家族成员（多拷贝）
   species_tree: "<publish_dir>/species_tree.nwk"
   # ultrametric_tree:   "<publish_dir>/species_tree_ultrametric.nwk"   # 若由phylo的10脚本发布，则使用这个
   ultrametric_tree: "results/06_cafe/mcmctree/utree_for_cafe.nwk"
@@ -61,8 +62,8 @@ codeml:
     - name: "HighSalinity"
       tips: ["Sinonovacula_constricta"]         # 论文：高盐前景
 
-cafes:
-  threads: 30                                          # -c
+cafe5:
+  threads: 40                                          # -c
   k_cycles:                                           # -k
   p_alpha: 0.05                                        # -P
   models: ["global"]                                   # 目前只用 global
@@ -79,6 +80,27 @@ cafes:
     apply_to: "primary"                                # primary | both（只应用 primary，或 primary+large）
 
   archive_on_start: false                              # true：开跑前把旧 models/ 归档到 models_archive_时间戳
+
+  enrich_bridge:                                       # ← 新增块：13b 使用
+    enable: true                                       # false 则 13b 什么都不做直接退出
+    outputs_dir: "results/07_cafeagg/enrich_inputs"    # ORA 输入统一写到这里
+
+    # 为 CAFE 定义的一组“外部 tag”：
+    # key = tag 名（会变成 enrich_inputs/<tag>/），value = 物种列表（与 species.alias_map 里的规范名一致）
+    species_sets:
+      cafe_sc:
+        - "Sinonovacula_constricta"
+      cafe_sr:
+        - "Sinonovacula_rivularis"
+    # 可以设置两个物种的集合，看他们的基因家族扩张和收缩富集情况
+    # cafe_sc_sr:                           
+    #   - "Sinonovacula_constricta"
+    #   - "Solen_grandis"
+
+    # 可选：若不想 aphylo 去读 rnaseq 的注释，就先留 null（13b 会把 n_annot_mapped 写成 NA）
+    annotations:
+      gene2go: null                                    # 例： "../rna-seq/results/07_annot/gene2go.tsv"
+      gene2pathway: null                               # 例： "../rna-seq/results/07_annot/gene2pathway.tsv"  
 
 report:
   fdr_alpha: 0.05
