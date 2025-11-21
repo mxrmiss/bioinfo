@@ -62,6 +62,11 @@ codeml:
     - name: "HighSalinity"
       tips: ["Sinonovacula_constricta"]         # 论文：高盐前景
 
+psg:
+  enable: true               # 打开 07 内置的 PSG cds 富集输入工厂
+  fdr_alpha: 0.05            # PSG 判定用的 Q 阈值（优先级高于 report.fdr_alpha）
+  cds_inputs_dir: "psg_cds_inputs"   # 输出到 results/05_cmlagg/psg_cds_inputs/
+
 cafe5:
   threads: 40                                          # -c
   k_cycles:                                           # -k
