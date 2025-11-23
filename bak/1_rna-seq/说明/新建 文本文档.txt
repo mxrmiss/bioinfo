@@ -1,0 +1,19 @@
+准备 samples.tsv / contrasts.tsv
+
+（可选）./run_fastp_auto.sh
+
+./build_refprep.sh
+
+./run_salmon_quant.sh
+
+./build_geneMap.sh（若需要）
+
+./run_matrix_aggregate.sh（→ 产出 gene_counts.tsv）
+
+./run_deg_module.sh（→ DEG、PCA、火山图）
+
+./build_kegg_pathway_maps_local.sh（一次性）
+
+./run_enrich_module.sh（→ GO/KEGG 富集与气泡图）
+
+（可选）make_tables.py（→ 汇总大表）

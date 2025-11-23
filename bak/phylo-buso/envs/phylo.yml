@@ -1,0 +1,24 @@
+name: phylo
+channels:
+  - conda-forge
+  - bioconda
+  - defaults
+channel_priority: strict
+dependencies:
+  - python
+  - snakemake
+  # 正交 / BUSCO 相关
+  - busco
+  - augustus
+  - metaeuk
+  - orthofinder
+  - diamond
+  - seqkit
+  - gffread 
+  # 比对 / 剪切 / 拼接 / 构树
+  - mafft
+  - trimal
+  - iqtree               
+  - openjdk              
+  - astral               
+

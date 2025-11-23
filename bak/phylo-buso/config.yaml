@@ -1,0 +1,78 @@
+# 极简版 config.yaml（Snakefile 不含任何默认值，所有配置都必须在此给出）
+# =====================================================================
+# 提示：FASTA 后缀可为 .faa/.fa/.fasta，路径按你的真实数据填写。
+
+# 物种与蛋白路径（顺序即超矩阵中的物种顺序）
+species:
+  - id: M_gigas
+    type: protein
+    path: data/proteomes/M_gigas.protein.faa
+  - id: M_galloprovincialis
+    type: protein
+    path: data/proteomes/M_galloprovincialis.protein.faa
+  - id: M_yessoensis
+    type: protein
+    path: data/proteomes/M_yessoensis.protein.faa
+  - id: A_californica
+    type: protein
+    path: data/proteomes/A_californica.protein.faa
+  - id: L_sinensis
+    type: protein
+    path: data/proteomes/L_sinensis.protein.faa
+  - id: S_constricta
+    type: protein
+    path: data/proteomes/S_constricta.protein.faa   # 支持 .faa/.fasta
+  - id: T_granosa
+    type: protein
+    path: data/proteomes/T_granosa.protein.faa
+
+# 目录（全部必填）
+dirs:
+  busco: results/busco
+  loci: results/loci
+  align: results/align
+  trim: results/trim
+  concat: results/concat
+  trees: results/trees
+
+# 线程（全部必填），服务器重新设置
+threads:
+  busco: 8
+  mafft: 16
+  trimal: 8
+  iqtree_concat: 16
+  iqtree_gene: 8
+  astral: 2
+
+# BUSCO（必须为 proteins 模式）
+busco:
+  lineage: mollusca_odb10
+  mode: proteins
+  extra_args: ""
+
+# MAFFT / trimAl 参数（强参数请在这里改动）
+mafft:
+  extra_args: "--auto"
+
+trimal:
+  extra_args: "-automated1"
+
+# IQ-TREE 配置
+iqtree:
+  bin: iqtree         # 或 iqtree2(需要自己设置)
+  seed: 12345
+  extra_args_concat: "-m MFP+MERGE -B 1000 --bnni"
+  extra_args_gene: "-m MFP -bb 1000"
+
+# 拼接/分区配置
+concat:
+  mincov: 2           # 仅保留覆盖物种数 ≥ 该阈值的位点
+  line_width: 60      # FASTA 换行宽度
+  partition_model: "AA"   # partitions.txt 中写入的模型（AA）
+  sort_loci: true     # 对位点文件按文件名排序，保证分区坐标稳定
+
+# ASTRAL（可选）
+astral:
+  enable: false
+  jar_env: "ASTRAL_JAR"   # export ASTRAL_JAR=/path/to/astral.jar
+  xmx: "8g"      # 内存分配，服务器看着来
