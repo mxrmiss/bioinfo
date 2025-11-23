@@ -1,0 +1,6 @@
+#NEXUS
+BEGIN TREES;
+
+	UTREE 1 = (((Branchiostoma_floridae: 6.069289, Homo_sapiens: 6.069289) [&95%HPD={5.26927, 6.81099}]: 0.644433, ((Capitella_teleta: 5.658039, ((((((Crassostrea_ariakensis: 0.556617, Crassostrea_gigas: 0.556617) [&95%HPD={0.357673, 0.704123}]: 2.535639, Mytilus_coruscus: 3.092257) [&95%HPD={2.09354, 3.99081}]: 0.497938, (Patinopecten_yessoensis: 3.040767, Tegillarca_granosa: 3.040767) [&95%HPD={2.06333, 3.9508}]: 0.549428) [&95%HPD={2.70134, 4.38555}]: 0.631805, (Cyclina_sinensis: 2.356020, (Sinonovacula_constricta: 0.223398, Sinonovacula_rivularis: 0.223398) [&95%HPD={0.180393, 0.254469}]: 2.132622) [&95%HPD={1.22074, 3.51551}]: 1.865980) [&95%HPD={3.5268, 4.84673}]: 0.494092, Pomacea_canaliculata: 4.716091) [&95%HPD={4.25038, 5.24059}]: 0.284733, Nautilus_pompilius: 5.000825) [&95%HPD={4.74657, 5.39379}]: 0.657215) [&95%HPD={5.1514, 6.18806}]: 0.635114, Drosophila_melanogaster: 6.293154) [&95%HPD={5.74702, 6.74676}]: 0.420569) [&95%HPD={5.976, 7.40432}]: 0.638622, Nematostella_vectensis: 7.352344) [&95%HPD={6.0815, 8.87505}];
+
+END;
