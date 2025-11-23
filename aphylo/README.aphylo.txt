@@ -595,42 +595,49 @@ aphylo假定已经有一个来自 phylo 流水线的“发布包接口”，包�
 
 以下为一个典型 aphylo 工程的目录结构示意，风格与 phylo 项目类似，仅展示主要层级：
 
-project/
+aphylo/
 ├── config.yaml
 ├── README.txt
-├── data/
-│   ├── annotation/
-│   ├── genomic/
-│   ├── proteomes/
-│   ├── cds/
-│   └── maps/
-│       └── pep2cds.tsv
-└── results/
-    ├── publish/
-    │   └── aphylo_ready/
-    │       ├── strict_sco_msa/
-    │       ├── colmask/
-    │       ├── ogs_selected.list
-    │       ├── sco_filelist.txt
-    │       ├── ogs_selected.published.list
-    │       ├── sco_filelist.published.txt
-    │       └── family.tsv
-    ├── 01_iface/
-    ├── 02_bt/
-    ├── 03_codon/
-    ├── 03_qc/
-    ├── 04_codeml/
-    ├── 05_cmlagg/
-    ├── 06_cafe/
-    │   ├── mcmctree/
-    │   ├── input/
-    │   └── models/
-    ├── 07_cafeagg/
-    │   └── enrich_inputs/
-    └── 08_joint/
-        └── report/
 
-logs/
+├── scripts/
+│   ├── 01_iface_check_publish.py
+│   ├── 02_build_codon_inputs.py
+│   ├── 03_pal2nal_like_and_colmask_sync.py
+│   ├── 04_qc_codon_alignments.py
+│   ├── 05_define_foregrounds.py
+│   ├── 06_codeml_batch_branchsite.py
+│   ├── 07_codeml_aggregate.py
+│   ├── 08_clean_tree_and_noblize.py
+│   ├── 09_build_concat_clean_phy.py
+│   ├── 10_mcmctree_run_and_publish.py
+│   ├── mcmctree_postcheck.py
+│   ├── 11_cafe5_prepare_inputs.py
+│   ├── 12_cafe5_run_models.py
+│   ├── 13_cafe5_aggregate.py
+│   ├── 13b_cafe_build_enrich_inputs.py
+│   ├── 14_joint_integration.py
+│   ├── 15_build_final_report.py
+│   ├── ess_report.R
+│   └── finetune_suggest.py
+
+├── results/
+│   ├── 01_iface/
+│   ├── 02_bt/
+│   ├── 03_codon/
+│   ├── 03_qc/
+│   ├── 04_codeml/
+│   │   └── sets/
+│   ├── 05_cmlagg/
+│   ├── 06_cafe/
+│   │   ├── mcmctree/
+│   │   ├── input/
+│   │   └── models/
+│   ├── 07_cafeagg/
+│   │   └── enrich_inputs/
+│   └── 08_joint/
+│       └── report/
+
+└── logs/
 
 
 ====================================================================================================
@@ -822,4 +829,5 @@ README.txt                                最终报告说明                    
 
 ====================================================================================================
 END OF README.txt
+
 ====================================================================================================
