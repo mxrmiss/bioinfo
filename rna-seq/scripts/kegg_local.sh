@@ -28,6 +28,7 @@ mkdir -p "$REF/kegg_offline" "$REF/kegg_legacy" "$OUTDIR"
 : > "$LOG"
 log(){ echo "$*" | tee -a "$LOG"; }
 
+# 规范化 RAW -> TSV（两列：Kxxxxx \t koYYYYY）
 norm_ko_path(){
   awk -vOFS='\t' '{
     gsub(/\r/,"");
@@ -54,22 +55,32 @@ else
 fi
 log "[✔] ko_to_pathway.tsv: pairs=$(wc -l < "$KO2PATH_TSV")  KO=$(cut -f1 "$KO2PATH_TSV"|LC_ALL=C sort -u|wc -l)  pathways=$(cut -f2 "$KO2PATH_TSV"|LC_ALL=C sort -u|wc -l)"
 
-# B) pathway_names.tsv → 确保带表头
+# B) pathway_names.tsv → 确保带表头（关键修复：按 TAB 分列，保留完整描述）
 if [[ ! -s "$PATHNAME_TSV" ]]; then
   log "[2] 获取 pathway_names.tsv"
   if curl -sSL --max-time 60 "https://rest.kegg.jp/list/pathway/ko" \
-    | awk -vOFS='\t' '{gsub(/\r/,""); gsub(/^path:/,"",$1); sub(/^map/,"ko",$1); if($1~/^ko[0-9]{5}$/) print $1,$2}' \
-    | LC_ALL=C sort -u > "$PATHNAME_TSV"; then :; else
+    | awk -vFS='\t' -vOFS='\t' '{
+        gsub(/\r/,"");
+        gsub(/^path:/,"",$1);
+        sub(/^map/,"ko",$1);
+        if ($1 ~ /^ko[0-9]{5}$/) print $1,$2
+      }' \
+    | LC_ALL=C sort -u > "$PATHNAME_TSV"; then
+    :
+  else
+    # 在线失败兜底：ID=Name
     cut -f2 "$KO2PATH_TSV" | LC_ALL=C sort -u | awk -vOFS='\t' '{print $1,$1}' > "$PATHNAME_TSV"
   fi
 fi
+
+# 补表头（pathway_id\tname）
 if [[ "$(head -n1 "$PATHNAME_TSV")" != $'pathway_id\tname' ]]; then
   { echo -e "pathway_id\tname"; cat "$PATHNAME_TSV"; } > "$REF/.kegg_pathway.with_header.tsv"
   mv -f "$REF/.kegg_pathway.with_header.tsv" "$PATHNAME_TSV"
 fi
 log "[✔] pathway_names.tsv: $(wc -l < "$PATHNAME_TSV") 行"
 
-# C) gene→KO 预处理（关键修复：CRLF + 自动列定位 + KO 规范化；不改基因ID）
+# C) gene→KO 预处理（CRLF + 自动列定位 + KO 规范化；不改基因ID）
 if [[ ! -s "$GENE2KO" ]]; then
   log "[❌] 缺少 $GENE2KO"
   exit 2
@@ -121,8 +132,7 @@ else
   log "[✔] term2gene.tsv: $(wc -l < "$T2G_PW") 行"
 fi
 
-# E) 名称字典落点
+# E) 名称字典落点（保持流水线约定：pathway_id\tterm_name）
 { echo -e "pathway_id\tterm_name"; tail -n +2 "$PATHNAME_TSV"; } > "$T2N_PW"
 log "[✔] term2name.tsv: $(wc -l < "$T2N_PW") 行"
 
-log "[完成] 构建日志：$LOG"
