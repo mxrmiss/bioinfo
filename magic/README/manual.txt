@@ -1,0 +1,14 @@
+mcscanx_synteny.py
+- 输入：基因组、注释、蛋白质（最长转录本）
+- 输出：在input/下，synteny_blocks_full.tsv、synteny_summary.tsv用于后续统计分析；genome_len.tsv、synteny_blocks.tsv用于画图
+- 注意事项：输入的三个文件名前缀必须是S_constricta这种由一个下划线隔开的属名和种名的命名方式
+
+chr_synteny.R	染色体共线性圆圈图
+- 输入：mcscanx_synteny.py的两个产物genome_len.tsv、synteny_blocks.tsv，脚本自动识别
+- 注意事项：个人觉得物种间间隙为5，染色体间间隙为1.5最好看
+
+stats_plot.R    染色体共线性热图和弦图
+- 输入：mcscanx_synteny.py的产物synteny_summary.tsv，脚本自动识别
+
+enrichment_bar.R	富集柱状图
+- 输入：可直接使用
