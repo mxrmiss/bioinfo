@@ -34,22 +34,22 @@ paths:
 
 # 物种命名保障：防止历史别名/拼写差异造成前景或树节点不匹配（可按需增删）
 species:
-  alias_map:
-    Branchiostoma_floridae: "Branchiostoma_floridae"
-    Crassostrea_ariakensis: "Crassostrea_ariakensis"
-    Crassostrea_gigas: "Crassostrea_gigas"
-    Sinonovacula_constricta: "Sinonovacula_constricta"
-    Sinonovacula_rivularis: "Sinonovacula_rivularis"
+  {}
+  # alias_map:
+    # Crassostrea_ariakensis: "Crassostrea_ariakensis"
+    # Crassostrea_gigas: "Crassostrea_gigas"
+    # Sinonovacula_constricta: "Sinonovacula_constricta"
+    # Sinonovacula_rivularis: "Sinonovacula_rivularis"
 
 codon:
-  threads: 8
-  min_taxa: 15
+  threads: 40
+  min_taxa: 13
   min_codon_len: 120
   max_gap_frac: 0.4
   stopcodon_action: "fail"   # fail | mask(NNN)
 
 codeml:
-  threads: 30                                   # 并行请用 `snakemake -j` 控制；脚本逐任务运行更稳
+  threads: 40                                   # 并行请用 `snakemake -j` 控制；脚本逐任务运行更稳
   alt_template: "templates/branch_site_alt.ctl"
   null_template: "templates/branch_site_null.ctl"
   ctl_template: "templates/branch_site.ctl"    # 固定模板文件（保留不影响）
@@ -57,10 +57,14 @@ codeml:
 
   # —— 前景集合的唯一权威来源（保留） ——
   foreground_sets:
-    - name: "LowSalinity"
-      tips: ["Sinonovacula_rivularis"]          # 论文：低盐前景
-    - name: "HighSalinity"
-      tips: ["Sinonovacula_constricta"]         # 论文：高盐前景
+    - name: "HugeFootGroup"
+      tips: ["Sinonovacula_rivularis","Sinonovacula_constricta","Novaculina_chinensis"]          # 高效挖掘组
+    - name: "HugeFoot"
+      tips: ["Sinonovacula_constricta"]         # 缢蛏单枝
+    - name: "NOFootGroup"
+      tips: ["Crassostrea_gigas","Mizuhopecten_yessoensis","Mytilus_galloprovincialis"]          # 不挖掘
+    - name: "MedFootGrpup"
+      tips: ["Tegillarca_granosa","Ruditapes_philippinarum","Meretrix_meretrix"]          # 中等挖掘       
 
 psg:
   enable: true               # 打开 07 内置的 PSG cds 富集输入工厂
@@ -95,8 +99,18 @@ cafe5:
     species_sets:
       cafe_sc:
         - "Sinonovacula_constricta"
-      cafe_sr:
+      cafe_sc_sr_nc:
+        - "Sinonovacula_constricta"
         - "Sinonovacula_rivularis"
+        - "Novaculina_chinensis"
+      cafe_tg_rp_mm:
+        - "Tegillarca_granosa"
+        - "Ruditapes_philippinarum"
+        - "Meretrix_meretrix"
+      cafe_cg_my_mg:
+        - "Mizuhopecten_yessoensis"
+        - "Crassostrea_gigas"
+        - "Mytilus_galloprovincialis"
     # 可以设置两个物种的集合，看他们的基因家族扩张和收缩富集情况
     # cafe_sc_sr:                           
     #   - "Sinonovacula_constricta"
@@ -121,8 +135,8 @@ mcmctree:
   unrooted_tree: "../phylo/results/publish/aphylo_ready/species_tree.nwk"
   rooted_tree: "../phylo/results/publish/aphylo_ready/species_tree_rooted.nwk"
   source_tree: "results/06_cafe/mcmctree/species_calib.trees"   # 08 产出：有分支长度
-  tree:        "results/06_cafe/mcmctree/species_calib.trees"   # 同上（与部分脚本兼容）
-  outgroups:   ["Nematostella_vectensis"]
+  tree:        "results/06_cafe/mcmctree/species_calib.trees"   # 09使用，无分支长度和化石校准点
+  outgroups:   ["Lottia_gigantea"]
 
   # -------- 工作目录与关键输入（10 步在该目录内就地运行）--------
   outdir:   "results/06_cafe/mcmctree"
