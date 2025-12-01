@@ -5,16 +5,40 @@
 小工具：用 tx2gene.clean.tsv 把第三方提供的 cds/transcript 列表映射成 gene_id
 
 使用方式（示例）：
-  1. 确保本脚本与 tx2gene.clean.tsv 在同一目录下。
-  2. 把第三方给你的 cds/transcript 列表文件路径，填到 INPUT_CDS_FILE 变量中。
+  1. 确保本脚本与 tx2gene.clean.tsv 在同一目录下（脚本目录）。
+  2. 把第三方给你的 cds/transcript 列表文件路径，填到 INPUT_CDS_FILE 变量中，
+     或在命令行中显式传入一个或多个输入文件。
   3. 根据实际情况修改：输入文件是否有表头、ID 在第几列等参数。
-  4. 运行：python map_cds_to_gene.py
-  5. 输出：
-       - 映射表：OUTPUT_MAPPED_FILE
-       - 去重的 gene_id 列表：OUTPUT_GENE_LIST_FILE
+  4. 运行方式：
+       - 老模式（使用参数区）：
+           python map_cds_to_gene.py
+       - 单文件（命令行）：
+           python map_cds_to_gene.py file1
+       - 单文件 + 备份（命令行）：
+           python map_cds_to_gene.py file1 -c
+       - 多文件（命令行）：
+           python map_cds_to_gene.py file1 file2 file3
+       - 多文件 + 备份（命令行）：
+           python map_cds_to_gene.py file1 file2 file3 -c
+  5. 输出规则：
+       - 产物文件名的前缀一律与输入文件前缀（去掉扩展名后的部分）相同。
+       - 老模式：
+           * 不修改原输入文件；
+           * 映射表：脚本目录 / <前缀>.mapped.tsv
+           * gene 列表：脚本目录 / <前缀>.list
+       - 命令行模式：
+           * 若输入文件与脚本在同一目录：
+               - 映射表：覆盖原输入文件（可选 .bak 备份）
+               - gene 列表：脚本目录 / <前缀>.list
+           * 若输入文件与脚本不在同一目录：
+               - 原输入文件保持不变；
+               - 映射表：脚本目录 / <前缀>.mapped.tsv
+               - gene 列表：脚本目录 / <前缀>.list
 """
 
 import csv
+import sys
+import shutil
 from pathlib import Path
 
 # ===================== 参数区（皇上只要改这里就行） =====================
@@ -23,7 +47,7 @@ from pathlib import Path
 # 可以是：
 #   - 一列：每行一个 cds_id
 #   - 多列：ID 在第 ID_COLUMN 列
-INPUT_CDS_FILE = "third_party_cds.list"   # ← 皇上改成自己的文件名
+INPUT_CDS_FILE = "third_party_cds.list"   # ← 皇上改成自己的文件名（支持相对/绝对路径）
 
 # tx2gene.clean.tsv 文件名（与本脚本同目录）
 TX2GENE_FILE = "tx2gene.clean.tsv"
@@ -34,10 +58,9 @@ INPUT_HAS_HEADER = False  # 若第一行为表头则改为 True
 # cds/transcript ID 在第几列（从 1 开始计数）
 ID_COLUMN = 1
 
-# 输出文件：映射后的完整表（=原始内容 + 最后一列 gene_id）
+# 下面两个名字仅作占位，实际输出文件名会根据输入文件前缀自动生成：
+#   <前缀>.mapped.tsv, <前缀>.list
 OUTPUT_MAPPED_FILE = "cds_mapped_to_gene.tsv"
-
-# 输出文件：仅包含去重后的 gene_id，一列，以便直接用作 gene 集合
 OUTPUT_GENE_LIST_FILE = "cds_mapped_gene.list"
 
 # tx2gene.clean.tsv 是否有表头（推荐 True）
@@ -168,29 +191,125 @@ def map_cds_to_gene(
         print("[WARN] 存在未映射的 cds/transcript，请检查 ID 口径是否与 tx2gene.clean.tsv 一致")
 
 
+def _parse_cli_args():
+    """
+    简单解析命令行参数：
+      - 无参数：返回 (None, False) —— 使用参数区 INPUT_CDS_FILE（老模式）
+      - 有参数：
+          python map_cds_to_gene.py file1 [file2 ... fileN]
+          python map_cds_to_gene.py file1 [file2 ... fileN] -c
+        其中：
+          * 最后一个参数若为 -c，则表示对所有文件进行备份
+    返回：
+      ( [file1, file2, ...] 或 None, backup_flag_bool )
+    """
+    args = sys.argv[1:]
+    if not args:
+        return None, False
+
+    backup = False
+    if args[-1] == "-c":
+        backup = True
+        file_args = args[:-1]
+    else:
+        file_args = args
+
+    # 不允许在中间出现 -c
+    if any(a == "-c" for a in file_args):
+        print("用法: python map_cds_to_gene.py file1 [file2 ...] [-c]", file=sys.stderr)
+        sys.exit(1)
+
+    if not file_args:
+        print("用法: python map_cds_to_gene.py file1 [file2 ...] [-c]", file=sys.stderr)
+        sys.exit(1)
+
+    return file_args, backup
+
+
 def main():
-    # 当前工作目录
+    # 脚本所在目录（tx2gene 与所有产物统一放在这里）
+    script_dir = Path(__file__).resolve().parent
+    # 当前工作目录（运行 python 命令的地方）
     cwd = Path(".").resolve()
 
-    tx2gene_path = cwd / TX2GENE_FILE
-    input_path = cwd / INPUT_CDS_FILE
-    output_mapped_path = cwd / OUTPUT_MAPPED_FILE
-    output_gene_list_path = cwd / OUTPUT_GENE_LIST_FILE
+    cli_files, backup_flag = _parse_cli_args()
+
+    # tx2gene 固定从脚本目录读取
+    tx2gene_path = script_dir / TX2GENE_FILE
 
     print(f"[INIT] 当前工作目录：{cwd}")
+    print(f"[INIT] 脚本所在目录：{script_dir}")
     print(f"[INIT] 使用 tx2gene 文件：{tx2gene_path}")
-    print(f"[INIT] 输入 cds 列表文件：{input_path}")
 
     tx2gene_map = load_tx2gene(tx2gene_path, has_header=TX2GENE_HAS_HEADER)
 
-    map_cds_to_gene(
-        input_file=input_path,
-        tx2gene_map=tx2gene_map,
-        id_column=ID_COLUMN,
-        has_header=INPUT_HAS_HEADER,
-        output_mapped=output_mapped_path,
-        output_gene_list=output_gene_list_path,
-    )
+    if cli_files is not None:
+        # —— 命令行模式：一个或多个显式输入 —— 
+        input_paths = []
+        for name in cli_files:
+            p = Path(name)
+            if p.is_absolute():
+                input_paths.append(p.resolve())
+            else:
+                input_paths.append((cwd / p).resolve())
+
+        # -c：对所有输入文件备份 .bak（在各自目录下）
+        if backup_flag:
+            for p in input_paths:
+                bak_path = p.with_name(p.name + ".bak")
+                shutil.copy2(p, bak_path)
+                print(f"[INIT] 备份原文件为：{bak_path}")
+
+        for p in input_paths:
+            same_dir = (p.parent == script_dir)
+            prefix = p.stem
+
+            print(f"[INIT] 正在处理输入 cds 列表文件：{p}")
+            print(f"[INIT] 输入文件与脚本同目录？ {'是' if same_dir else '否'}")
+            print(f"[INIT] 当前前缀：{prefix}")
+
+            # 映射表输出路径：
+            if same_dir:
+                # 同一目录：覆盖原文件
+                output_mapped_path = p
+            else:
+                # 不同目录：保留原文件，映射表写在脚本目录
+                output_mapped_path = script_dir / f"{prefix}.mapped.tsv"
+
+            # 基因列表一律写在脚本目录，前缀一致，后缀为 .list
+            output_gene_list_path = script_dir / f"{prefix}.list"
+
+            map_cds_to_gene(
+                input_file=p,
+                tx2gene_map=tx2gene_map,
+                id_column=ID_COLUMN,
+                has_header=INPUT_HAS_HEADER,
+                output_mapped=output_mapped_path,
+                output_gene_list=output_gene_list_path,
+            )
+    else:
+        # —— 老模式：使用参数区 INPUT_CDS_FILE —— 
+        input_path = Path(INPUT_CDS_FILE)
+        if not input_path.is_absolute():
+            input_path = (cwd / input_path).resolve()
+
+        prefix = input_path.stem
+        output_mapped_path = script_dir / f"{prefix}.mapped.tsv"
+        output_gene_list_path = script_dir / f"{prefix}.list"
+
+        print(f"[INIT] 输入 cds 列表文件：{input_path}")
+        print(f"[INIT] 映射表输出到脚本目录：{output_mapped_path}")
+        print(f"[INIT] gene 列表输出到脚本目录：{output_gene_list_path}")
+        print(f"[INIT] 当前前缀：{prefix}")
+
+        map_cds_to_gene(
+            input_file=input_path,
+            tx2gene_map=tx2gene_map,
+            id_column=ID_COLUMN,
+            has_header=INPUT_HAS_HEADER,
+            output_mapped=output_mapped_path,
+            output_gene_list=output_gene_list_path,
+        )
 
     print("[DONE] 映射完成。")
 
