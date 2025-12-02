@@ -1,10 +1,11 @@
 #!/usr/bin/env Rscript
 # ==============================================================================
-# Script Name: viz_enrichment_bubble.R (v2.5 Font Control Edition)
+# Script Name: viz_enrichment_bubble.R (v2.6 Dynamic Color Edition)
 # Description:
 #   - [Feat] Toggle Plot Title ON/OFF for publication.
 #   - [Feat] Auto-removes underscores from titles (e.g. "GO_BP" -> "GO BP").
 #   - [Feat] Centralized font size control for journal submission.
+#   - [Feat] Dynamic Color Scale: Optional switch for adaptive p-value coloring.
 #   - [System] Template Guard & Dual Layout Standard included.
 # ==============================================================================
 
@@ -18,37 +19,46 @@ suppressPackageStartupMessages({
 })
 
 # ==============================================================================
-# 1. USER CONFIGURATION
+# 1. USER CONFIGURATION (用户配置)
 # ==============================================================================
 
-# --- [NEW] Title Control ---
-SHOW_PLOT_TITLE     <- TRUE   # TRUE = Show Title; FALSE = No Title (Clean for Paper)
+# --- [NEW] Title Control (标题控制) ---
+SHOW_PLOT_TITLE     <- TRUE   # TRUE = 显示标题; FALSE = 不显示 (发文章用)
 
-# --- A. Single Plot Standards (Dynamic Width) ---
+# --- A. Single Plot Standards (单图动态宽度标准) ---
 SINGLE_HEIGHT_INCH  <- 9.5
-SINGLE_ASPECT_RATIO <- 1.3
+SINGLE_ASPECT_RATIO <- 1.7
 TOP_N_SINGLE        <- 20
 
-# --- B. Facet Plot Standards (Fixed Dimensions) ---
+# --- B. Facet Plot Standards (分面图固定尺寸标准) ---
 FACET_WIDTH_INCH    <- 12.0
 FACET_HEIGHT_INCH   <- 10.0
 TOP_N_FACET         <- 10
 
-# --- C. Global Legend Standards ---
+# --- C. Global Legend Standards (图例颜色控制) ---
+
+# [NEW] 颜色标尺模式开关
+# TRUE  = 动态模式：根据每个文件的实际 P 值范围自动伸缩颜色标尺（推荐：能最大程度凸显数据内部差异）
+# FALSE = 固定模式：强制使用下方 GLOBAL_P_MIN/MAX 锁死范围（推荐：用于多图横向统一比较颜色深浅）
+USE_DYNAMIC_COLOR_SCALE <- TRUE 
+
+# 下方参数仅在 USE_DYNAMIC_COLOR_SCALE <- FALSE 时生效 (或作为动态模式的默认参考/保底)
 GLOBAL_P_MIN <- 1e-10
 GLOBAL_P_MAX <- 0.05
-LEGEND_TICKS <- 5
-COUNT_TICKS  <- 5
 
-# --- D. Aesthetics & Sorting ---
+LEGEND_TICKS <- 5     # 图例刻度数量
+COUNT_TICKS  <- 5     # 气泡大小刻度数量
+
+# --- D. Aesthetics & Sorting (配色与排序) ---
+# 配色方案彩：blue orange red
 SORT_BY      <- "GeneRatio"
-COLOR_LOW    <- "blue"
-COLOR_MID    <- "orange"
-COLOR_HIGH   <- "red"
+COLOR_LOW    <- "#4DBBD5"
+COLOR_MID    <- "#F39B7F"
+COLOR_HIGH   <- "#E64B35"
 FONT_FAMILY  <- "sans"
 
 # =======================
-# [NEW] Font Size Control
+# [NEW] Font Size Control (字号控制)
 # =======================
 # 建议值（投稿友好）：
 # - 坐标刻度：12–14
@@ -66,7 +76,8 @@ STRIP_TEXT_SIZE   <- 13
 TITLE_SIZE        <- 17
 
 WRAP_WIDTH   <- 60
-SHOW_GRID    <- TRUE
+# 控制网格线
+SHOW_GRID    <- FALSE
 
 # Paths
 IN_DIR       <- "input"
@@ -79,7 +90,7 @@ TEMPLATE_DIR <- "templates"
 TEMPLATE_FILE<- "enrichment_input_template.tsv"
 
 # ==============================================================================
-# 2. HELPER FUNCTIONS
+# 2. HELPER FUNCTIONS (辅助函数)
 # ==============================================================================
 
 init_template_system <- function() {
@@ -123,6 +134,8 @@ scientific_p_formatter <- function(x) {
 }
 
 generate_fixed_breaks <- function(min_val, max_val, n) {
+  # 避免 log10(0) 或负数
+  if (min_val <= 0) min_val <- 1e-300 
   log_seq <- seq(log10(max_val), log10(min_val), length.out = n)
   return(10^log_seq)
 }
@@ -136,11 +149,11 @@ force_integer_breaks <- function(n = 5) {
 }
 
 # ==============================================================================
-# 3. MAIN LOOP
+# 3. MAIN LOOP (主流程)
 # ==============================================================================
 
 cat("================================================================\n")
-cat(" Magic Bubble Plotter v2.5 (Font Control)\n")
+cat(" Magic Bubble Plotter v2.6 (Dynamic Color Edition)\n")
 cat("================================================================\n")
 
 init_template_system()
@@ -153,6 +166,7 @@ if (length(files) == 0) {
 
 cat(sprintf("Detected %d input files. Processing...\n", length(files)))
 cat(sprintf("Show Title: %s\n", SHOW_PLOT_TITLE))
+cat(sprintf("Dynamic Color Scale: %s\n", USE_DYNAMIC_COLOR_SCALE))
 cat("----------------------------------------------------------------\n")
 
 for (f_path in files) {
@@ -182,10 +196,10 @@ for (f_path in files) {
   # --- Step 3: Clean ---
   df_plot <- df_raw %>%
     mutate(
-      p_adjust        = as.numeric(p_adjust),
-      gene_count      = as.numeric(gene_count),
-      GeneRatioNumeric= parse_ratio_hybrid(gene_ratio),
-      TermWrapped     = str_wrap(term_name, width = WRAP_WIDTH)
+      p_adjust            = as.numeric(p_adjust),
+      gene_count          = as.numeric(gene_count),
+      GeneRatioNumeric    = parse_ratio_hybrid(gene_ratio),
+      TermWrapped         = str_wrap(term_name, width = WRAP_WIDTH)
     ) %>%
     filter(!is.na(p_adjust), !is.na(GeneRatioNumeric))
 
@@ -237,16 +251,40 @@ for (f_path in files) {
     final_width_inch  <- FACET_WIDTH_INCH
     final_height_inch <- FACET_HEIGHT_INCH
   } else {
-    max_char_len     <- max(nchar(as.character(df_ready$TermWrapped)), na.rm = TRUE)
-    grid_width_inch  <- SINGLE_HEIGHT_INCH / SINGLE_ASPECT_RATIO
-    text_width_inch  <- max_char_len * 0.09 + 0.5
-    legend_width_inch<- 2.0
-    final_width_inch <- text_width_inch + grid_width_inch + legend_width_inch
-    final_height_inch<- SINGLE_HEIGHT_INCH
+    max_char_len      <- max(nchar(as.character(df_ready$TermWrapped)), na.rm = TRUE)
+    grid_width_inch   <- SINGLE_HEIGHT_INCH / SINGLE_ASPECT_RATIO
+    text_width_inch   <- max_char_len * 0.09 + 0.5
+    legend_width_inch <- 2.0
+    final_width_inch  <- text_width_inch + grid_width_inch + legend_width_inch
+    final_height_inch <- SINGLE_HEIGHT_INCH
   }
 
   # --- Step 6: Plotting ---
-  fixed_breaks <- generate_fixed_breaks(GLOBAL_P_MIN, GLOBAL_P_MAX, LEGEND_TICKS)
+  
+  # [NEW] 核心逻辑：动态颜色计算
+  # 根据 USE_DYNAMIC_COLOR_SCALE 开关决定使用当前数据范围还是全局固定范围
+  if (USE_DYNAMIC_COLOR_SCALE) {
+    # 动态模式：计算当前绘图数据的极值
+    current_p_min <- min(df_ready$p_adjust, na.rm = TRUE)
+    current_p_max <- max(df_ready$p_adjust, na.rm = TRUE)
+    
+    # 边界保护：如果最小值和最大值相等（所有P值都一样），手动拉开一点距离防止报错
+    if (current_p_min == current_p_max) {
+      current_p_min <- current_p_min * 0.5
+      current_p_max <- if(current_p_max == 0) 0.01 else current_p_max * 1.5
+    }
+    
+    plot_breaks <- generate_fixed_breaks(current_p_min, current_p_max, LEGEND_TICKS)
+    plot_limits <- c(current_p_min, current_p_max)
+    cat(sprintf("   [COLOR] Dynamic Scale: %.2e - %.2e\n", current_p_min, current_p_max))
+    
+  } else {
+    # 固定模式：使用全局配置
+    plot_breaks <- generate_fixed_breaks(GLOBAL_P_MIN, GLOBAL_P_MAX, LEGEND_TICKS)
+    plot_limits <- c(GLOBAL_P_MIN, GLOBAL_P_MAX)
+    cat(sprintf("   [COLOR] Fixed Scale: %.2e - %.2e\n", GLOBAL_P_MIN, GLOBAL_P_MAX))
+  }
+  
   legend_h_cm  <- 3.5
 
   # Title Logic
@@ -262,9 +300,9 @@ for (f_path in files) {
     scale_color_gradientn(
       colours = c(COLOR_HIGH, COLOR_MID, COLOR_LOW),
       trans   = "log10",
-      breaks  = fixed_breaks,
+      breaks  = plot_breaks,                # [MODIFIED] 使用计算好的动态或固定刻度
       labels  = scientific_p_formatter,
-      limits  = c(GLOBAL_P_MIN, GLOBAL_P_MAX),
+      limits  = plot_limits,                # [MODIFIED] 使用计算好的动态或固定范围
       oob     = scales::squish,
       name    = "P.adjust\n"
     ) +
@@ -346,4 +384,3 @@ for (f_path in files) {
 
 cat("----------------------------------------------------------------\n")
 cat("All processing finished.\n")
-

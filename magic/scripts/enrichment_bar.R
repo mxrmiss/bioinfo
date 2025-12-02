@@ -1,8 +1,9 @@
 #!/usr/bin/env Rscript
 # ==============================================================================
-# Script Name: viz_enrichment_bar.R (v1.1 Label & Fixed Thickness)
+# Script Name: viz_enrichment_bar.R (v1.2 Dynamic Color Edition)
 # Description:
 #   - [Feat] Adds Gene Count labels (Format: "15") at bar ends.
+#   - [Feat] Dynamic Color Scale: Optional switch for adaptive p-value coloring.
 #   - [Fix] Bars maintain consistent physical thickness (no bloating).
 #   - [System] Checks/Generates templates independently.
 #   - [Layout] Fixed Height + Dynamic Width (Matches Bubble Plot).
@@ -18,7 +19,7 @@ suppressPackageStartupMessages({
 })
 
 # ==============================================================================
-# 1. USER CONFIGURATION
+# 1. USER CONFIGURATION (用户配置)
 # ==============================================================================
 
 # --- Title Control ---
@@ -26,7 +27,7 @@ SHOW_PLOT_TITLE     <- TRUE
 
 # --- A. Single Plot Standards ---
 SINGLE_HEIGHT_INCH  <- 9.5
-SINGLE_ASPECT_RATIO <- 1.3
+SINGLE_ASPECT_RATIO <- 1.7
 TOP_N_SINGLE        <- 20
 
 # --- B. Facet Plot Standards ---
@@ -34,27 +35,29 @@ FACET_WIDTH_INCH    <- 12.0
 FACET_HEIGHT_INCH   <- 10.0
 TOP_N_FACET         <- 10
 
-# --- C. Global Legend Standards ---
+# --- C. Global Legend Standards (图例颜色控制) ---
+
+# [NEW] 颜色标尺模式开关
+# TRUE  = 动态模式：根据每个文件的实际 P 值范围自动伸缩颜色标尺（推荐：能最大程度凸显数据内部差异）
+# FALSE = 固定模式：强制使用下方 GLOBAL_P_MIN/MAX 锁死范围（推荐：用于多图横向统一比较颜色深浅）
+USE_DYNAMIC_COLOR_SCALE <- TRUE 
+
+# 下方参数仅在 USE_DYNAMIC_COLOR_SCALE <- FALSE 时生效
 GLOBAL_P_MIN <- 1e-10
 GLOBAL_P_MAX <- 0.05
+
 LEGEND_TICKS <- 5
 
 # --- D. Aesthetics ---
-COLOR_LOW    <- "blue"
-COLOR_MID    <- "orange"
-COLOR_HIGH   <- "red"
+# 配色彩：blue orange red
+COLOR_LOW    <- "#4DBBD5"
+COLOR_MID    <- "#F39B7F"
+COLOR_HIGH   <- "#E64B35"
 FONT_FAMILY  <- "sans"
 
 # =======================
 # Font Size Control（与气泡图保持一致风格）
 # =======================
-# 可按需调整：
-# - 坐标刻度：12–14
-# - 坐标标题：14–16
-# - 图例文字：11–12
-# - 图例标题：12–13
-# - 分面标题：13–14
-# - 主标题：16–18
 BASE_SIZE         <- 14  # theme_bw 的 base_size
 AXIS_TEXT_SIZE    <- 13
 AXIS_TITLE_SIZE   <- 14
@@ -64,13 +67,13 @@ STRIP_TEXT_SIZE   <- 13
 TITLE_SIZE        <- 17
 
 WRAP_WIDTH   <- 60
-SHOW_GRID    <- TRUE
+# 灰色网格线
+SHOW_GRID    <- FALSE
 
 #Paths
 IN_DIR       <- "input"
 
 # [MODIFIED] 输出到脚本同名子文件夹
-# 默认使用脚本前缀名，您也可以将引号内的内容修改为其他名称
 SCRIPT_PREFIX <- "bar_enrichment"
 OUT_DIR       <- file.path("output", SCRIPT_PREFIX)
 
@@ -123,6 +126,8 @@ scientific_p_formatter <- function(x) {
 }
 
 generate_fixed_breaks <- function(min_val, max_val, n) {
+  # 避免 log10(0) 或负数
+  if (min_val <= 0) min_val <- 1e-300 
   log_seq <- seq(log10(max_val), log10(min_val), length.out = n)
   return(10^log_seq)
 }
@@ -132,7 +137,7 @@ generate_fixed_breaks <- function(min_val, max_val, n) {
 # ==============================================================================
 
 cat("================================================================\n")
-cat(" Magic Bar Plotter v1.1 (Labels & Fixed Thickness)\n")
+cat(" Magic Bar Plotter v1.2 (Dynamic Color Edition)\n")
 cat("================================================================\n")
 
 init_template_system()
@@ -144,6 +149,8 @@ if (length(files) == 0) {
 }
 
 cat(sprintf("Detected %d input files. Processing...\n", length(files)))
+cat(sprintf("Show Title: %s\n", SHOW_PLOT_TITLE))
+cat(sprintf("Dynamic Color Scale: %s\n", USE_DYNAMIC_COLOR_SCALE))
 cat("----------------------------------------------------------------\n")
 
 for (f_path in files) {
@@ -233,7 +240,30 @@ for (f_path in files) {
   }
 
   # --- Step 6: Plotting ---
-  fixed_breaks <- generate_fixed_breaks(GLOBAL_P_MIN, GLOBAL_P_MAX, LEGEND_TICKS)
+  
+  # [NEW] 核心逻辑：动态颜色计算 (Dynamic Color Logic)
+  if (USE_DYNAMIC_COLOR_SCALE) {
+    # 动态模式：计算当前绘图数据的极值
+    current_p_min <- min(df_ready$p_adjust, na.rm = TRUE)
+    current_p_max <- max(df_ready$p_adjust, na.rm = TRUE)
+    
+    # 边界保护
+    if (current_p_min == current_p_max) {
+      current_p_min <- current_p_min * 0.5
+      current_p_max <- if(current_p_max == 0) 0.01 else current_p_max * 1.5
+    }
+    
+    plot_breaks <- generate_fixed_breaks(current_p_min, current_p_max, LEGEND_TICKS)
+    plot_limits <- c(current_p_min, current_p_max)
+    cat(sprintf("   [COLOR] Dynamic Scale: %.2e - %.2e\n", current_p_min, current_p_max))
+    
+  } else {
+    # 固定模式：使用全局配置
+    plot_breaks <- generate_fixed_breaks(GLOBAL_P_MIN, GLOBAL_P_MAX, LEGEND_TICKS)
+    plot_limits <- c(GLOBAL_P_MIN, GLOBAL_P_MAX)
+    cat(sprintf("   [COLOR] Fixed Scale: %.2e - %.2e\n", GLOBAL_P_MIN, GLOBAL_P_MAX))
+  }
+  
   legend_h_cm <- 3.5
 
   if (SHOW_PLOT_TITLE) {
@@ -257,9 +287,9 @@ for (f_path in files) {
     scale_fill_gradientn(
       colours = c(COLOR_HIGH, COLOR_MID, COLOR_LOW),
       trans = "log10",
-      breaks = fixed_breaks,
+      breaks = plot_breaks,                 # [MODIFIED] 动态或固定刻度
       labels = scientific_p_formatter,
-      limits = c(GLOBAL_P_MIN, GLOBAL_P_MAX),
+      limits = plot_limits,                 # [MODIFIED] 动态或固定范围
       oob = scales::squish,
       name = "P.adjust\n"
     ) +
@@ -280,9 +310,9 @@ for (f_path in files) {
       panel.grid.major = if(SHOW_GRID) element_line(colour = "grey92") else element_blank(),
       panel.grid.minor = element_blank(),
 
-      axis.line   = element_line(colour = "black"),
-      axis.text   = element_text(colour = "black", size = AXIS_TEXT_SIZE),
-      axis.title  = element_text(size = AXIS_TITLE_SIZE),
+      axis.line    = element_line(colour = "black"),
+      axis.text    = element_text(colour = "black", size = AXIS_TEXT_SIZE),
+      axis.title   = element_text(size = AXIS_TITLE_SIZE),
       axis.text.y = element_text(lineheight = 0.8, size = AXIS_TEXT_SIZE),
 
       legend.position = "right",
@@ -310,4 +340,3 @@ for (f_path in files) {
 
 cat("----------------------------------------------------------------\n")
 cat("All processing finished.\n")
-
