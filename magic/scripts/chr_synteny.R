@@ -28,7 +28,7 @@ CUSTOM_OUT_DIR    <- NULL   # 自定义输出子文件夹
 CUSTOM_FILENAME   <- NULL   # 自定义输出文件名前缀
 
 # --- [B. 显示开关] ---
-SHOW_LEGEND <- FALSE   # 是否显示图例
+SHOW_LEGEND <- TRUE   # 是否显示图例
 SHOW_TITLE  <- FALSE   # 是否显示标题
 SHOW_TICKS  <- TRUE   # 是否显示刻度尺
 
