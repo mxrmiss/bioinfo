@@ -22,7 +22,7 @@
 
 # --- [A. 输入/输出设置] ---
 # 默认 NULL (自动扫描 input/ 文件夹)
-INPUT_GENOME_FILE <- NULL 
+INPUT_GENOME_FILE <- NULL
 INPUT_LINKS_FILE  <- NULL
 CUSTOM_OUT_DIR    <- NULL   # 自定义输出子文件夹
 CUSTOM_FILENAME   <- NULL   # 自定义输出文件名前缀
@@ -35,7 +35,7 @@ SHOW_TICKS  <- TRUE   # 是否显示刻度尺
 # --- [C. 标签与命名] ---
 # 自动缩写: S_constricta -> Sco
 # 如需手动指定: CUSTOM_ABBREV <- c("S_constricta" = "Sco", "S_rivularis" = "Sri")
-CUSTOM_ABBREV <- NULL 
+CUSTOM_ABBREV <- NULL
 
 # --- [D. 配色风格选择] ---
 # 1. "nature"      : [默认] NPG 风格。红蓝绿灰主调，稳重优雅，适合大多数期刊。
@@ -45,7 +45,7 @@ CUSTOM_ABBREV <- NULL
 # 5. "pastel"      : 糖果色 (Pastel)。色彩柔和，适合做背景。
 # 6. "simple"      : 极简双色。物种A全红系，物种B全蓝系。
 # 7. "rainbow"     : 经典彩虹色。
-COLOR_STYLE     <- "nature" 
+COLOR_STYLE     <- "nature"
 
 # --- [E. 绘图细节] ---
 LINK_ALPHA      <- 0.5       # 绸带透明度 (0.5 最佳)
@@ -53,6 +53,7 @@ GAP_DEGREE      <- 1.5       # [调整] 染色体间隙 (默认 1.5，更紧凑)
 BIG_GAP         <- 5         # [调整] 物种间间隙 (默认 5，不用分太开)
 LABEL_SIZE      <- 0.8       # 标签字号
 AXIS_GAP        <- 10        # 刻度间隔 (Mb)
+LABEL_MIN_SIZE_MB <- 10      # 只有长度 ≥ 该阈值 (Mb) 的染色体才绘制标签
 
 # ==========================================================================================
 # ⚠️ 核心逻辑区 (CORE LOGIC)
@@ -62,10 +63,13 @@ suppressPackageStartupMessages({
   library(circlize)
   library(RColorBrewer)
   library(data.table)
-  library(stringr) 
+  library(stringr)
   library(dplyr)
   library(grDevices)
 })
+
+# 将标签长度阈值转换为碱基数
+LABEL_MIN_SIZE <- LABEL_MIN_SIZE_MB * 1000000
 
 # --- 1. 环境准备 ---
 DIR_ROOT   <- getwd()
@@ -80,13 +84,13 @@ cat(">> Magic Plotting Kit: Chromosome Synteny (v5.5 Fixed)\n")
 if (is.null(INPUT_GENOME_FILE) || is.null(INPUT_LINKS_FILE)) {
   all_files <- list.files(DIR_INPUT, pattern = "\\.tsv$", full.names = TRUE)
   if (length(all_files) == 0) stop("[错误] input/ 文件夹为空。")
-  
+
   f_genome <- all_files[grepl("genome_len", basename(all_files))][1]
   f_links  <- all_files[grepl("synteny_blocks", basename(all_files))][1]
   if (is.na(f_links)) f_links <- all_files[grepl("gene_links", basename(all_files))][1]
-  
+
   if (is.na(f_genome) || is.na(f_links)) stop("[错误] 缺少数据文件。")
-  
+
   df_chr <- as.data.frame(fread(f_genome))
   df_link <- as.data.frame(fread(f_links))
 } else {
@@ -104,8 +108,8 @@ if (all(req_cols %in% colnames(df_link))) {
 
 # --- 3. 智能命名处理 ---
 raw_species <- unique(df_chr$species)
-sp_map <- list()      
-legend_map <- list()  
+sp_map <- list()
+legend_map <- list()
 
 for (sp in raw_species) {
   if (!is.null(CUSTOM_ABBREV) && sp %in% names(CUSTOM_ABBREV)) {
@@ -122,15 +126,17 @@ for (sp in raw_species) {
   legend_map[[abbr]] <- gsub("_", ". ", sp)
 }
 
-df_chr$label <- mapply(function(chr, sp) {
-  num <- str_extract(chr, "\\d+$")
-  if (is.na(num)) num <- chr       
-  paste0(sp_map[[sp]], num)        
-}, df_chr$chr, df_chr$species)
-
+# 按物种 + 染色体名排序，并在每个物种内部重新编号 01,02,... 作为标签编号
 df_chr <- df_chr %>%
-  mutate(num_part = as.numeric(str_extract(label, "\\d+"))) %>%
-  arrange(species, num_part) 
+  group_by(species) %>%
+  arrange(chr, .by_group = TRUE) %>%
+  mutate(chr_index = row_number()) %>%
+  ungroup()
+
+df_chr$label <- mapply(function(idx, sp) {
+  num <- sprintf("%02d", idx)
+  paste0(sp_map[[sp]], num)
+}, df_chr$chr_index, df_chr$species)
 
 df_chr$chr <- factor(df_chr$chr, levels = df_chr$chr)
 
@@ -140,25 +146,25 @@ generate_palette <- function(style, n) {
     # NPG 风格 (Nature)
     cols <- c("#E64B35", "#4DBBD5", "#00A087", "#3C5488", "#F39B7F", "#8491B4", "#91D1C2", "#DC0000", "#7E6148")
     return(colorRampPalette(cols)(n))
-    
+
   } else if (style == "distinct_12") {
     # 12色高反差
     cols <- c("#E41A1C", "#1F78B4", "#33A02C", "#6A3D9A", "#FF7F00", "#B15928",
               "#A6CEE3", "#B2DF8A", "#FB9A99", "#FDBF6F", "#CAB2D6", "#FFFF99")
     return(rep(cols, length.out = n))
-    
+
   } else if (style == "science") {
     # AAAS 风格
     cols <- c("#3B4992", "#EE0000", "#008B45", "#631879", "#008280", "#BB0021", "#5F559B")
     return(colorRampPalette(cols)(n))
-    
+
   } else if (style == "viridis") {
     return(hcl.colors(n, palette = "Viridis"))
-    
+
   } else if (style == "pastel") {
     cols <- brewer.pal(12, "Set3")
     return(rep(cols, length.out = n))
-    
+
   } else if (style == "simple") {
     sp_counts <- table(df_chr$species)[raw_species]
     col_list <- c()
@@ -168,7 +174,7 @@ generate_palette <- function(style, n) {
       col_list <- c(col_list, pal)
     }
     return(col_list)
-    
+
   } else {
     return(rainbow(n))
   }
@@ -186,69 +192,72 @@ gaps[length(gaps)] <- BIG_GAP
 draw_core_plot <- function() {
   circos.clear()
   circos.par(start.degree = 90, gap.degree = gaps, cell.padding = c(0, 0, 0, 0), track.margin=c(0.01, 0.01))
-  
+
   circos.initialize(factors = df_chr$chr, xlim = cbind(0, df_chr$size))
-  
+
   # === 轨道 1: 染色体 + 沉浸式刻度 ===
   circos.track(ylim = c(0, 1), panel.fun = function(x, y) {
     chr_real_name = CELL_META$sector.index
     chr_label = df_chr$label[df_chr$chr == chr_real_name]
+    chr_size  = df_chr$size[df_chr$chr == chr_real_name][1]
     xlim = CELL_META$xlim
-    
+
     # 1. 染色体色块 (铺满整个轨道，0到1)
     # [集成设计] 不再留白，让色块填满
     circos.rect(xlim[1], 0, xlim[2], 1, col = grid_col[chr_real_name], border = NA)
-    
-    # 2. 标签 (弯曲排列)
-    circos.text(mean(xlim), 1.8, chr_label, 
-                facing = "bending.outside", 
-                niceFacing = TRUE, adj = c(0.5, 0), cex = LABEL_SIZE)
-    
+
+    # 2. 标签 (弯曲排列) —— 仅对长度 ≥ LABEL_MIN_SIZE 的染色体绘制
+    if (!is.na(chr_size) && chr_size >= LABEL_MIN_SIZE) {
+      circos.text(mean(xlim), 1.8, chr_label,
+                  facing = "bending.outside",
+                  niceFacing = TRUE, adj = c(0.5, 0), cex = LABEL_SIZE)
+    }
+
     # 3. 刻度尺 (Integrated / Clean Cut)
     if (SHOW_TICKS) {
       # 刻度画在色块底边 (y=0)
-      tick_y_pos <- 0 
+      tick_y_pos <- 0
       tick_step  <- AXIS_GAP * 1000000
-      
+
       # [自然截断] 计算最大整数刻度
       max_tick_pos <- floor(xlim[2] / tick_step) * tick_step
-      
+
       if (max_tick_pos > 0) {
         # A. 底线 (Bone): 只画到整数截断点
         # 黑色线条叠加在色块下边缘，形成清晰边界
         circos.lines(c(0, max_tick_pos), c(tick_y_pos, tick_y_pos), col = "black", lwd = 0.5)
-        
+
         # B. 刻度 (Ticks): 标准整数序列
         major_at = seq(0, max_tick_pos, by = tick_step)
-        
-        circos.axis(h = tick_y_pos, major.at = major_at, labels = NULL, 
+
+        circos.axis(h = tick_y_pos, major.at = major_at, labels = NULL,
                     major.tick.length = 0.5, lwd = 0.5)
       }
     }
   }, bg.border = NA, track.height = 0.05)
-  
+
   # === 核心: 绘制绸带 ===
   ribbon_colors <- grid_col[df_ribbon$chr1]
-  
+
   # [修正点] 使用 genomicLink 绘制宽带 (当输入为区间时，genomicLink = Ribbon)
   circos.genomicLink(
-    df_ribbon[, 1:3], 
-    df_ribbon[, 4:6], 
-    col = adjustcolor(ribbon_colors, alpha.f = LINK_ALPHA), 
+    df_ribbon[, 1:3],
+    df_ribbon[, 4:6],
+    col = adjustcolor(ribbon_colors, alpha.f = LINK_ALPHA),
     border = NA
   )
-  
+
   # === 装饰 ===
   if (SHOW_LEGEND) {
     legend_texts <- c()
     for (abbr in names(legend_map)) {
       legend_texts <- c(legend_texts, paste0(abbr, " = ", legend_map[[abbr]]))
     }
-    legend("topleft", legend = legend_texts, 
-           bty = "n", cex = 1.0, text.font = 3, 
+    legend("topleft", legend = legend_texts,
+           bty = "n", cex = 1.0, text.font = 3,
            title = "Species Legend", title.adj = 0)
   }
-  
+
   if (SHOW_TITLE) {
     title_text <- paste(unique(legend_map), collapse = " vs ")
     title(title_text, cex.main = 1.2)
@@ -271,3 +280,4 @@ draw_core_plot()
 dev.off()
 
 cat(">> [Success] 绘图完成！\n")
+

@@ -302,11 +302,20 @@ def parse_gff_to_bed_and_coords(species: str, gff_path: str):
                 start, end = end, start
             attr = parts[8]
             gene_id = None
-            if "ID=" in attr:
+            # ✅ 修改处：优先使用 transcript_id=，兼容 NCBI Gnomon / RefSeq 风格
+            if "transcript_id=" in attr:
+                gene_id = attr.split("transcript_id=")[1].split(";")[0].strip().strip('"')
+            elif "ID=" in attr:
                 gene_id = attr.split("ID=")[1].split(";")[0]
             elif "gene_id" in attr:
                 # 兼容部分 gtf 风格
-                gene_id = attr.split("gene_id")[1].strip().lstrip("=").strip('"; ').split(";")[0]
+                gene_id = (
+                    attr.split("gene_id")[1]
+                    .strip()
+                    .lstrip("=")
+                    .strip('"; ')
+                    .split(";")[0]
+                )
             if not gene_id:
                 continue
             tmp_features.append((chrom, start, end, gene_id))
