@@ -11,10 +11,14 @@
    - D_beb_sites.tsv  —— BEB 正选择位点表
 3) 若 config.psg.enable = true，则额外：
    - 为每个前景 FG 构建 PSG cds 富集输入，符合 vNext ORA 接口形状：
-       codeml_agg_dir / psg_cds_inputs / psg_<FG> /
+       codeml_agg_dir / psg_cds_inputs / psg_<FG> /       （以 q 值显著为标准）
          ├─ test.list        # PSG cds_id 集合
          ├─ background.list  # 背景 cds_id 集合
          └─ meta.tsv         # 元信息说明
+       codeml_agg_dir / psg_cds_inputs_rawp / psg_rawp_<FG> / （以原始 P 值为标准）
+         ├─ test.list
+         ├─ background.list
+         └─ meta.tsv
 
 注意：
 - 本脚本只处理到 cds 粒度；cds → gene_id 的映射由下游脚本完成。
@@ -138,14 +142,17 @@ def parse_beb_lines(mlc_text: str, cutoff: float = 0.95) -> List[Tuple[int, str,
     """
     解析 BEB 正选择位点表（逐行解析，不跨行）：
 
-    支持格式示例：
-      Positively selected sites (BEB):
-        123 K 0.999(*)
-        234 L 0.980
-      或类似不带表头的纯数据块，只要第一列是数字即可。
+    支持格式示例（PAML 4.9 / 4.10）：
+      Bayes Empirical Bayes (BEB) analysis ...
+      Positive sites for foreground lineages Prob(w>1):
+          123 K 0.999*
+          234 L 0.980
+      或类似不带表头的纯数据块，只要第一列是数字、第二列为氨基酸即可。
 
-    返回：
-      [(site, aa, post_prob), ...]  仅保留 post_prob >= cutoff 的位点。
+    注意：
+      - 只在“BEB/Positive sites …”块内部解析；
+      - 仅当第二列是氨基酸字母时才视为 BEB 位点，避免将 1 1 1.000 之类数字表误解析；
+      - 仅保留 posterior ≥ cutoff 的位点。
     """
     rows: List[Tuple[int, str, float]] = []
     in_beb_block = False
@@ -153,18 +160,35 @@ def parse_beb_lines(mlc_text: str, cutoff: float = 0.95) -> List[Tuple[int, str,
     for raw in mlc_text.splitlines():
         line = raw.rstrip()
 
-        # 进入 / 退出 BEB 区（宽松匹配关键字）
-        if re.search(r"Positively selected sites|Bayes Empirical Bayes|BEB", line, flags=re.I):
+        # 进入 BEB 区（宽松匹配关键字）
+        if re.search(r"Bayes Empirical Bayes|BEB analysis|Positively selected sites|Positive sites for foreground lineages", line, flags=re.I):
             in_beb_block = True
             continue
-        if in_beb_block and not line.strip():
-            in_beb_block = False
+
+        # 离开 BEB 块：空行或开始其它小节
+        if in_beb_block:
+            if not line.strip():
+                in_beb_block = False
+                continue
+            if re.match(r"\s*(The grid|Posterior on the grid|Posterior for p0-p1)", line):
+                # BEB 位点段结束，后面是数值网格/后验表，不应解析为位点
+                in_beb_block = False
+                continue
+
+        if not in_beb_block:
             continue
 
         parts = line.split()
         if len(parts) < 3:
             continue
+        # 第一列必须是位点编号（纯数字）
         if not parts[0].isdigit():
+            continue
+        site = int(parts[0])
+
+        aa = parts[1]
+        # 第二列必须是氨基酸字母而不是数字，避免把 "1 1 1.000" 之类的行当成位点
+        if not re.fullmatch(r"[A-Za-z\*]+", aa):
             continue
 
         # 从行尾往前找数值 token（剥离星标 *）
@@ -179,12 +203,11 @@ def parse_beb_lines(mlc_text: str, cutoff: float = 0.95) -> List[Tuple[int, str,
 
         try:
             post = float(post_tok)
-            if post >= cutoff:
-                site = int(parts[0])
-                aa   = parts[1]
-                rows.append((site, aa, post))
         except Exception:
             continue
+
+        if post >= cutoff:
+            rows.append((site, aa, post))
 
     return rows
 
@@ -219,10 +242,17 @@ def build_psg_cds_inputs(cfg: Dict[str, Any],
     """
     基于 codeml 聚合结果（rows_genes + qvals），构建 PSG cds 富集输入：
 
-      codeml_agg_dir / psg_cds_inputs / psg_<FG> /
-        ├─ test.list        # PSG cds_id 集合（cds 空间）
-        ├─ background.list  # 背景 cds_id 集合（cds 空间）
-        └─ meta.tsv         # 元信息（tag, id_space, fdr_cutoff 等）
+      1）q 值显著版（现有发布包）：
+          codeml_agg_dir / psg_cds_inputs / psg_<FG> /
+            ├─ test.list        # PSG cds_id 集合（cds 空间，q <= fdr_alpha）
+            ├─ background.list  # 背景 cds_id 集合（cds 空间）
+            └─ meta.tsv
+
+      2）原始 P 值显著版（新增发布包）：
+          codeml_agg_dir / psg_cds_inputs_rawp / psg_rawp_<FG> /
+            ├─ test.list        # PSG cds_id 集合（cds 空间，P <= p_alpha）
+            ├─ background.list  # 背景 cds_id 集合（cds 空间）
+            └─ meta.tsv
 
     注意：
       - 本函数只在 cfg["psg"]["enable"] 为 True 且 rows_genes 非空时调用；
@@ -251,21 +281,36 @@ def build_psg_cds_inputs(cfg: Dict[str, Any],
         log.warning(f"[PSG] 无法解析 FDR 阈值（{fdr_alpha!r}），回退为 0.05。")
         fdr_alpha = 0.05
 
-    # Step 1: 按 FG 汇总 OG 背景 & PSG 集合
-    bg_ogs: Dict[str, set] = defaultdict(set)
-    sig_ogs: Dict[str, set] = defaultdict(set)
+    # 解析 PSG 原始 P 值阈值：psg.p_alpha 优先，否则默认 0.01
+    p_alpha = psg_cfg.get("p_alpha")
+    if p_alpha is None:
+        p_alpha = 0.01
+        log.warning("[PSG] 未在 config 中设置 psg.p_alpha，使用默认原始 P 值阈值 0.01。")
+    try:
+        p_alpha = float(p_alpha)
+    except Exception:
+        log.warning(f"[PSG] 无法解析原始 P 值阈值（{p_alpha!r}），回退为 0.01。")
+        p_alpha = 0.01
+
+    # Step 1: 按 FG 汇总 OG 背景 & PSG 集合（分别记 q 阈值与 p 阈值）
+    bg_ogs: Dict[str, set]    = defaultdict(set)
+    sig_ogs_q: Dict[str, set] = defaultdict(set)
+    sig_ogs_p: Dict[str, set] = defaultdict(set)
 
     for row, q in zip(rows_genes, qvals):
         if len(row) < 4:
             continue
-        og, fg, _, _ = row
+        og, fg, _, p_str = row
         try:
             qv = float(q)
+            pv = float(p_str)
         except Exception:
             continue
         bg_ogs[fg].add(og)
         if qv <= fdr_alpha:
-            sig_ogs[fg].add(og)
+            sig_ogs_q[fg].add(og)
+        if pv <= p_alpha:
+            sig_ogs_p[fg].add(og)
 
     if not bg_ogs:
         log.warning("[PSG] D_fdr_genes.tsv 中没有任何可用记录，跳过 PSG cds 富集输入构建。")
@@ -333,14 +378,19 @@ def build_psg_cds_inputs(cfg: Dict[str, Any],
         og2rows[og] = rows
         return og2rows[og]
 
-    # Step 4: PSG cds 富集输入输出根目录
-    cds_dir_name = psg_cfg.get("cds_inputs_dir") or "psg_cds_inputs"
-    psg_root = ensure_dir(out_dir / cds_dir_name)
+    # Step 4: PSG cds 富集输入输出根目录（q 版 + p 版）
+    cds_dir_name_q = psg_cfg.get("cds_inputs_dir") or "psg_cds_inputs"
+    cds_dir_name_p = psg_cfg.get("cds_inputs_rawp_dir") or "psg_cds_inputs_rawp"
+    psg_root_q = ensure_dir(out_dir / cds_dir_name_q)
+    psg_root_p = ensure_dir(out_dir / cds_dir_name_p)
 
-    fg_processed = 0
+    fg_processed_q = 0
+    fg_processed_p = 0
+
     for fg in sorted(bg_ogs.keys()):
-        ogs_bg = bg_ogs[fg]
-        ogs_sig = sig_ogs.get(fg, set())
+        ogs_bg   = bg_ogs[fg]
+        ogs_sig_q = sig_ogs_q.get(fg, set())
+        ogs_sig_p = sig_ogs_p.get(fg, set())
 
         if fg not in fg_species:
             log.error(f"[PSG] FG={fg} 在 sets/ 目录中找不到对应 .list 文件，跳过该前景。")
@@ -350,82 +400,143 @@ def build_psg_cds_inputs(cfg: Dict[str, Any],
         if not tips:
             log.warning(f"[PSG] FG={fg} 的前景物种集合为空，继续构建但可能得到空的 cds 集合。")
 
+        # 构建一个通用的背景 cds 集合（q 版/p 版共享）
         bg_cds_set: set = set()
-        sig_cds_set: set = set()
+        og2cds_cache: Dict[str, List[Tuple[str, str]]] = {}
 
         for og in sorted(ogs_bg):
             rows = get_og_rows(og)
+            og2cds_cache[og] = rows
             if not rows:
                 continue
             for species, cds_id in rows:
                 if species not in tips:
                     continue
                 bg_cds_set.add(cds_id)
-                if og in ogs_sig:
-                    sig_cds_set.add(cds_id)
 
-        n_ogs_bg  = len(ogs_bg)
-        n_ogs_sig = len(ogs_sig)
-        n_cds_bg  = len(bg_cds_set)
-        n_cds_sig = len(sig_cds_set)
-
+        n_ogs_bg = len(ogs_bg)
+        n_cds_bg = len(bg_cds_set)
         if n_ogs_bg == 0:
             log.warning(f"[PSG] FG={fg} 背景 OG 数为 0，跳过该前景。")
             continue
 
-        tag = f"psg_{fg}"
-        fg_dir = ensure_dir(psg_root / tag)
-
-        # 写 background.list（cds_id，一列，无表头）
-        bg_txt = "\n".join(sorted(bg_cds_set))
-        if bg_txt:
-            bg_txt += "\n"
-        (fg_dir / "background.list").write_text(bg_txt, encoding="utf-8")
-
-        # 写 test.list（cds_id，一列，无表头）
-        test_txt = "\n".join(sorted(sig_cds_set))
-        if test_txt:
-            test_txt += "\n"
-        (fg_dir / "test.list").write_text(test_txt, encoding="utf-8")
-
-        # 写 meta.tsv（vNext 风格）
         fg_tips_str = ",".join(sorted(tips))
         head_meta = "\t".join([
             "tag","id_space","source","fg_label","fg_tips",
             "fdr_cutoff","n_ogs_bg","n_ogs_sig","n_cds_bg","n_cds_sig","note"
         ])
-        note = "branch-site; terminals_mode"
-        row_meta = "\t".join([
-            tag,
+
+        # ------- 4A. q 值显著版：沿用原有发布结构 -------
+        sig_cds_set_q: set = set()
+        for og in sorted(ogs_sig_q):
+            rows = og2cds_cache.get(og) or get_og_rows(og)
+            for species, cds_id in rows:
+                if species not in tips:
+                    continue
+                sig_cds_set_q.add(cds_id)
+
+        n_ogs_sig_q = len(ogs_sig_q)
+        n_cds_sig_q = len(sig_cds_set_q)
+
+        tag_q = f"psg_{fg}"
+        fg_dir_q = ensure_dir(psg_root_q / tag_q)
+
+        bg_txt = "\n".join(sorted(bg_cds_set))
+        if bg_txt:
+            bg_txt += "\n"
+        (fg_dir_q / "background.list").write_text(bg_txt, encoding="utf-8")
+
+        test_txt_q = "\n".join(sorted(sig_cds_set_q))
+        if test_txt_q:
+            test_txt_q += "\n"
+        (fg_dir_q / "test.list").write_text(test_txt_q, encoding="utf-8")
+
+        note_q = "branch-site; terminals_mode; criterion=q<=fdr_alpha"
+        row_meta_q = "\t".join([
+            tag_q,
             "cds_id",
             "aphylo_codeml_branchsite",
             fg,
             fg_tips_str,
             f"{fdr_alpha:.6g}",
             str(n_ogs_bg),
-            str(n_ogs_sig),
+            str(n_ogs_sig_q),
             str(n_cds_bg),
-            str(n_cds_sig),
-            note,
+            str(n_cds_sig_q),
+            note_q,
         ])
-        (fg_dir / "meta.tsv").write_text(head_meta + "\n" + row_meta + "\n", encoding="utf-8")
+        (fg_dir_q / "meta.tsv").write_text(head_meta + "\n" + row_meta_q + "\n", encoding="utf-8")
 
         if n_cds_bg == 0:
-            log.warning(f"[PSG] FG={fg} 无任何 cds 进入 PSG 背景（n_ogs_bg={n_ogs_bg}），background.list 为空。")
-        if n_cds_sig == 0:
-            log.warning(f"[PSG] FG={fg} 无任何显著 PSG cds（q <= {fdr_alpha}），test.list 为空。")
+            log.warning(f"[PSG] [Q] FG={fg} 无任何 cds 进入 PSG 背景（n_ogs_bg={n_ogs_bg}），background.list 为空。")
+        if n_cds_sig_q == 0:
+            log.warning(f"[PSG] [Q] FG={fg} 无任何显著 PSG cds（q <= {fdr_alpha}），test.list 为空。")
 
         log.info(
-            f"[PSG] FG={fg} → tag={tag}, "
-            f"OGs(bg/sig)={n_ogs_bg}/{n_ogs_sig}, CDS(bg/sig)={n_cds_bg}/{n_cds_sig}"
+            f"[PSG] [Q] FG={fg} → tag={tag_q}, "
+            f"OGs(bg/sig)={n_ogs_bg}/{n_ogs_sig_q}, CDS(bg/sig)={n_cds_bg}/{n_cds_sig_q}"
         )
-        fg_processed += 1
+        fg_processed_q += 1
 
-    if fg_processed == 0:
-        log.warning("[PSG] 没有任何前景成功构建 PSG cds 富集输入。")
+        # ------- 4B. 原始 P 值显著版：新增发布结构 -------
+        sig_cds_set_p: set = set()
+        for og in sorted(ogs_sig_p):
+            rows = og2cds_cache.get(og) or get_og_rows(og)
+            for species, cds_id in rows:
+                if species not in tips:
+                    continue
+                sig_cds_set_p.add(cds_id)
+
+        n_ogs_sig_p = len(ogs_sig_p)
+        n_cds_sig_p = len(sig_cds_set_p)
+
+        tag_p = f"psg_rawp_{fg}"
+        fg_dir_p = ensure_dir(psg_root_p / tag_p)
+
+        # 背景依旧是同一份 bg_txt
+        (fg_dir_p / "background.list").write_text(bg_txt, encoding="utf-8")
+
+        test_txt_p = "\n".join(sorted(sig_cds_set_p))
+        if test_txt_p:
+            test_txt_p += "\n"
+        (fg_dir_p / "test.list").write_text(test_txt_p, encoding="utf-8")
+
+        note_p = "branch-site; terminals_mode; criterion=p<=p_alpha (raw P)"
+        row_meta_p = "\t".join([
+            tag_p,
+            "cds_id",
+            "aphylo_codeml_branchsite",
+            fg,
+            fg_tips_str,
+            f"{p_alpha:.6g}",
+            str(n_ogs_bg),
+            str(n_ogs_sig_p),
+            str(n_cds_bg),
+            str(n_cds_sig_p),
+            note_p,
+        ])
+        (fg_dir_p / "meta.tsv").write_text(head_meta + "\n" + row_meta_p + "\n", encoding="utf-8")
+
+        if n_cds_sig_p == 0:
+            log.info(f"[PSG] [P] FG={fg} 在原始 P 阈值 {p_alpha} 下无显著 PSG cds，test.list 为空。")
+        else:
+            log.info(
+                f"[PSG] [P] FG={fg} → tag={tag_p}, "
+                f"OGs(bg/sig)={n_ogs_bg}/{n_ogs_sig_p}, CDS(bg/sig)={n_cds_bg}/{n_cds_sig_p}"
+            )
+        fg_processed_p += 1
+
+    if fg_processed_q == 0:
+        log.warning("[PSG] 没有任何前景成功构建 PSG cds 富集输入（q 值版）。")
     else:
-        write_done(psg_root / ".psg_cds_inputs.done")
-        log.info(f"[PSG] PSG cds 富集输入构建完成，前景数={fg_processed}，输出目录={psg_root}")
+        write_done(psg_root_q / ".psg_cds_inputs.done")
+        log.info(f"[PSG] PSG cds 富集输入构建完成（q 值版），前景数={fg_processed_q}，输出目录={psg_root_q}")
+
+    if fg_processed_p == 0:
+        log.warning("[PSG] 没有任何前景成功构建 PSG cds 富集输入（原始 P 值版）。")
+    else:
+        write_done(psg_root_p / ".psg_cds_inputs_rawp.done")
+        log.info(f"[PSG] PSG cds 富集输入构建完成（原始 P 值版），前景数={fg_processed_p}，输出目录={psg_root_p}")
 
 # ===================== 主流程 =====================
 
@@ -504,3 +615,4 @@ if __name__ == "__main__":
     except Exception as e:
         sys.stderr.write(str(e) + "\n")
         sys.exit(2)
+
