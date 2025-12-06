@@ -59,17 +59,13 @@ species_tree:
     top_n_partitions: 1000
 
 positive_selection:
-  output_dir: "results/publish/aphylo_psg_subset"
+  output_dir: "results/publish/aphylo_ready"
   species_subset:
     - Sinonovacula_constricta
     - Tegillarca_granosa
-    - Ruditapes_philippinarum
     - Crassostrea_gigas
-    - Mizuhopecten_yessoensis
-    - Mytilus_galloprovincialis
-    - Mya_arenaria
-    - Panopea_generosa
-    - Meretrix_meretrix
+    - Crassostrea_ariakensis
+    - Cyclina_sinensis
 
 binaries:
   python: python
