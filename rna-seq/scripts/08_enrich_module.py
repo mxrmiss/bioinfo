@@ -246,54 +246,78 @@ def main() -> None:
         if not fp.exists():
             log.warning("注释文件缺失（可在 08_g_enrich.R 中进一步检查）：%s", fp)
 
-    # 读取 gene 矩阵
+    # 读取 gene 矩阵（若失败则仅使用外部 tag 通道）
+    matrix_available = True
     try:
         gene_ids_counts, samples_counts, counts_mat = read_gene_matrix(counts_fp)
         gene_ids_tpm, samples_tpm, tpm_mat = read_gene_matrix(tpm_fp)
     except Exception as e:
-        log.error("读取表达矩阵失败：%s", e)
-        sys.exit(1)
+        log.warning(
+            "读取表达矩阵失败，将跳过 RNA 对比，仅使用外部 tag 的背景；原因：%s",
+            e,
+        )
+        matrix_available = False
+        gene_ids_counts, samples_counts, counts_mat = [], [], {}
+        gene_ids_tpm, samples_tpm, tpm_mat = [], [], {}
 
-    if gene_ids_counts != gene_ids_tpm or samples_counts != samples_tpm:
-        log.warning("counts 与 TPM 的行/列不完全一致，将以 counts 为准对齐 TPM")
+    if matrix_available:
+        if gene_ids_counts != gene_ids_tpm or samples_counts != samples_tpm:
+            log.warning("counts 与 TPM 的行/列不完全一致，将以 counts 为准对齐 TPM")
+        gene_ids = gene_ids_counts
+        samples = samples_counts
+    else:
+        gene_ids = []
+        samples = []
 
-    gene_ids = gene_ids_counts
-    samples = samples_counts
-
-    # 样本与对比信息
-    if not samples_tsv.exists() or not contrasts_tsv.exists():
-        log.error("samples.tsv 或 contrasts.tsv 不存在：%s, %s", samples_tsv, contrasts_tsv)
-        sys.exit(1)
-
+    # 样本与对比信息（若缺失则仅使用外部 tag 通道）
     sample_group: Dict[str, str] = {}
-    with samples_tsv.open("r", encoding="utf-8") as f:
-        reader = csv.DictReader(f, delimiter="\t")
-        if "sample" not in reader.fieldnames or "group" not in reader.fieldnames:
-            log.error("samples.tsv 必须包含列：sample, group")
-            sys.exit(1)
-        for row in reader:
-            sid = (row.get("sample") or "").strip()
-            grp = (row.get("group") or "").strip()
-            if sid:
-                sample_group[sid] = grp
-
     contrasts: List[Tuple[str, str, str]] = []
-    with contrasts_tsv.open("r", encoding="utf-8") as f:
-        reader = csv.DictReader(f, delimiter="\t")
-        required_cols = ["contrast", "case", "control"]
-        miss = [c for c in required_cols if c not in (reader.fieldnames or [])]
-        if miss:
-            log.error("contrasts.tsv 需要包含列：%s", ",".join(required_cols))
-            sys.exit(1)
-        for row in reader:
-            label = (row.get("contrast") or "").strip()
-            case = (row.get("case") or "").strip()
-            ctrl = (row.get("control") or "").strip()
-            if not label:
-                continue
-            contrasts.append((label, case, ctrl))
 
-    log.info("检测到 RNA 对比数量：%d", len(contrasts))
+    if matrix_available:
+        if not samples_tsv.exists() or not contrasts_tsv.exists():
+            log.warning(
+                "samples.tsv 或 contrasts.tsv 不存在，将跳过 RNA 对比，仅处理外部 tag：%s, %s",
+                samples_tsv,
+                contrasts_tsv,
+            )
+            matrix_available = False
+        else:
+            with samples_tsv.open("r", encoding="utf-8") as f:
+                reader = csv.DictReader(f, delimiter="\t")
+                if "sample" not in (reader.fieldnames or []) or "group" not in (reader.fieldnames or []):
+                    log.warning("samples.tsv 必须包含列 sample, group，将跳过 RNA 对比，仅处理外部 tag")
+                    matrix_available = False
+                else:
+                    for row in reader:
+                        sid = (row.get("sample") or "").strip()
+                        grp = (row.get("group") or "").strip()
+                        if sid:
+                            sample_group[sid] = grp
+
+            if matrix_available:
+                with contrasts_tsv.open("r", encoding="utf-8") as f:
+                    reader = csv.DictReader(f, delimiter="\t")
+                    required_cols = ["contrast", "case", "control"]
+                    miss = [c for c in required_cols if c not in (reader.fieldnames or [])]
+                    if miss:
+                        log.warning(
+                            "contrasts.tsv 需要包含列：%s，将跳过 RNA 对比，仅处理外部 tag",
+                            ",".join(required_cols),
+                        )
+                        matrix_available = False
+                    else:
+                        for row in reader:
+                            label = (row.get("contrast") or "").strip()
+                            case = (row.get("case") or "").strip()
+                            ctrl = (row.get("control") or "").strip()
+                            if not label:
+                                continue
+                            contrasts.append((label, case, ctrl))
+
+    if matrix_available:
+        log.info("检测到 RNA 对比数量：%d", len(contrasts))
+    else:
+        log.info("RNA 对比模块已关闭，本次仅使用外部 tag 的 ORA 背景（如存在）。")
 
     # 注释基因宇宙
     annot_gene_universe = read_gene_universe_from_annotations(dir_annot)
@@ -632,3 +656,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

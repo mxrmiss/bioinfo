@@ -294,6 +294,7 @@ go_obsolete_policy <- cfg$go$obsolete_policy %||% "replace_or_consider"
 
 enrich_fdr <- cfg$enrich$fdr %||% 0.05
 enrich_output_sig_sorted <- cfg$enrich$output_sig_sorted %||% TRUE
+use_pvalue_cutoff_1 <- cfg$enrich$use_pvalue_cutoff_1 %||% FALSE
 
 kegg_count_mode <- cfg$kegg$count_mode %||% "by_gene"
 kegg_padj_method <- cfg$kegg$p_adjust_method %||% "BH"
@@ -457,6 +458,7 @@ for (lb in labels_unique) {
           pAdjustMethod = go_padj_method,
           minGS         = go_minGS,
           maxGS         = go_maxGS,
+          pvalueCutoff  = if (isTRUE(use_pvalue_cutoff_1)) 1.0 else 0.05,
           qvalueCutoff  = 1.0
         ),
         error = function(e) {
@@ -537,6 +539,7 @@ for (lb in labels_unique) {
           pAdjustMethod = kegg_padj_method,
           minGS         = go_minGS,
           maxGS         = go_maxGS,
+          pvalueCutoff  = if (isTRUE(use_pvalue_cutoff_1)) 1.0 else 0.05,
           qvalueCutoff  = 1.0
         ),
         error = function(e) {
@@ -799,7 +802,7 @@ for (lb in labels_unique) {
               kegg_gsea_sig_n <- 0L
               gsea_dir <- file.path(outdir_label, "gsea")
               ensure_dir(gsea_dir)
-              kegg_gsea_fp <- file.path(gsea_dir, "KEGG_gsea.tsv")
+              kegg_gsea_fp <- file.path(outdir_label, "gsea/KEGG_gsea.tsv")
               empty_dt <- data.table(
                 term_id          = character(),
                 term_name        = character(),

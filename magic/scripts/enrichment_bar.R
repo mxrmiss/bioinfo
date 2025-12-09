@@ -27,7 +27,7 @@ suppressPackageStartupMessages({
 # 强烈建议 TRUE (锁死)，这也是你最初代码的默认行为
 USE_FIXED_HEIGHT    <- TRUE
 FIXED_HEIGHT_VAL    <- 9.5     # [原版标准] 
-SINGLE_ASPECT_RATIO <- 1.7     # [原版标准] 宽高比 (决定了绘图区的胖瘦)
+SINGLE_ASPECT_RATIO <- 2.0     # [原版标准] 宽高比 (决定了绘图区的胖瘦)
 
 # 2. 自动高度 (仅在 USE_FIXED_HEIGHT = FALSE 时生效)
 ROW_HEIGHT_INCH     <- 0.35
