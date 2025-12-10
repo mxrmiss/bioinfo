@@ -30,11 +30,11 @@ reference:
 # ------------------------------ 运行资源 ------------------------------
 resources:
   threads:
-    qc:      40
-    salmon:  40
-    tximport: 40
-    deg:     40
-    enrich:  40
+    qc:      30
+    salmon:  30
+    tximport: 30
+    deg:     30
+    enrich:  30
   memory_gb:
     qc:      90
     salmon:  90
@@ -115,7 +115,7 @@ background:
 
 # ------------------------------ GO 富集（08 使用） ------------------------------
 go:
-  minGS: 10
+  minGS: 2
   maxGS: 500
   p_adjust_method: "BH"
   obsolete_policy: "replace_or_consider"
@@ -135,7 +135,7 @@ kegg:
 
 # ------------------------------ GSEA 富集（08使用） --------------------------------
 gsea:
-  enable: true            # 是否启用 GSEA 通道
+  enable: false            # 是否启用 GSEA 通道
   score_from: "stat"      # 使用 DESeq2 的哪一列作为排名：stat 或 log2fc
   minGS: 10               # 基因集最小大小（与 GO ORA 保持一致即可）
   maxGS: 500              # 基因集最大大小（一般不用改）
@@ -150,6 +150,7 @@ enrich:
   add_go_sig_tables: true
   output_sig_sorted: true
   write_universe_meta: true
+  use_pvalue_cutoff_1: false
 
 # ------------------------------ 发布与装订（09 使用） ------------------------------
 publish:
