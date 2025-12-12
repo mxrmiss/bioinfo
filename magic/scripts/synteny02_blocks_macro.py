@@ -3,9 +3,9 @@
 
 """
 synteny02_blocks_macro.py
-—— JCVI MCscan 结果整理：blocks 标准化 + 染色体着色 segments + anchors.simple 过滤
+—— JCVI MCscan 结果整理：blocks 标准化 + 染色体 segments + anchors.simple 过滤
 
-当前版本职责（对应蓝图的 Step 02）：
+当前职责（对应蓝图的 Step 02）：
   1) 02a：统一调用 jcvi 为“参考物种 vs 其它物种”生成 anchors.simple：
        - 在 raw_jcvi/ 下为每个物种准备 <short>.bed + <short>.pep 软链接；
        - 调用：
@@ -22,8 +22,8 @@ synteny02_blocks_macro.py
 说明：
   - 本脚本使用的共线信息全部来自 jcvi 输出的 anchors.simple，
     不依赖 synteny_01 的 BLAST 文件（01 的 BLAST 可用于后续其它分析）。
-  - 颜色表 color_table_ref_chr.tsv 若存在，则 paint_segments 会附带 color_hex；
-    若不存在，则 color_hex 留空，由后续步骤再补色。
+  - paint_segments 仅负责各物种染色体上“对应参考 Chr 的区段”坐标信息，
+    不再包含颜色信息；颜色由后续出图脚本统一分配。
 """
 
 from __future__ import annotations
@@ -33,6 +33,7 @@ import csv
 import shutil
 import logging
 import subprocess
+import os
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional
 from collections import defaultdict
@@ -61,9 +62,6 @@ BLOCKS_NORMALIZED_DIR = OUTPUT_ROOT / "blocks_normalized"
 PAINT_SEGMENTS_DIR = OUTPUT_ROOT / "paint_segments"
 ANCHORS_FOR_LINKS_DIR = OUTPUT_ROOT / "anchors_for_links"
 
-# 可选：颜色表（ref_chr -> color_hex）
-COLOR_TABLE_FILE = PROJECT_ROOT / "output" / "synteny_04_layout" / "color_table_ref_chr.tsv"
-
 # 是否在脚本内调用 jcvi 生成 anchors.simple
 # 当前设为 True：00 → 01 → 02 一条龙，无需额外手动步骤。
 RUN_JCVI_PIPELINE = True
@@ -82,26 +80,19 @@ MIN_SEGMENT_LENGTH_BP = 100_000
 # 日志等级
 LOG_LEVEL = "INFO"
 
+# jcvi dotplot 字体设置：
+#   - DOTPLOT_SANS_SERIF_FONTS：写入 matplotlibrc 的 sans-serif 字体列表（按顺序偏好）。
+#   - ENABLE_DOTPLOT_FONT_TWEAK：
+#       True  时：为 jcvi 子进程设置 MPLCONFIGDIR，使 dotplot 使用这些字体。
+#       False 时：完全不干预，使用 jcvi / matplotlib 默认字体。
+DOTPLOT_SANS_SERIF_FONTS: List[str] = ["Arial", "DejaVu Sans"]
+ENABLE_DOTPLOT_FONT_TWEAK = True
 
-# 物种短名映射（用于 jcvi 文件前缀等）
-SPECIES_SHORT_NAME: Dict[str, str] = {
-    "Sinonovacula_constricta": "Sco",
-    "Sinonovacula_rivularis": "Sri",
-    "Novaculina_chinensis": "Nch",
-    "Panopea_generosa": "Pge",
-    "Mya_arenaria": "Mar",
-    "Meretrix_meretrix": "Mme",
-    "Mercenaria_mercenaria": "Mmc",
-    "Tegillarca_granosa": "Tgr",
-    "Mytilus_edulis": "Med",
-    "Mytilus_galloprovincialis": "Mga",
-    "Pinctada_fucata": "Pfu",
-    "Ostrea_edulis": "Oed",
-    "Crassostrea_gigas": "Cgi",
-    "Ctenoides_ales": "Cal",
-    "Pecten_maximus": "Pma",
-    "Argopecten_irradians": "Air",
-}
+# 供 run_cmd 使用的 MPLCONFIGDIR（若未成功创建则为 None）
+MPLCONFIG_DIR_FOR_JCVI: Optional[Path] = None
+
+# 物种短名映射表（运行时自动生成，不再手动维护）
+SHORT_NAME_MAP: Dict[str, str] = {}
 
 
 # =========================
@@ -145,6 +136,8 @@ def setup_logging(log_dir: Path) -> logging.Logger:
     logger.info("MIN_SEGMENT_LENGTH_BP            = %d", MIN_SEGMENT_LENGTH_BP)
     logger.info("JCVI_MINSPAN (screen --minspan)  = %d", JCVI_MINSPAN)
     logger.info("JCVI_CSCORE  (ortholog --cscore) = %.2f", JCVI_CSCORE)
+    logger.info("DOTPLOT_SANS_SERIF_FONTS         = %s", ", ".join(DOTPLOT_SANS_SERIF_FONTS))
+    logger.info("ENABLE_DOTPLOT_FONT_TWEAK        = %s", ENABLE_DOTPLOT_FONT_TWEAK)
 
     return logger
 
@@ -200,30 +193,121 @@ def load_species_meta(meta_file: Path, logger: logging.Logger) -> Tuple[List[str
     return species_ids, ref_species
 
 
+def build_short_name_map(species_ids: List[str], logger: logging.Logger) -> Dict[str, str]:
+    """
+    根据 species_id 自动生成短名：
+      - 初始规则：Genus[0] + species[:2]，例如：
+          Sinonovacula_constricta -> Sco
+      - 若不同物种间出现重名，则自动增加更多 species 字母，
+        直到在当前物种集合中唯一。
+
+    生成的映射会写入日志，以便检查。
+    """
+    mapping: Dict[str, str] = {}
+    used: Dict[str, str] = {}
+
+    for sid in species_ids:
+        parts = sid.split("_")
+        if len(parts) >= 2:
+            genus, species = parts[0], parts[1]
+        else:
+            genus, species = sid, ""
+
+        # 基础前缀：首字母 + 种名前两位（若不足则尽量多）
+        if species:
+            base = genus[0] + species[:2]
+        else:
+            base = (genus[:3] or sid[:3])
+
+        cand = base.capitalize()
+        # 若已被占用，则逐步延长种名部分，直至唯一
+        extra = 2
+        while cand in used and used[cand] != sid:
+            extra += 1
+            if species and extra < len(species):
+                cand = (genus[0] + species[:extra]).capitalize()
+            else:
+                # 退而求其次，拼接 genus 更多字母或序号
+                cand = (genus[:min(len(genus), extra)] + species[:1]).capitalize()
+                if cand in used and used[cand] != sid:
+                    cand = (base + str(extra)).capitalize()
+
+        mapping[sid] = cand
+        used[cand] = sid
+
+    logger.info("物种短名映射：%s",
+                ", ".join(f"{k} -> {v}" for k, v in mapping.items()))
+    return mapping
+
+
 def get_short_name(species_id: str) -> str:
     """
-    获取物种短名；若未在 SPECIES_SHORT_NAME 中显式指定，则自动生成一个。
+    获取物种短名；优先使用自动生成的 SHORT_NAME_MAP。
     """
-    if species_id in SPECIES_SHORT_NAME:
-        return SPECIES_SHORT_NAME[species_id]
+    if species_id in SHORT_NAME_MAP:
+        return SHORT_NAME_MAP[species_id]
 
     parts = species_id.split("_")
     if len(parts) >= 2:
         g, s = parts[0], parts[1]
-        return (g[0] + s[:3]).capitalize()
+        return (g[0] + s[:2]).capitalize()
     return species_id[:4]
+
+
+def prepare_mpl_config_for_jcvi(logger: logging.Logger) -> Optional[Path]:
+    """
+    如有需要，为 jcvi 子进程创建专用 MPLCONFIGDIR：
+      - 在 matplotlibrc 中设置：
+            font.family    : sans-serif
+            font.sans-serif: <DOTPLOT_SANS_SERIF_FONTS 列表>
+      - 通过环境变量 MPLCONFIGDIR 传递给 jcvi 使用。
+
+    不再检测字体是否真实存在，若缺失则由 matplotlib 自己回退并可能打印警告。
+    """
+    if not ENABLE_DOTPLOT_FONT_TWEAK:
+        logger.info("不调整 jcvi dotplot 字体（ENABLE_DOTPLOT_FONT_TWEAK = False）。")
+        return None
+
+    fonts = [f.strip() for f in DOTPLOT_SANS_SERIF_FONTS if f.strip()]
+    if not fonts:
+        logger.info("DOTPLOT_SANS_SERIF_FONTS 为空，跳过 dotplot 字体设置。")
+        return None
+
+    fonts_str = ", ".join(fonts)
+
+    mpl_dir = OUTPUT_ROOT / "mplconfig_for_jcvi"
+    mpl_dir.mkdir(parents=True, exist_ok=True)
+    rc_file = mpl_dir / "matplotlibrc"
+    with rc_file.open("w", encoding="utf-8") as f:
+        f.write("font.family: sans-serif\n")
+        f.write(f"font.sans-serif: {fonts_str}\n")
+
+    logger.info(
+        "已为 jcvi dotplot 创建 MPLCONFIGDIR：%s（font.sans-serif = [%s]）",
+        mpl_dir,
+        fonts_str,
+    )
+    return mpl_dir
 
 
 def run_cmd(cmd: List[str], logger: logging.Logger, cwd: Optional[Path] = None) -> int:
     """
     统一封装外部命令调用。
+    如 MPLCONFIG_DIR_FOR_JCVI 非空，则为子进程设置 MPLCONFIGDIR（用于控制 dotplot 字体）。
     """
     cmd_str = " ".join(str(x) for x in cmd)
     logger.info("运行命令：%s", cmd_str)
+
+    env = None
+    if MPLCONFIG_DIR_FOR_JCVI is not None:
+        env = dict(os.environ)
+        env["MPLCONFIGDIR"] = str(MPLCONFIG_DIR_FOR_JCVI)
+
     try:
         result = subprocess.run(
             cmd,
             cwd=str(cwd) if cwd is not None else None,
+            env=env,
             capture_output=True,
             text=True,
             check=False,
@@ -346,7 +430,7 @@ def run_jcvi_for_pair(
 
 
 # =========================
-# 读取 geneorder / 颜色表 / anchors.simple
+# 读取 geneorder / anchors.simple
 # =========================
 
 def load_geneorder_bed(
@@ -390,33 +474,6 @@ def load_geneorder_bed(
     logger.info("geneorder(%s): 共解析到 %d 个基因，%d 条染色体。",
                 species_id, len(gene_info), len(chr_intervals))
     return gene_info, chr_intervals
-
-
-def load_color_table(logger: logging.Logger) -> Dict[str, str]:
-    """
-    读取 color_table_ref_chr.tsv，返回 ref_chr -> color_hex 映射。
-    若文件不存在，则返回空字典。
-    """
-    if not COLOR_TABLE_FILE.exists():
-        logger.warning("未找到颜色表文件：%s，本轮 paint_segments 的 color_hex 将留空。",
-                       COLOR_TABLE_FILE)
-        return {}
-
-    mapping: Dict[str, str] = {}
-    with COLOR_TABLE_FILE.open("r", encoding="utf-8") as f:
-        reader = csv.DictReader(f, delimiter="\t")
-        if not reader.fieldnames or "ref_chr" not in reader.fieldnames:
-            logger.warning("颜色表缺少 ref_chr 列：%s，本轮忽略颜色信息。", COLOR_TABLE_FILE)
-            return {}
-
-        for row in reader:
-            ref_chr = (row.get("ref_chr") or "").strip()
-            color_hex = (row.get("color_hex") or "").strip()
-            if ref_chr and color_hex:
-                mapping[ref_chr] = color_hex
-
-    logger.info("颜色表读取完成：共 %d 条 ref_chr 颜色映射。", len(mapping))
-    return mapping
 
 
 def parse_anchors_simple(
@@ -577,7 +634,6 @@ def build_blocks_normalized_and_segments_for_pair(
 def merge_segments_for_species(
     species_id: str,
     segments_by_chr: Dict[str, List[Tuple[int, int, str, int]]],
-    color_table: Dict[str, str],
     logger: logging.Logger,
 ) -> List[Dict[str, object]]:
     """
@@ -608,7 +664,6 @@ def merge_segments_for_species(
         for s, e, ref_chr, n_genes in merged:
             if e - s < MIN_SEGMENT_LENGTH_BP:
                 continue
-            color_hex = color_table.get(ref_chr, "")
             records.append(
                 {
                     "species_id": species_id,
@@ -616,7 +671,6 @@ def merge_segments_for_species(
                     "start": int(s),
                     "end": int(e),
                     "ref_chr": ref_chr,
-                    "color_hex": color_hex,
                     "n_genes_in_block": int(n_genes),
                 }
             )
@@ -627,7 +681,6 @@ def merge_segments_for_species(
 
 def build_reference_segments_from_chr_rename(
     ref_species: str,
-    color_table: Dict[str, str],
     logger: logging.Logger,
 ) -> List[Dict[str, object]]:
     """
@@ -653,7 +706,6 @@ def build_reference_segments_from_chr_rename(
             length_bp = int(row.get("length_bp") or "0")
             if length_bp <= 0:
                 continue
-            color_hex = color_table.get(chr_name, "")
             records.append(
                 {
                     "species_id": ref_species,
@@ -661,7 +713,6 @@ def build_reference_segments_from_chr_rename(
                     "start": 0,
                     "end": length_bp,
                     "ref_chr": chr_name,
-                    "color_hex": color_hex,
                     "n_genes_in_block": int(row.get("n_genes") or 0),
                 }
             )
@@ -733,11 +784,17 @@ def main() -> None:
 
     # 2) 读取物种列表与参考物种
     species_ids, ref_species = load_species_meta(SPECIES_META_FILE, logger)
+
+    # 2b) 自动构建物种短名映射
+    global SHORT_NAME_MAP
+    SHORT_NAME_MAP = build_short_name_map(species_ids, logger)
     ref_short = get_short_name(ref_species)
 
-    # 3) 颜色表 & geneorder 预载
-    color_table = load_color_table(logger)
+    # 2c) 准备 jcvi dotplot 字体配置（若启用）
+    global MPLCONFIG_DIR_FOR_JCVI
+    MPLCONFIG_DIR_FOR_JCVI = prepare_mpl_config_for_jcvi(logger)
 
+    # 3) geneorder 预载
     gene_info_cache: Dict[str, Dict[str, Tuple[str, int, int]]] = {}
     chr_intervals_cache: Dict[str, Dict[str, List[Tuple[int, int, str]]]] = {}
     for sid in species_ids:
@@ -836,13 +893,12 @@ def main() -> None:
         "start",
         "end",
         "ref_chr",
-        "color_hex",
         "n_genes_in_block",
     ]
 
     # 7.1 参考物种
     ref_segments_records = build_reference_segments_from_chr_rename(
-        ref_species, color_table, logger
+        ref_species, logger
     )
     paint_ref_path = PAINT_SEGMENTS_DIR / f"paint_segments_{ref_species}.tsv"
     with paint_ref_path.open("w", encoding="utf-8", newline="") as f_ref:
@@ -860,7 +916,6 @@ def main() -> None:
         records = merge_segments_for_species(
             species_id=sid,
             segments_by_chr=segs_by_chr,
-            color_table=color_table,
             logger=logger,
         )
         out_path = PAINT_SEGMENTS_DIR / f"paint_segments_{sid}.tsv"

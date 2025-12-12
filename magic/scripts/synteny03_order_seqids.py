@@ -72,26 +72,6 @@ LOG_LEVEL = "INFO"
 DOMINANT_MIN_FRACTION = 0.30
 DOMINANT_MIXED_CUTOFF = 0.70
 
-# 物种短名映射（需与 02 脚本保持完全一致）
-SPECIES_SHORT_NAME: Dict[str, str] = {
-    "Sinonovacula_constricta": "Sco",
-    "Sinonovacula_rivularis": "Sri",
-    "Novaculina_chinensis": "Nch",
-    "Panopea_generosa": "Pge",
-    "Mya_arenaria": "Mar",
-    "Meretrix_meretrix": "Mme",
-    "Mercenaria_mercenaria": "Mmc",
-    "Tegillarca_granosa": "Tgr",
-    "Mytilus_edulis": "Med",
-    "Mytilus_galloprovincialis": "Mga",
-    "Pinctada_fucata": "Pfu",
-    "Ostrea_edulis": "Oed",
-    "Crassostrea_gigas": "Cgi",
-    "Ctenoides_ales": "Cal",
-    "Pecten_maximus": "Pma",
-    "Argopecten_irradians": "Air",
-}
-
 
 # =========================
 # 通用工具函数
@@ -179,15 +159,13 @@ def load_species_meta(meta_file: Path, logger: logging.Logger) -> Tuple[List[str
 
 
 def get_short_name(species_id: str) -> str:
-    """获取物种短名；与 02 脚本保持一致。"""
-    if species_id in SPECIES_SHORT_NAME:
-        return SPECIES_SHORT_NAME[species_id]
-
+    """自动生成物种短名，规则与 Step 02 保持一致。"""
     parts = species_id.split("_")
     if len(parts) >= 2:
         g, s = parts[0], parts[1]
-        return (g[0] + s[:3]).capitalize()
-    return species_id[:4]
+        core = (g[0] + s[:2]).lower()
+        return core.capitalize()
+    return species_id[:3].capitalize()
 
 
 def parse_chr_rename_for_species(

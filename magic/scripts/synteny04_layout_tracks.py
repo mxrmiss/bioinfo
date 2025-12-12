@@ -3,7 +3,7 @@
 
 """
 synteny04_layout_tracks.py
-—— 轨道 layout + 染色体颜色配置（Step 04）
+—— 轨道 layout（Step 04）
 
 当前职责（对应蓝图 Step 04）：
   1) 基于 synteny_species_meta.tsv 确定物种顺序与分组信息；
@@ -12,18 +12,16 @@ synteny04_layout_tracks.py
        - y_center（0~1 之间）
        - track_height（轨道高度）
        - short_label / plot_label / include_in_synteny
-  3) 基于 group（digger / non_digger）生成背景色块：
-       - layout_background_blocks.tsv
-  4) 基于参考物种的 chr_rename_<ref>.tsv 生成染色体颜色表：
-       - color_table_ref_chr.tsv
-       - 使用皇上的“皇家御用配色”循环分配 Chr1..N
-  5) 汇总 layout 信息写出：
+  3) 基于 group（digger / non_digger）生成纵向背景区间：
+       - layout_background_blocks.tsv（仅包含 group 与 y 范围，不含颜色信息）
+  4) 汇总 layout 信息写出：
        - layout_species_tracks.tsv
        - layout_base_tracks.tsv
 
 说明：
   - 本脚本不调用 jcvi，也不读写 anchors/simple；
-  - 只依赖 Step 00 + Step 03 的结果，用于驱动 Step 05 生成 layout 文件。
+  - 只依赖 Step 00 + Step 03 的结果，用于驱动 Step 05 生成 layout 文件，
+    所有具体颜色由后续出图脚本统一分配。
 """
 
 from __future__ import annotations
@@ -71,42 +69,8 @@ AUTO_TRACK_HEIGHT_FRACTION = 0.6
 # 背景块纵向扩展（在最上/最下物种轨道基础上略微扩展）
 BACKGROUND_PADDING = 0.01
 
-# group 背景颜色（可按皇上喜好调整）
-GROUP_BG_COLORS: Dict[str, str] = {
-    "digger": "#FFF3E0",      # 浅橙
-    "non_digger": "#E3F2FD",  # 浅蓝
-}
-
-# 染色体颜色表使用的“皇家御用配色”循环
-ROYAL_COLORS: List[Tuple[str, str]] = [
-    ("Chr_palette_1", "#E64B35"),  # Maroon
-    ("Chr_palette_2", "#4DBBD5"),  # SkyBlue
-    ("Chr_palette_3", "#00A087"),  # Teal
-    ("Chr_palette_4", "#3C5488"),  # Navy
-    ("Chr_palette_5", "#F39B7F"),  # Light Orange
-    ("Chr_palette_6", "#8491B4"),  # Slate Blue
-    ("Chr_palette_7", "#808180"),  # Dark Gray
-]
-
-# 物种短名映射（保持与 synteny02_blocks_macro.py 一致）
-SPECIES_SHORT_NAME: Dict[str, str] = {
-    "Sinonovacula_constricta": "Sco",
-    "Sinonovacula_rivularis": "Sri",
-    "Novaculina_chinensis": "Nch",
-    "Panopea_generosa": "Pge",
-    "Mya_arenaria": "Mar",
-    "Meretrix_meretrix": "Mme",
-    "Mercenaria_mercenaria": "Mmc",
-    "Tegillarca_granosa": "Tgr",
-    "Mytilus_edulis": "Med",
-    "Mytilus_galloprovincialis": "Mga",
-    "Pinctada_fucata": "Pfu",
-    "Ostrea_edulis": "Oed",
-    "Crassostrea_gigas": "Cgi",
-    "Ctenoides_ales": "Cal",
-    "Pecten_maximus": "Pma",
-    "Argopecten_irradians": "Air",
-}
+# 物种短名映射表（运行时自动生成，不再手动维护）
+SHORT_NAME_MAP: Dict[str, str] = {}
 
 
 # =========================
@@ -143,7 +107,7 @@ def setup_logging(log_dir: Path) -> logging.Logger:
     logger.addHandler(fh)
     logger.addHandler(ch)
 
-    logger.info("========== synteny04 — layout + 颜色配置 ==========")
+    logger.info("========== synteny04 — layout ==========")
     logger.info("PROJECT_ROOT = %s", PROJECT_ROOT)
     logger.info("OUTPUT_ROOT  = %s", OUTPUT_ROOT)
     logger.info("VERTICAL_MARGIN = %.3f", VERTICAL_MARGIN)
@@ -164,10 +128,11 @@ def clean_output_root(output_root: Path) -> None:
 
 def get_short_name(species_id: str) -> str:
     """
-    获取物种短名；若未在 SPECIES_SHORT_NAME 中显式指定，则自动生成一个。
+    获取物种短名；优先使用自动生成的 SHORT_NAME_MAP。
+    若未找到，则退化为首字母组合。
     """
-    if species_id in SPECIES_SHORT_NAME:
-        return SPECIES_SHORT_NAME[species_id]
+    if species_id in SHORT_NAME_MAP:
+        return SHORT_NAME_MAP[species_id]
 
     parts = species_id.split("_")
     if len(parts) >= 2:
@@ -243,6 +208,50 @@ def load_species_meta(meta_file: Path, logger: logging.Logger) -> Tuple[List[Dic
     return meta_rows, ref_species
 
 
+def build_short_name_map(species_ids: List[str], logger: logging.Logger) -> Dict[str, str]:
+    """
+    根据 species_id 自动生成短名：
+      - 初始规则：Genus[0] + species[:2]，例如：
+          Sinonovacula_constricta -> Sco
+      - 若不同物种间出现重名，则自动增加更多 species 字母，
+        直到在当前物种集合中唯一。
+
+    生成的映射会写入日志，以便检查。
+    """
+    mapping: Dict[str, str] = {}
+    used: Dict[str, str] = {}
+
+    for sid in species_ids:
+        parts = sid.split("_")
+        if len(parts) >= 2:
+            genus, species = parts[0], parts[1]
+        else:
+            genus, species = sid, ""
+
+        if species:
+            base = genus[0] + species[:2]
+        else:
+            base = (genus[:3] or sid[:3])
+
+        cand = base.capitalize()
+        extra = 2
+        while cand in used and used[cand] != sid:
+            extra += 1
+            if species and extra < len(species):
+                cand = (genus[0] + species[:extra]).capitalize()
+            else:
+                cand = (genus[:min(len(genus), extra)] + species[:1]).capitalize()
+                if cand in used and used[cand] != sid:
+                    cand = (base + str(extra)).capitalize()
+
+        mapping[sid] = cand
+        used[cand] = sid
+
+    logger.info("物种短名映射：%s",
+                ", ".join(f"{k} -> {v}" for k, v in mapping.items()))
+    return mapping
+
+
 def check_chr_order_files(meta_rows: List[Dict[str, str]], logger: logging.Logger) -> None:
     """
     简单检查 Step 03 输出的 chr_order_<species_id>.tsv 是否存在。
@@ -262,44 +271,6 @@ def check_chr_order_files(meta_rows: List[Dict[str, str]], logger: logging.Logge
         sys.exit(1)
     else:
         logger.info("Step 03 的 chr_order_<species_id>.tsv 已全部就绪。")
-
-
-def load_ref_chr_rename(ref_species: str, logger: logging.Logger) -> List[Dict[str, str]]:
-    """
-    读取参考物种的 chr_rename_<ref>.tsv，返回主染色体列表（按 rank 排序）。
-    """
-    path = CHR_RENAME_DIR / f"chr_rename_{ref_species}.tsv"
-    if not path.exists():
-        logger.error("找不到参考物种 chr_rename 文件：%s", path)
-        sys.exit(1)
-
-    rows: List[Dict[str, str]] = []
-    with path.open("r", encoding="utf-8") as f:
-        reader = csv.DictReader(f, delimiter="\t")
-        required_cols = {"is_chromosome", "new_chr_name"}
-        if not reader.fieldnames or not required_cols.issubset(set(reader.fieldnames)):
-            logger.error("chr_rename_%s.tsv 必须包含列：%s",
-                         ref_species, ", ".join(sorted(required_cols)))
-            sys.exit(1)
-
-        for row in reader:
-            if (row.get("is_chromosome") or "") != "yes":
-                continue
-            new_chr_name = (row.get("new_chr_name") or "").strip()
-            if not new_chr_name:
-                continue
-            rows.append(row)
-
-    # 按 rank 排序（若 rank 缺失则放在末尾）
-    def _rank_key(r: Dict[str, str]) -> int:
-        try:
-            return int(r.get("rank") or "9999")
-        except ValueError:
-            return 9999
-
-    rows.sort(key=_rank_key)
-    logger.info("参考物种 %s：chr_rename 中读取到 %d 条主染色体。", ref_species, len(rows))
-    return rows
 
 
 # =========================
@@ -391,12 +362,12 @@ def build_background_blocks(
     logger: logging.Logger,
 ) -> List[Dict[str, object]]:
     """
-    根据物种的 group 与轨道位置，生成背景块：
+    根据物种的 group 与轨道位置，生成背景区间（不含颜色）：
 
       - 对每个 group（如 digger / non_digger）：
          - 找到该组所有物种的 y_center ± track_height/2 的范围；
          - 在该范围基础上向外扩展 BACKGROUND_PADDING；
-         - 分配填充颜色 fill_color。
+         - 记录 group 与纵向范围，颜色由后续出图脚本决定。
     """
     by_group: Dict[str, List[Tuple[float, float]]] = defaultdict(list)
     for row in layout_rows:
@@ -419,8 +390,6 @@ def build_background_blocks(
         y_min = max(0.0, ys_min - BACKGROUND_PADDING)
         y_max = min(1.0, ys_max + BACKGROUND_PADDING)
 
-        fill_color = GROUP_BG_COLORS.get(group, "#FFFFFF")
-
         block_id = f"bg_{block_id_counter}"
         block_id_counter += 1
 
@@ -430,57 +399,12 @@ def build_background_blocks(
                 "group": group,
                 "y_min": y_min,
                 "y_max": y_max,
-                "fill_color": fill_color,
                 "note": f"group={group}",
             }
         )
 
     logger.info("背景块生成完成：共 %d 个 group 背景块。", len(blocks))
     return blocks
-
-
-# =========================
-# 染色体颜色表生成
-# =========================
-
-def build_color_table_for_ref_chr(
-    ref_species: str,
-    ref_chr_rows: List[Dict[str, str]],
-    logger: logging.Logger,
-) -> List[Dict[str, str]]:
-    """
-    基于参考物种 chr_rename_<ref>.tsv 中的主染色体，生成颜色表：
-
-      - 按 rank 顺序遍历 Chr1..N；
-      - 使用 ROYAL_COLORS 循环分配 color_hex；
-      - note 字段记录使用的调色编号。
-    """
-    color_table: List[Dict[str, str]] = []
-    if not ref_chr_rows:
-        logger.warning("参考物种 %s 未检测到任何主染色体，color_table_ref_chr 将为空。", ref_species)
-        return color_table
-
-    palette_size = len(ROYAL_COLORS)
-    if palette_size == 0:
-        logger.error("ROYAL_COLORS 列表为空，无法为 Chr 分配颜色。")
-        sys.exit(1)
-
-    for idx, row in enumerate(ref_chr_rows):
-        ref_chr = (row.get("new_chr_name") or "").strip()
-        if not ref_chr:
-            continue
-        palette_name, color_hex = ROYAL_COLORS[idx % palette_size]
-        note = f"{palette_name}_cycle_{idx + 1}"
-        color_table.append(
-            {
-                "ref_chr": ref_chr,
-                "color_hex": color_hex,
-                "note": note,
-            }
-        )
-
-    logger.info("color_table_ref_chr 生成完成：共为 %d 条 Chr 分配颜色。", len(color_table))
-    return color_table
 
 
 # =========================
@@ -599,7 +523,6 @@ def write_background_blocks(
       - group
       - y_min
       - y_max
-      - fill_color
       - note
     """
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -608,7 +531,6 @@ def write_background_blocks(
         "group",
         "y_min",
         "y_max",
-        "fill_color",
         "note",
     ]
     with out_path.open("w", encoding="utf-8", newline="") as f:
@@ -621,38 +543,10 @@ def write_background_blocks(
                     "group": row["group"],
                     "y_min": float(row["y_min"]),
                     "y_max": float(row["y_max"]),
-                    "fill_color": row["fill_color"],
                     "note": row["note"],
                 }
             )
     logger.info("layout_background_blocks.tsv 已写出：%s", out_path)
-
-
-def write_color_table_ref_chr(
-    color_rows: List[Dict[str, str]],
-    out_path: Path,
-    logger: logging.Logger,
-) -> None:
-    """
-    写出 color_table_ref_chr.tsv：
-      - ref_chr
-      - color_hex
-      - note
-    """
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    fieldnames = ["ref_chr", "color_hex", "note"]
-    with out_path.open("w", encoding="utf-8", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames, delimiter="\t")
-        writer.writeheader()
-        for row in color_rows:
-            writer.writerow(
-                {
-                    "ref_chr": row["ref_chr"],
-                    "color_hex": row["color_hex"],
-                    "note": row.get("note", ""),
-                }
-            )
-    logger.info("color_table_ref_chr.tsv 已写出：%s", out_path)
 
 
 # =========================
@@ -666,6 +560,12 @@ def main() -> None:
 
     # 2) 读取物种 meta，并确认参考物种
     meta_rows, ref_species = load_species_meta(SPECIES_META_FILE, logger)
+    logger.info("参考物种（仅用于后续步骤配色等）：%s", ref_species)
+
+    # 2b) 自动构建物种短名映射
+    species_ids = [row["species_id"] for row in meta_rows]
+    global SHORT_NAME_MAP
+    SHORT_NAME_MAP = build_short_name_map(species_ids, logger)
 
     # 3) 检查 Step 03 的 chr_order_<species_id>.tsv 是否存在
     check_chr_order_files(meta_rows, logger)
@@ -673,25 +573,19 @@ def main() -> None:
     # 4) 计算每个物种的轨道布局（纵向 y_center + track_height）
     layout_rows = compute_track_layout(meta_rows, logger)
 
-    # 5) 基于 group 生成背景块
+    # 5) 基于 group 生成背景区间（不含颜色）
     bg_blocks = build_background_blocks(layout_rows, logger)
 
-    # 6) 基于参考物种 chr_rename 生成染色体颜色表
-    ref_chr_rows = load_ref_chr_rename(ref_species, logger)
-    color_rows = build_color_table_for_ref_chr(ref_species, ref_chr_rows, logger)
-
-    # 7) 写出各类 TSV 文件
+    # 6) 写出各类 TSV 文件
     layout_species_path = OUTPUT_ROOT / "layout_species_tracks.tsv"
     layout_base_path = OUTPUT_ROOT / "layout_base_tracks.tsv"
     bg_blocks_path = OUTPUT_ROOT / "layout_background_blocks.tsv"
-    color_table_path = OUTPUT_ROOT / "color_table_ref_chr.tsv"
 
     write_layout_species_tracks(layout_rows, layout_species_path, logger)
     write_layout_base_tracks(layout_rows, layout_base_path, logger)
     write_background_blocks(bg_blocks, bg_blocks_path, logger)
-    write_color_table_ref_chr(color_rows, color_table_path, logger)
 
-    logger.info("synteny04 完成：layout_species_tracks + background_blocks + color_table_ref_chr + layout_base_tracks 均已生成。")
+    logger.info("synteny04 完成：layout_species_tracks + background_blocks + layout_base_tracks 均已生成。")
 
 
 if __name__ == "__main__":
