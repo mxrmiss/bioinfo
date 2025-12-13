@@ -68,14 +68,14 @@ RUN_JCVI_PIPELINE = True
 
 # jcvi 相关参数
 JCVI_PYTHON = "python"   # jcvi 所在的 python 命令
-JCVI_CSCORE = 0.7        # compara.catalog ortholog --cscore
-JCVI_MINSPAN = 30        # synteny.screen --minspan
+JCVI_CSCORE = 0.5        # compara.catalog ortholog --cscore
+JCVI_MINSPAN = 5        # synteny.screen --minspan
 
 # “画细线”时每条参考染色体最多保留多少个共线区块
-MAX_LINK_BLOCKS_PER_REF_CHR = 300
+MAX_LINK_BLOCKS_PER_REF_CHR = 1000
 
 # paint_segments 中保留的最小区段长度（bp）
-MIN_SEGMENT_LENGTH_BP = 100_000
+MIN_SEGMENT_LENGTH_BP = 20_000
 
 # 日志等级
 LOG_LEVEL = "INFO"
@@ -93,6 +93,16 @@ MPLCONFIG_DIR_FOR_JCVI: Optional[Path] = None
 
 # 物种短名映射表（运行时自动生成，不再手动维护）
 SHORT_NAME_MAP: Dict[str, str] = {}
+
+# 皇家御用配色（用于 ribbons：按参考 Chr 上色，循环使用）
+ROYAL_COLOR_PALETTE: List[str] = [
+    "#F79D93",  # A - 干燥玫瑰 (Dusty Rose) - 比原红更柔和
+    "#F6CD96",  # B - 杏仁奶油 (Apricot) - 去掉了刺眼的橙光
+    "#9FD5CB",  # D - 灰豆绿 (Sage Green) - 很有质感的植物绿
+    "#95C8F2",  # F - 雾霾蓝 (Hazy Blue) - 非常经典的科研蓝
+    "#C8C0F0",  # G - 丁香紫 (Lilac) - 淡雅的紫色
+    "#F6C6E7"   # H - 柔粉色 (Soft Pink) - 少女感但稳重
+]
 
 
 # =========================
@@ -326,6 +336,54 @@ def run_cmd(cmd: List[str], logger: logging.Logger, cwd: Optional[Path] = None) 
     else:
         logger.info("命令执行成功。")
     return result.returncode
+
+
+def build_ref_chr_color_map(
+    ref_species: str,
+    logger: logging.Logger,
+) -> Dict[str, str]:
+    """
+    按参考物种 chr_rename_{ref}.tsv 中的 Chr 顺序，为每条参考染色体分配皇家御用配色。
+    若读取失败，则返回空映射（下游会自动不标色，不影响主流程）。
+    """
+    chr_rename_file = CHR_RENAME_DIR / f"chr_rename_{ref_species}.tsv"
+    if not chr_rename_file.exists():
+        logger.warning("找不到参考物种 chr_rename 文件：%s（本次 ribbons 将不标色）", chr_rename_file)
+        return {}
+
+    ref_chrs: List[str] = []
+    try:
+        with chr_rename_file.open("r", encoding="utf-8") as f:
+            reader = csv.DictReader(f, delimiter="\t")
+            for row in reader:
+                if (row.get("is_chromosome") or "") != "yes":
+                    continue
+                chr_name = (row.get("new_chr_name") or "").strip()
+                if not chr_name:
+                    continue
+                ref_chrs.append(chr_name)
+    except Exception as e:
+        logger.warning("读取 chr_rename 失败：%s（%s；本次 ribbons 将不标色）", chr_rename_file, str(e))
+        return {}
+
+    def chr_sort_key(x: str) -> Tuple[int, int, str]:
+        s = x.replace("chr", "").replace("Chr", "").strip()
+        try:
+            return (0, int(s), x)
+        except ValueError:
+            return (1, 10**9, x)
+
+    ref_chrs_sorted = sorted(set(ref_chrs), key=chr_sort_key)
+
+    color_map: Dict[str, str] = {}
+    for i, c in enumerate(ref_chrs_sorted):
+        color_map[c] = ROYAL_COLOR_PALETTE[i % len(ROYAL_COLOR_PALETTE)]
+
+    logger.info(
+        "ribbons 颜色映射（ref_chr → color）：%s",
+        ", ".join(f"{k}→{v}" for k, v in color_map.items()),
+    )
+    return color_map
 
 
 # =========================
@@ -759,15 +817,32 @@ def filter_anchors_for_links(
 def write_filtered_anchors_simple(
     out_path: Path,
     records: List[Tuple[str, str, str, str, float, str]],
+    ref_gene_info: Dict[str, Tuple[str, int, int]],
+    ref_chr_color_map: Dict[str, str],
 ) -> None:
     """
     将筛选后的 anchors.simple 记录写出为 6 列文件。
+    同时按参考物种染色体(ref_chr)给共线区块添加颜色标记：
+      - 对 ref 端基因写成：<hex>*<gene_id>
+      - 颜色来自 ref_chr_color_map[ref_chr]（按 Chr1..ChrN 映射皇家御用配色）
     """
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with out_path.open("w", encoding="utf-8") as f:
         for ref_start_gene, ref_end_gene, qry_start_gene, qry_end_gene, score, orientation in records:
+            color = None
+            if ref_start_gene in ref_gene_info:
+                ref_chr = ref_gene_info[ref_start_gene][0]
+                color = ref_chr_color_map.get(ref_chr)
+
+            if color:
+                ref_start_out = f"{color}*{ref_start_gene}"
+                ref_end_out = f"{color}*{ref_end_gene}"
+            else:
+                ref_start_out = ref_start_gene
+                ref_end_out = ref_end_gene
+
             f.write(
-                f"{ref_start_gene}\t{ref_end_gene}\t"
+                f"{ref_start_out}\t{ref_end_out}\t"
                 f"{qry_start_gene}\t{qry_end_gene}\t"
                 f"{score}\t{orientation}\n"
             )
@@ -793,6 +868,9 @@ def main() -> None:
     # 2c) 准备 jcvi dotplot 字体配置（若启用）
     global MPLCONFIG_DIR_FOR_JCVI
     MPLCONFIG_DIR_FOR_JCVI = prepare_mpl_config_for_jcvi(logger)
+
+    # 2d) 构建参考染色体颜色映射（用于 anchors.simple.filtered 的 ribbons 标色）
+    ref_chr_color_map = build_ref_chr_color_map(ref_species, logger)
 
     # 3) geneorder 预载
     gene_info_cache: Dict[str, Dict[str, Tuple[str, int, int]]] = {}
@@ -858,7 +936,7 @@ def main() -> None:
         # 02c：生成 anchors.simple.filtered
         filtered_records = filter_anchors_for_links(anchors_records, ref_gene_info)
         out_filtered = ANCHORS_FOR_LINKS_DIR / f"{ref_short}__vs__{qry_short}.anchors.simple.filtered"
-        write_filtered_anchors_simple(out_filtered, filtered_records)
+        write_filtered_anchors_simple(out_filtered, filtered_records, ref_gene_info, ref_chr_color_map)
         logger.info(
             "anchors.simple.filtered 已写出：%s（保留 %d / %d 个 blocks）",
             out_filtered,
