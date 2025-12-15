@@ -3,433 +3,328 @@
 
 """
 synteny00_chr_rename.py
-—— 染色体长度统计 + 自动筛选大染色体并重命名为 Chr1..N（16 物种版）
+Chr length stats + rename table (Chr01..)
 
-职责概述：
-  1) 从 raw_data/synteny_species_meta.tsv 读取物种列表（只要有 species_id 就行）；
-  2) 对每个物种：
-       - 自动在 raw_data/gff/ 下寻找对应的 GFF 文件
-         （支持 .gff / .gff3 / .gff.gz / .gff3.gz 后缀）；
-       - 基于 GFF 中 feature 的坐标估计每个 seqid 的长度；
-       - 按长度筛选出“主染色体”（长度 ≥ 阈值），其余视为小片段；
-       - 对主染色体按长度从大到小排序，重命名为 Chr1, Chr2, ...；
-       - 输出每物种的 chr 长度表 + 重命名表；
-  3) 汇总所有物种到一个 summary 表；
-  4) 全程输出详细日志到屏幕与日志文件。
-
-重要说明：
-  - 本脚本完全不涉及进化树信息；
-  - synteny_species_meta.tsv 只需要最简结构：
-        species_id  group  is_reference
-    本脚本当前只用到 species_id 列，其余列由后续脚本使用。
-
-使用前准备：
-  - 保证本脚本位于 magic/scripts/ 目录下；
-  - 物种 meta 表位于 magic/raw_data/synteny_species_meta.tsv；
-  - GFF 文件位于 magic/raw_data/gff/，文件名以 species_id 为前缀；
-  - 若目录结构不同，可在脚本顶部参数区自行修改。
+Contract:
+- Read raw_data/synteny_species_meta.tsv (tab-separated; use first 2 columns: species_id, group).
+- Auto-detect input files under raw_data/genomes/ and raw_data/gff/ (supports .gz).
+- Output:
+    output/synteny_00_chr_rename/chr_lengths_<species>.tsv
+    output/synteny_00_chr_rename/chr_rename_<species>.tsv
+    output/synteny_00_chr_rename/step00.summary.tsv
+- No sentinel files.
+- No command-line args. Edit parameters in the "USER PARAMETERS" section.
 """
 
 from __future__ import annotations
 
-import os
-import sys
 import csv
 import gzip
 import shutil
-import logging
+import time
+import traceback
 from pathlib import Path
-from typing import Dict, Tuple, List
+from typing import Dict, List, Optional, Tuple, Iterable
 
 
-# =========================
-# 参数区（皇上可在此修改）
-# =========================
+# ============================
+# USER PARAMETERS (edit here)
+# ============================
 
-# 项目根目录（默认自动推断为脚本所在目录的上一级：magic/）
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
-# 原始数据与输出目录
 RAW_DATA_DIR = PROJECT_ROOT / "raw_data"
+META_TSV = RAW_DATA_DIR / "synteny_species_meta.tsv"
+GENOMES_DIR = RAW_DATA_DIR / "genomes"
 GFF_DIR = RAW_DATA_DIR / "gff"
-SPECIES_META_FILE = RAW_DATA_DIR / "synteny_species_meta.tsv"
 
-OUTPUT_ROOT = PROJECT_ROOT / "output" / "synteny_00_chr_rename"
+OUTPUT_DIR = PROJECT_ROOT / "output" / "synteny_00_chr_rename"
+LOG_DIR = PROJECT_ROOT / "logs"
+CLEAN_OUTPUT = True
 
-# 染色体长度阈值（bp），默认 10 Mb，低于此长度的序列不会被视为“主染色体”
 CHR_LENGTH_THRESHOLD_BP = 10_000_000
-
-# 是否基于 GFF 估计长度（推荐 True）
-USE_GFF_FOR_LENGTH = True
-
-# 每个物种最多保留的主染色体数量（None 表示不限制）
-MAX_CHR_TO_KEEP: int | None = None
-
-# 日志等级：DEBUG / INFO / WARNING / ERROR
-LOG_LEVEL = "INFO"
+PREFER_GENOME_FASTA = True
 
 
-# =========================
-# 工具函数
-# =========================
+# ============================
+# Utilities
+# ============================
 
-def setup_logging(log_dir: Path) -> logging.Logger:
-    """
-    初始化日志系统：同时输出到屏幕与日志文件。
-    """
-    log_dir.mkdir(parents=True, exist_ok=True)
-    log_file = log_dir / "synteny00_chr_rename.log"
-
-    logger = logging.getLogger("synteny_chr_rename")
-    logger.setLevel(getattr(logging, LOG_LEVEL.upper(), logging.INFO))
-
-    # 清空旧 handler，避免重复输出
-    for handler in list(logger.handlers):
-        logger.removeHandler(handler)
-
-    fh = logging.FileHandler(log_file, encoding="utf-8")
-    fh.setLevel(getattr(logging, LOG_LEVEL.upper(), logging.INFO))
-
-    ch = logging.StreamHandler(sys.stdout)
-    ch.setLevel(getattr(logging, LOG_LEVEL.upper(), logging.INFO))
-
-    formatter = logging.Formatter(
-        fmt="%(asctime)s [%(levelname)s] %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    )
-    fh.setFormatter(formatter)
-    ch.setFormatter(formatter)
-
-    logger.addHandler(fh)
-    logger.addHandler(ch)
-
-    logger.info("========== synteny00 — 染色体长度统计 + 重命名 ==========")
-    logger.info("PROJECT_ROOT = %s", PROJECT_ROOT)
-    logger.info("RAW_DATA_DIR = %s", RAW_DATA_DIR)
-    logger.info("OUTPUT_ROOT  = %s", OUTPUT_ROOT)
-    logger.info("CHR_LENGTH_THRESHOLD_BP = %d", CHR_LENGTH_THRESHOLD_BP)
-    logger.info("USE_GFF_FOR_LENGTH      = %s", USE_GFF_FOR_LENGTH)
-    logger.info("MAX_CHR_TO_KEEP         = %s", str(MAX_CHR_TO_KEEP))
-
-    return logger
+def now_ts() -> str:
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
 
 
-def clean_output_root(output_root: Path) -> None:
-    """
-    删除旧的输出目录并重建（不依赖 logger，方便在初始化日志前调用）。
-    """
-    if output_root.exists():
-        shutil.rmtree(output_root)
-    output_root.mkdir(parents=True, exist_ok=True)
+class Logger:
+    def __init__(self, log_file: Path):
+        self.log_file = log_file
+        self.log_file.parent.mkdir(parents=True, exist_ok=True)
+
+    def _write(self, level: str, msg: str) -> None:
+        line = f"{now_ts()} [{level}] {msg}"
+        print(line, flush=True)
+        with self.log_file.open("a", encoding="utf-8") as fw:
+            fw.write(line + "\n")
+
+    def info(self, msg: str) -> None:
+        self._write("INFO", msg)
+
+    def warn(self, msg: str) -> None:
+        self._write("WARN", msg)
+
+    def error(self, msg: str) -> None:
+        self._write("ERROR", msg)
 
 
-def load_species_meta(meta_file: Path, logger: logging.Logger) -> List[str]:
-    """
-    读取 synteny_species_meta.tsv，返回需要处理的 species_id 列表。
-
-    约定：
-      - 至少包含一列 species_id；
-      - group / is_reference 等列若不存在，本脚本也不会报错。
-    """
-    if not meta_file.exists():
-        logger.error("物种 meta 文件不存在：%s", meta_file)
-        sys.exit(1)
-
-    logger.info("读取物种 meta 表：%s", meta_file)
-    species_ids: List[str] = []
-    with meta_file.open("r", encoding="utf-8") as f:
-        reader = csv.DictReader(f, delimiter="\t")
-        if not reader.fieldnames or "species_id" not in reader.fieldnames:
-            logger.error("synteny_species_meta.tsv 必须包含列：species_id")
-            sys.exit(1)
-
-        for row in reader:
-            sid = (row.get("species_id") or "").strip()
-            if not sid:
-                # 空行直接跳过
-                continue
-            species_ids.append(sid)
-
-    logger.info("总计 %d 个物种将用于 synteny00（按表格行顺序处理）。", len(species_ids))
-    return species_ids
+def abort(logger: Logger, msg: str, code: int = 1) -> None:
+    logger.error(msg)
+    raise SystemExit(code)
 
 
-def find_gff_for_species(species_id: str, logger: logging.Logger) -> Path | None:
-    """
-    根据 species_id 在 GFF_DIR 中尝试匹配 GFF 文件，支持多种后缀：
-      - .gff3
-      - .gff
-      - .gff3.gz
-      - .gff.gz
+def clean_dir(path: Path, clean: bool, logger: Logger) -> None:
+    if clean and path.exists():
+        logger.info(f"Clean output dir: {path}")
+        shutil.rmtree(path)
+    path.mkdir(parents=True, exist_ok=True)
 
-    优先级顺序：
-      .gff3 > .gff > .gff3.gz > .gff.gz
-    """
-    candidates = [
-        GFF_DIR / f"{species_id}.gff3",
-        GFF_DIR / f"{species_id}.gff",
-        GFF_DIR / f"{species_id}.gff3.gz",
-        GFF_DIR / f"{species_id}.gff.gz",
-    ]
-    for path in candidates:
-        if path.exists():
-            logger.info("物种 %s 使用 GFF 文件：%s", species_id, path)
-            return path
 
-    pattern_list = [
-        f"{species_id}.gff3",
-        f"{species_id}.gff",
-        f"{species_id}.gff3.gz",
-        f"{species_id}.gff.gz",
-    ]
-    try:
-        for fname in os.listdir(GFF_DIR):
-            for pat in pattern_list:
-                if fname == pat:
-                    path = GFF_DIR / fname
-                    logger.info("物种 %s 使用 GFF 文件（宽松匹配）：%s", species_id, path)
-                    return path
-    except FileNotFoundError:
-        logger.error("GFF 目录不存在：%s", GFF_DIR)
-        return None
+def open_text_auto(path: Path):
+    if str(path).endswith(".gz"):
+        return gzip.open(path, "rt", encoding="utf-8", errors="replace")
+    return path.open("r", encoding="utf-8", errors="replace")
 
-    logger.error(
-        "未能在 %s 下找到物种 %s 对应的 GFF 文件（尝试后缀：.gff/.gff3/.gff.gz/.gff3.gz）",
-        GFF_DIR,
-        species_id,
-    )
+
+def detect_first_existing(base_dir: Path, candidates: List[str]) -> Optional[Path]:
+    for name in candidates:
+        p = base_dir / name
+        if p.exists():
+            return p
     return None
 
 
-def estimate_lengths_from_gff(gff_path: Path, logger: logging.Logger) -> Tuple[Dict[str, int], Dict[str, int]]:
+def read_meta_species(meta_tsv: Path) -> Tuple[List[str], Dict[str, str]]:
     """
-    基于 GFF 估计每个 seqid 的长度（取该 seqid 上所有 feature 的最大 end 值），
-    同时统计每个 seqid 上 feature 的计数（近似 n_genes）。
-
-    支持普通文本 GFF 和 .gz 压缩 GFF。
+    Read meta: must have header starting with 'species_id' and 'group' (tab-separated).
+    Extra columns (if any) are ignored; only first two are used.
     """
-    lengths: Dict[str, int] = {}
-    counts: Dict[str, int] = {}
+    species: List[str] = []
+    group: Dict[str, str] = {}
 
-    if not gff_path.exists():
-        logger.error("GFF 文件不存在：%s", gff_path)
-        raise FileNotFoundError(str(gff_path))
+    with open_text_auto(meta_tsv) as fr:
+        header_line = fr.readline().rstrip("\n")
+        if not header_line:
+            raise ValueError("meta header is empty")
+        header = header_line.split("\t")
+        if len(header) < 2 or header[0] != "species_id" or header[1] != "group":
+            raise ValueError(f"meta header must start with: species_id<TAB>group, got: {header}")
 
-    is_gz = gff_path.suffix == ".gz"
+        for ln, line in enumerate(fr, start=2):
+            line = line.rstrip("\n")
+            if not line:
+                continue
+            parts = line.split("\t")
+            if len(parts) < 2:
+                raise ValueError(f"meta line {ln} must have at least 2 columns: {line}")
+            sid = parts[0].strip()
+            grp = parts[1].strip()
+            if not sid:
+                raise ValueError(f"meta line {ln} species_id empty")
+            species.append(sid)
+            group[sid] = grp
 
-    open_func = gzip.open if is_gz else open
-    mode = "rt" if is_gz else "r"
+    if len(species) < 2:
+        raise ValueError("meta must contain at least 2 species")
+    return species, group
 
-    with open_func(gff_path, mode, encoding="utf-8") as f:
-        for line in f:
+
+def safe_int(x: str, default: int = 0) -> int:
+    try:
+        return int(x)
+    except Exception:
+        return default
+
+
+def write_tsv(path: Path, header: List[str], rows: Iterable[List[str]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8", newline="") as fw:
+        w = csv.writer(fw, delimiter="\t")
+        w.writerow(header)
+        for r in rows:
+            w.writerow(r)
+
+
+def fasta_lengths(fa_path: Path) -> Dict[str, int]:
+    lens: Dict[str, int] = {}
+    cur_id: Optional[str] = None
+    cur_len = 0
+
+    with open_text_auto(fa_path) as fr:
+        for line in fr:
+            line = line.rstrip("\n")
+            if not line:
+                continue
+            if line.startswith(">"):
+                if cur_id is not None:
+                    lens[cur_id] = cur_len
+                cur_id = line[1:].split()[0]
+                cur_len = 0
+            else:
+                cur_len += len(line.strip())
+        if cur_id is not None:
+            lens[cur_id] = cur_len
+
+    return lens
+
+
+def gff_gene_counts_and_maxend(gff_path: Path) -> Tuple[Dict[str, int], Dict[str, int]]:
+    """
+    Return:
+      n_genes per seqid (prefer gene; if no gene feature then use mRNA/transcript)
+      max_end per seqid (as a rough length proxy)
+    """
+    n_gene: Dict[str, int] = {}
+    n_mrna: Dict[str, int] = {}
+    max_end: Dict[str, int] = {}
+    has_gene = False
+
+    with open_text_auto(gff_path) as fr:
+        for line in fr:
             if not line or line.startswith("#"):
                 continue
             parts = line.rstrip("\n").split("\t")
-            if len(parts) < 5:
+            if len(parts) < 9:
                 continue
             seqid = parts[0]
-            try:
-                end = int(parts[4])
-            except ValueError:
-                continue
+            ftype = parts[2]
+            end = parts[4]
 
-            prev_len = lengths.get(seqid, 0)
-            if end > prev_len:
-                lengths[seqid] = end
-            counts[seqid] = counts.get(seqid, 0) + 1
+            e = safe_int(end, 0)
+            if e > max_end.get(seqid, 0):
+                max_end[seqid] = e
 
-    return lengths, counts
+            ft = ftype.lower()
+            if ft == "gene":
+                has_gene = True
+                n_gene[seqid] = n_gene.get(seqid, 0) + 1
+            elif ft in ("mrna", "transcript"):
+                n_mrna[seqid] = n_mrna.get(seqid, 0) + 1
 
+    return (n_gene if has_gene else n_mrna), max_end
 
-def select_and_rename_chromosomes(
-    seq_lengths: Dict[str, int],
-    seq_counts: Dict[str, int],
-    logger: logging.Logger,
-) -> Tuple[List[Dict[str, object]], List[Dict[str, object]]]:
-    """
-    根据长度阈值筛选“主染色体”并按长度排序重命名为 Chr1..N。
-
-    返回两个列表：
-      1) chr_lengths_records：每个 seqid 的长度和 n_genes 信息；
-      2) chr_rename_records：每个 seqid 对应的 is_chromosome 和 new_chr_name 等信息。
-    """
-    chr_lengths_records: List[Dict[str, object]] = []
-    for seqid, length in seq_lengths.items():
-        chr_lengths_records.append(
-            {
-                "seqid_raw": seqid,
-                "length_bp": int(length),
-                "n_genes": int(seq_counts.get(seqid, 0)),
-            }
-        )
-
-    chr_lengths_records.sort(key=lambda r: r["length_bp"], reverse=True)
-
-    candidates = [r for r in chr_lengths_records if r["length_bp"] >= CHR_LENGTH_THRESHOLD_BP]
-
-    if MAX_CHR_TO_KEEP is not None and MAX_CHR_TO_KEEP > 0:
-        candidates = candidates[:MAX_CHR_TO_KEEP]
-
-    chr_rename_records: List[Dict[str, object]] = []
-    seqid_to_new: Dict[str, str] = {}
-    rank = 0
-    for rec in candidates:
-        rank += 1
-        new_name = f"Chr{rank}"
-        seqid_raw = rec["seqid_raw"]
-        seqid_to_new[seqid_raw] = new_name
-
-    for rec in chr_lengths_records:
-        seqid_raw = rec["seqid_raw"]
-        length_bp = rec["length_bp"]
-        n_genes = rec["n_genes"]
-        if seqid_raw in seqid_to_new:
-            is_chr = "yes"
-            new_name = seqid_to_new[seqid_raw]
-            rank_val = int(new_name.replace("Chr", "")) if new_name.startswith("Chr") else None
-        else:
-            is_chr = "no"
-            new_name = ""
-            rank_val = None
-
-        chr_rename_records.append(
-            {
-                "seqid_raw": seqid_raw,
-                "is_chromosome": is_chr,
-                "length_bp": int(length_bp),
-                "new_chr_name": new_name,
-                "rank": rank_val,
-                "n_genes": int(n_genes),
-            }
-        )
-
-    return chr_lengths_records, chr_rename_records
-
-
-def write_tsv(path: Path, fieldnames: List[str], records: List[Dict[str, object]]) -> None:
-    """
-    将记录列表写出为 TSV 文件。
-    """
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames, delimiter="\t")
-        writer.writeheader()
-        for rec in records:
-            writer.writerow(rec)
-
-
-# =========================
-# 主流程
-# =========================
 
 def main() -> None:
-    # 先清空输出目录，再初始化日志，避免删除刚建立的 log 文件
-    clean_output_root(OUTPUT_ROOT)
-    logger = setup_logging(OUTPUT_ROOT / "logs")
+    logger = Logger(LOG_DIR / "synteny00_chr_rename.log")
+    t0 = time.time()
 
-    species_ids = load_species_meta(SPECIES_META_FILE, logger)
-    if not species_ids:
-        logger.error("synteny_species_meta.tsv 中没有任何有效的 species_id，无法继续。")
-        sys.exit(1)
+    logger.info("========== synteny00 — Chr rename table ==========")
+    logger.info(f"PROJECT_ROOT={PROJECT_ROOT}")
+    logger.info(f"META_TSV={META_TSV}")
+    logger.info(f"OUTPUT_DIR={OUTPUT_DIR}")
+    logger.info(f"CLEAN_OUTPUT={CLEAN_OUTPUT}")
+    logger.info(f"CHR_LENGTH_THRESHOLD_BP={CHR_LENGTH_THRESHOLD_BP}")
+    logger.info(f"PREFER_GENOME_FASTA={PREFER_GENOME_FASTA}")
 
-    summary_records: List[Dict[str, object]] = []
+    if not META_TSV.exists():
+        abort(logger, f"Missing meta: {META_TSV}")
 
-    for species_id in species_ids:
-        logger.info("------ 处理物种：%s ------", species_id)
-        gff_path = find_gff_for_species(species_id, logger)
-        if gff_path is None:
-            logger.error("跳过物种 %s，因为未找到对应 GFF 文件。", species_id)
-            continue
+    try:
+        species, _group = read_meta_species(META_TSV)
+    except Exception as e:
+        abort(logger, f"Meta parse error: {e}")
 
-        try:
-            if USE_GFF_FOR_LENGTH:
-                seq_lengths, seq_counts = estimate_lengths_from_gff(gff_path, logger)
+    logger.info(f"META species count={len(species)}")
+
+    clean_dir(OUTPUT_DIR, CLEAN_OUTPUT, logger)
+
+    summary_rows: List[List[str]] = []
+
+    for sid in species:
+        gff = detect_first_existing(GFF_DIR, [
+            f"{sid}.gff3", f"{sid}.gff", f"{sid}.gff3.gz", f"{sid}.gff.gz"
+        ])
+        genome = detect_first_existing(GENOMES_DIR, [
+            f"{sid}.fa", f"{sid}.fasta", f"{sid}.fna",
+            f"{sid}.fa.gz", f"{sid}.fasta.gz", f"{sid}.fna.gz",
+        ])
+
+        if gff is None and genome is None:
+            abort(logger, f"[{sid}] Missing both GFF and genome FASTA under raw_data/")
+
+        n_genes: Dict[str, int] = {}
+        gff_len_proxy: Dict[str, int] = {}
+        if gff is not None:
+            n_genes, gff_len_proxy = gff_gene_counts_and_maxend(gff)
+
+        lens: Dict[str, int] = {}
+
+        if PREFER_GENOME_FASTA and genome is not None:
+            lens = fasta_lengths(genome)
+            logger.info(f"[{sid}] length source=genome: {genome.name} (seqids={len(lens)})")
+        else:
+            if genome is not None and not PREFER_GENOME_FASTA:
+                lens = fasta_lengths(genome)
+                logger.info(f"[{sid}] length source=genome (forced): {genome.name} (seqids={len(lens)})")
             else:
-                seq_lengths, seq_counts = estimate_lengths_from_gff(gff_path, logger)
-        except Exception as e:
-            logger.error("解析 GFF 时出错（%s）：%s", species_id, str(e))
-            continue
+                lens = {k: int(v) for k, v in gff_len_proxy.items()}
+                logger.info(f"[{sid}] length source=gff (max_end proxy): {gff.name if gff else 'NA'} (seqids={len(lens)})")
 
-        if not seq_lengths:
-            logger.warning("物种 %s 未在 GFF 中解析出任何 seqid，跳过。", species_id)
-            continue
+        if not lens:
+            abort(logger, f"[{sid}] No seqid length detected (empty lengths).")
 
-        chr_lengths_records, chr_rename_records = select_and_rename_chromosomes(
-            seq_lengths, seq_counts, logger
-        )
+        chr_lengths_path = OUTPUT_DIR / f"chr_lengths_{sid}.tsv"
+        chr_len_rows: List[List[str]] = []
+        for seqid_raw, L in sorted(lens.items(), key=lambda x: (-x[1], x[0])):
+            chr_len_rows.append([seqid_raw, str(L), str(n_genes.get(seqid_raw, 0))])
+        write_tsv(chr_lengths_path, ["seqid_raw", "length_bp", "n_genes"], chr_len_rows)
 
-        lengths_path = OUTPUT_ROOT / f"chr_lengths_{species_id}.tsv"
-        rename_path = OUTPUT_ROOT / f"chr_rename_{species_id}.tsv"
+        kept = [(k, v) for k, v in lens.items() if v >= CHR_LENGTH_THRESHOLD_BP]
+        kept_sorted = sorted(kept, key=lambda x: (-x[1], x[0]))
+
+        if len(kept_sorted) == 0:
+            abort(logger, f"[{sid}] n_kept_chromosomes==0 (threshold={CHR_LENGTH_THRESHOLD_BP}).")
+
+        chr_rename_path = OUTPUT_DIR / f"chr_rename_{sid}.tsv"
+        rename_rows: List[List[str]] = []
+        for i, (seqid_raw, L) in enumerate(kept_sorted, start=1):
+            chr_name = f"Chr{i:02d}" if i < 100 else f"Chr{i:03d}"
+            rename_rows.append([sid, seqid_raw, chr_name, str(i), str(L), "yes"])
+
+        kept_set = {k for k, _ in kept_sorted}
+        for seqid_raw, L in sorted(lens.items(), key=lambda x: (-x[1], x[0])):
+            if seqid_raw in kept_set:
+                continue
+            rename_rows.append([sid, seqid_raw, "NA", "0", str(L), "no"])
 
         write_tsv(
-            lengths_path,
-            fieldnames=["seqid_raw", "length_bp", "n_genes"],
-            records=chr_lengths_records,
-        )
-        write_tsv(
-            rename_path,
-            fieldnames=[
-                "species_id",
-                "seqid_raw",
-                "is_chromosome",
-                "length_bp",
-                "new_chr_name",
-                "rank",
-                "n_genes",
-            ],
-            records=[
-                {"species_id": species_id, **rec}
-                for rec in chr_rename_records
-            ],
+            chr_rename_path,
+            ["species_id", "seqid_raw", "seqid_renamed", "rank", "length_bp", "is_chromosome"],
+            rename_rows
         )
 
-        n_seqid_total = len(chr_lengths_records)
-        n_chr_kept = sum(1 for r in chr_rename_records if r["is_chromosome"] == "yes")
-        total_len_all = sum(r["length_bp"] for r in chr_lengths_records)
-        total_len_kept = sum(r["length_bp"] for r in chr_rename_records if r["is_chromosome"] == "yes")
-        kept_fraction = total_len_kept / total_len_all if total_len_all > 0 else 0.0
-
-        summary_records.append(
-            {
-                "species_id": species_id,
-                "n_seqid_total": n_seqid_total,
-                "n_chromosomes_kept": n_chr_kept,
-                "length_threshold_bp": CHR_LENGTH_THRESHOLD_BP,
-                "total_length_kept_bp": total_len_kept,
-                "total_length_all_bp": total_len_all,
-                "kept_fraction": f"{kept_fraction:.4f}",
-                "comment": "",
-            }
-        )
-
+        total_kept = sum(L for _, L in kept_sorted)
+        summary_rows.append([sid, str(len(lens)), str(len(kept_sorted)), str(CHR_LENGTH_THRESHOLD_BP), str(total_kept)])
         logger.info(
-            "物种 %s: 总 seqid=%d, 保留染色体=%d, 保留长度比例=%.2f%%",
-            species_id,
-            n_seqid_total,
-            n_chr_kept,
-            kept_fraction * 100.0,
+            f"[{sid}] n_raw_seqids={len(lens)} "
+            f"n_kept_chromosomes={len(kept_sorted)} "
+            f"total_kept_length_bp={total_kept}"
         )
 
-    summary_path = OUTPUT_ROOT / "chr_rename_summary.tsv"
     write_tsv(
-        summary_path,
-        fieldnames=[
-            "species_id",
-            "n_seqid_total",
-            "n_chromosomes_kept",
-            "length_threshold_bp",
-            "total_length_kept_bp",
-            "total_length_all_bp",
-            "kept_fraction",
-            "comment",
-        ],
-        records=summary_records,
+        OUTPUT_DIR / "step00.summary.tsv",
+        ["species_id", "n_raw_seqids", "n_kept_chromosomes", "min_chr_length_bp_threshold", "total_kept_length_bp"],
+        summary_rows
     )
 
-    logger.info("写出汇总表：%s", summary_path)
-    logger.info("synteny00 完成。")
+    logger.info(f"Done. runtime_sec={int(time.time() - t0)}")
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except SystemExit:
+        raise
+    except Exception as e:
+        logger = Logger(LOG_DIR / "synteny00_chr_rename.log")
+        logger.error("Unhandled exception: " + repr(e))
+        logger.error(traceback.format_exc())
+        raise
 

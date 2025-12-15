@@ -3,511 +3,405 @@
 
 """
 synteny01_mcscan_catalog.py
-—— MCscan 线性共线性前置：geneorder + BLAST catalog（16 物种 · 多线程版）
+生成 JCVI karyotype 所需的 per-species BED（geneorder bed）与 gene 索引
 
-当前职责：
-  1) 读取 raw_data/synteny_species_meta.tsv，识别：
-       - 全部 species_id
-       - 唯一参考物种 ref_species（is_reference == "yes"）
-  2) 对所有物种生成 MCscan 风格的 geneorder BED：
-       - 只保留 synteny_00_chr_rename 中 is_chromosome == "yes" 的 Chr*
-       - 从 GFF 中提取基因坐标，写出：
-           chr  start  end  gene_id
-  3) 基于参考物种蛋白质序列构建 BLASTP 数据库；
-  4) 对每个“非参考物种”并行执行 BLASTP：
-       - query = 该物种 protein/*.faa
-       - db    = 参考物种 protein DB
-       - 输出：blast/<ref>__vs__<qry>.blast
-  5) 全程多线程控制：
-       - 同时最多处理 PAIR_PARALLELISM 对物种
-       - 每对物种的 BLAST 使用 BLAST_THREADS_PER_PAIR 线程
-
-说明：
-  - 本脚本当前版本只负责 geneorder + BLAST catalog，
-    不在此处调用 jcvi 的 mcscan / screen。
+硬合同：
+- 读取 raw_data/synteny_species_meta.tsv（仅两列：species_id, group；顺序即全流程顺序）
+- 读取 Step00 的 chr_rename_<species>.tsv，把 seqid_raw 映射为 Chr01..
+- 从 raw_data/gff/<species>.* 提取基因坐标，输出：
+    output/synteny_01_mcscan_catalog/<species>.geneorder.bed     (BED4，无表头)
+    output/synteny_01_mcscan_catalog/geneorder_index_<species>.tsv
+- gene_id 抽取/标准化规则与全流程一致（见 common utils）
+- 不生成任何哨兵文件
+- 脚本不接受命令行参数
 """
 
 from __future__ import annotations
 
-import os
-import sys
-import csv
-import gzip
-import shutil
-import logging
-import subprocess
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
-# =========================
-# 参数区（皇上可在此修改）
-# =========================
+# -*- coding: utf-8 -*-
+"""
+公共工具函数（仅供本脚本使用；不依赖外部第三方库）。
+"""
 
-# 项目根目录（默认：当前脚本所在目录的上一级 magic/）
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-
-# 原始数据目录
-RAW_DATA_DIR = PROJECT_ROOT / "raw_data"
-GFF_DIR = RAW_DATA_DIR / "gff"
-PROTEIN_DIR = RAW_DATA_DIR / "protein"
-SPECIES_META_FILE = RAW_DATA_DIR / "synteny_species_meta.tsv"
-
-# synteny_00 的输出（染色体重命名表）
-CHR_RENAME_DIR = PROJECT_ROOT / "output" / "synteny_00_chr_rename"
-
-# 本脚本输出目录
-OUTPUT_ROOT = PROJECT_ROOT / "output" / "synteny_01_mcscan_catalog"
-
-# 是否执行 BLAST 步骤（一般保持 True）
-RUN_BLAST = True
-
-# 物种对的并行度控制：
-#   - 同时最多处理多少对 ref vs qry
-PAIR_PARALLELISM = 3
-
-# 每对物种 BLASTP 使用的线程数
-BLAST_THREADS_PER_PAIR = 10
-
-# BLAST 参数
-BLAST_PROGRAM = "blastp"
-BLAST_EVALUE = 1e-5
-BLAST_MAX_TARGET_SEQS = 5
-
-# 日志等级
-LOG_LEVEL = "INFO"
-
-# GFF 第 9 列中用于提取“蛋白 ID 对应的转录本 ID”的字段列表
-# 按顺序优先级依次匹配；皇上可自行在此追加字段名
-TRANSCRIPT_ATTR_KEYS: List[str] = [
-    "transcript_id",
-    "orig_transcript_id",
-]
+import os
+import sys
+import re
+import csv
+import gzip
+import time
+import shutil
+import traceback
+from pathlib import Path
+from typing import Dict, List, Tuple, Optional, Iterable
 
 
-# =========================
-# 工具函数
-# =========================
-
-def setup_logging(log_dir: Path) -> logging.Logger:
-    log_dir.mkdir(parents=True, exist_ok=True)
-    log_file = log_dir / "synteny01_mcscan_catalog.log"
-
-    logger = logging.getLogger("synteny01")
-    logger.setLevel(getattr(logging, LOG_LEVEL.upper(), logging.INFO))
-
-    # 清空旧 handler，避免重复
-    for h in list(logger.handlers):
-        logger.removeHandler(h)
-
-    fh = logging.FileHandler(log_file, encoding="utf-8")
-    fh.setLevel(getattr(logging, LOG_LEVEL.upper(), logging.INFO))
-
-    ch = logging.StreamHandler(sys.stdout)
-    ch.setLevel(getattr(logging, LOG_LEVEL.upper(), logging.INFO))
-
-    fmt = logging.Formatter(
-        fmt="%(asctime)s [%(levelname)s] %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    )
-    fh.setFormatter(fmt)
-    ch.setFormatter(fmt)
-
-    logger.addHandler(fh)
-    logger.addHandler(ch)
-
-    logger.info("========== synteny01 — MCscan catalog 构建 ==========")
-    logger.info("PROJECT_ROOT = %s", PROJECT_ROOT)
-    logger.info("RAW_DATA_DIR = %s", RAW_DATA_DIR)
-    logger.info("OUTPUT_ROOT  = %s", OUTPUT_ROOT)
-    logger.info("RUN_BLAST = %s", RUN_BLAST)
-    logger.info("PAIR_PARALLELISM = %d, BLAST_THREADS_PER_PAIR = %d",
-                PAIR_PARALLELISM, BLAST_THREADS_PER_PAIR)
-
-    return logger
+def now_ts() -> str:
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
 
 
-def clean_output_root(output_root: Path) -> None:
+class Logger:
+    def __init__(self, step_name: str, log_file: Path):
+        self.step_name = step_name
+        self.log_file = log_file
+        self.log_file.parent.mkdir(parents=True, exist_ok=True)
+
+    def _write(self, level: str, msg: str) -> None:
+        line = f"{now_ts()} [{level}] {msg}"
+        print(line, flush=True)
+        with self.log_file.open("a", encoding="utf-8") as fw:
+            fw.write(line + "\n")
+
+    def info(self, msg: str) -> None:
+        self._write("INFO", msg)
+
+    def warn(self, msg: str) -> None:
+        self._write("WARN", msg)
+
+    def error(self, msg: str) -> None:
+        self._write("ERROR", msg)
+
+
+def abort(logger: Logger, msg: str, code: int = 1) -> None:
+    logger.error(msg)
+    raise SystemExit(code)
+
+
+def clean_dir(path: Path, clean: bool, logger: Logger) -> None:
+    if clean and path.exists():
+        logger.info(f"Clean output dir: {path}")
+        shutil.rmtree(path)
+    path.mkdir(parents=True, exist_ok=True)
+
+
+def open_text_auto(path: Path):
     """
-    删除旧的输出目录并重建。
-    不使用 logger，方便在初始化日志前调用。
+    支持普通文本与 .gz。
+    返回一个 text mode file handle（utf-8，遇到奇怪字符直接替换）。
     """
-    if output_root.exists():
-        shutil.rmtree(output_root)
-    (output_root / "geneorder").mkdir(parents=True, exist_ok=True)
-    (output_root / "blast").mkdir(parents=True, exist_ok=True)
-    (output_root / "logs").mkdir(parents=True, exist_ok=True)
+    if str(path).endswith(".gz"):
+        return gzip.open(path, "rt", encoding="utf-8", errors="replace")
+    return path.open("r", encoding="utf-8", errors="replace")
 
 
-def load_species_meta(meta_file: Path, logger: logging.Logger) -> Tuple[List[str], str]:
-    if not meta_file.exists():
-        logger.error("物种 meta 文件不存在：%s", meta_file)
-        sys.exit(1)
-
-    species_ids: List[str] = []
-    ref_species: Optional[str] = None
-
-    with meta_file.open("r", encoding="utf-8") as f:
-        reader = csv.DictReader(f, delimiter="\t")
-        if not reader.fieldnames or "species_id" not in reader.fieldnames:
-            logger.error("synteny_species_meta.tsv 必须包含列：species_id")
-            sys.exit(1)
-
-        for row in reader:
-            sid = (row.get("species_id") or "").strip()
-            if not sid:
-                continue
-            species_ids.append(sid)
-            is_ref = (row.get("is_reference") or "").strip().lower()
-            if is_ref == "yes":
-                if ref_species is not None and ref_species != sid:
-                    logger.error("检测到多个 is_reference == yes 的物种：%s, %s",
-                                 ref_species, sid)
-                    sys.exit(1)
-                ref_species = sid
-
-    if ref_species is None:
-        logger.error("synteny_species_meta.tsv 中未找到 is_reference == yes 的物种。")
-        sys.exit(1)
-
-    logger.info("总计 %d 个物种，参考物种 = %s", len(species_ids), ref_species)
-    return species_ids, ref_species
-
-
-def find_gff_for_species(species_id: str, logger: logging.Logger) -> Path:
-    candidates = [
-        GFF_DIR / f"{species_id}.gff3",
-        GFF_DIR / f"{species_id}.gff",
-        GFF_DIR / f"{species_id}.gff3.gz",
-        GFF_DIR / f"{species_id}.gff.gz",
-    ]
-    for p in candidates:
+def detect_first_existing(base_dir: Path, candidates: List[str]) -> Optional[Path]:
+    for name in candidates:
+        p = base_dir / name
         if p.exists():
-            logger.info("物种 %s 使用 GFF 文件：%s", species_id, p)
             return p
-
-    logger.error("未能在 %s 下找到物种 %s 的 GFF 文件。", GFF_DIR, species_id)
-    sys.exit(1)
+    return None
 
 
-def load_chr_rename(species_id: str, logger: logging.Logger) -> Dict[str, str]:
-    path = CHR_RENAME_DIR / f"chr_rename_{species_id}.tsv"
-    if not path.exists():
-        logger.error("找不到 chr_rename 表：%s", path)
-        sys.exit(1)
-
-    mapping: Dict[str, str] = {}
-    with path.open("r", encoding="utf-8") as f:
-        reader = csv.DictReader(f, delimiter="\t")
-        for row in reader:
-            if (row.get("is_chromosome") or "") != "yes":
+def read_meta(meta_tsv: Path) -> Tuple[List[str], Dict[str, str]]:
+    """
+    meta 表硬合同：两列（tab 分隔）
+      species_id, group
+    """
+    species: List[str] = []
+    group: Dict[str, str] = {}
+    with open_text_auto(meta_tsv) as fr:
+        header = fr.readline().rstrip("\n").split("\t")
+        if header != ["species_id", "group"]:
+            raise ValueError(f"meta header must be: species_id<TAB>group, got: {header}")
+        for ln, line in enumerate(fr, start=2):
+            line = line.rstrip("\n")
+            if not line:
                 continue
-            raw = (row.get("seqid_raw") or "").strip()
-            new = (row.get("new_chr_name") or "").strip()
-            if raw and new:
-                mapping[raw] = new
+            parts = line.split("\t")
+            if len(parts) != 2:
+                raise ValueError(f"meta line {ln} must have 2 columns, got {len(parts)}: {line}")
+            sid, grp = parts
+            sid = sid.strip()
+            grp = grp.strip()
+            if not sid:
+                raise ValueError(f"meta line {ln} species_id empty")
+            species.append(sid)
+            group[sid] = grp
+    if len(species) < 2:
+        raise ValueError("meta must contain at least 2 species")
+    return species, group
 
-    logger.info("物种 %s：从 chr_rename 中读取到 %d 条主染色体映射。",
-                species_id, len(mapping))
-    return mapping
 
-
-def normalize_id_core(raw_id: str) -> str:
+def parse_species_display_label(species_id: str) -> str:
     """
-    对原始 ID 做标准化：
-      1) 去掉首尾空白与引号；
-      2) 若包含 '|'，取最后一个 '|' 后面的片段；
-      3) 返回处理后的字符串。
+    由 Genus_species_xxx 生成显示名：G. species
     """
-    val = raw_id.strip().strip('"').strip()
-    if "|" in val:
-        val = val.rsplit("|", 1)[1]
-    return val
+    parts = species_id.split("_")
+    if len(parts) < 2:
+        return species_id
+    genus = parts[0]
+    sp = parts[1]
+    if not genus:
+        return species_id
+    return f"{genus[0].upper()}. {sp.lower()}"
 
 
-def extract_id_from_attr(attr: str) -> Optional[str]:
-    """
-    按皇上要求的优先级从 GFF 第 9 列中提取 gene_id：
+_HEX_RE = re.compile(r"^#[0-9a-fA-F]{6}\*")
 
-    1) 依次尝试 TRANSCRIPT_ATTR_KEYS 中的字段（如 transcript_id、orig_transcript_id）：
-         - 若找到对应值，取该值中“从后往前第一个 '|' 后面的片段”为 ID；
-    2) 若上述字段均未命中：
-         - 回退到 ID= 或 Parent= 的值；
-         - 若值以 'rna-' 开头，则去掉 'rna-' 前缀；
-         - 再同样取“最后一个 '|' 后面的片段”为 ID。
+
+def strip_color_prefix(gene_id: str) -> str:
     """
-    # 先拆成若干 key/value
-    kv_list: List[Tuple[str, str]] = []
-    for field in attr.split(";"):
-        field = field.strip()
-        if not field:
+    如果 gene_id 是 #RRGGBB*xxx，返回 xxx，否则原样返回。
+    """
+    if _HEX_RE.match(gene_id):
+        return gene_id.split("*", 1)[1]
+    return gene_id
+
+
+def normalize_gene_id(raw: str) -> str:
+    """
+    ID 标准化硬合同：
+      - 去引号/空白
+      - 若含 |，取最后一个 | 后
+      - 去 rna- 前缀
+    """
+    x = raw.strip().strip('"').strip("'").strip()
+    if "|" in x:
+        x = x.split("|")[-1]
+    if x.startswith("rna-"):
+        x = x[4:]
+    return x
+
+
+def parse_gff_attributes(attr: str) -> Dict[str, str]:
+    """
+    GFF3 attributes 解析为 dict；允许出现无 '=' 的碎片但会忽略。
+    """
+    d: Dict[str, str] = {}
+    for item in attr.split(";"):
+        item = item.strip()
+        if not item or "=" not in item:
             continue
-        if "=" in field:
-            k, v = field.split("=", 1)
-        else:
-            parts = field.split()
-            if len(parts) >= 2:
-                k, v = parts[0], parts[-1]
-            elif len(parts) == 1:
-                k, v = parts[0], ""
-            else:
+        k, v = item.split("=", 1)
+        d[k.strip()] = v.strip()
+    return d
+
+
+def extract_gene_id_from_gff_attr(attr: str) -> str:
+    """
+    gene_id 抽取优先级：
+      transcript_id > orig_transcript_id > ID > Parent
+    """
+    d = parse_gff_attributes(attr)
+    for k in ("transcript_id", "orig_transcript_id", "ID", "Parent"):
+        if k in d and d[k]:
+            return normalize_gene_id(d[k])
+    # 没有任何键，直接返回整段（仍做 normalize）
+    return normalize_gene_id(attr)
+
+
+def safe_int(x: str, default: int = 0) -> int:
+    try:
+        return int(x)
+    except Exception:
+        return default
+
+
+def write_tsv(path: Path, header: List[str], rows: Iterable[List[str]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8", newline="") as fw:
+        w = csv.writer(fw, delimiter="\t")
+        w.writerow(header)
+        for r in rows:
+            w.writerow(r)
+
+
+# ============================
+# 用户参数区（手填；不走命令行）# ============================
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+RAW_DATA_DIR = PROJECT_ROOT / "raw_data"
+META_TSV = RAW_DATA_DIR / "synteny_species_meta.tsv"
+GFF_DIR = RAW_DATA_DIR / "gff"
+
+STEP00_DIR = PROJECT_ROOT / "output" / "synteny_00_chr_rename"
+
+OUTPUT_DIR = PROJECT_ROOT / "output" / "synteny_01_mcscan_catalog"
+LOG_DIR = PROJECT_ROOT / "logs"
+CLEAN_OUTPUT = True
+
+# 从 GFF 中提取哪些 feature 作为“基因坐标”
+# 规则：优先使用 mRNA/transcript；若文件中没有 mRNA/transcript，则使用 gene
+PREFERRED_FEATURES = ("mRNA", "transcript")
+
+
+def load_chr_rename(chr_rename_tsv: Path) -> Dict[str, str]:
+    """
+    seqid_raw -> seqid_renamed（仅保留 is_chromosome=yes）
+    """
+    mp: Dict[str, str] = {}
+    with open_text_auto(chr_rename_tsv) as fr:
+        header = fr.readline().rstrip("\n").split("\t")
+        need = ["species_id", "seqid_raw", "seqid_renamed", "rank", "length_bp", "is_chromosome"]
+        if header != need:
+            raise ValueError(f"Bad header in {chr_rename_tsv.name}: {header}")
+        for line in fr:
+            line = line.rstrip("\n")
+            if not line:
                 continue
-        k = k.strip()
-        v = v.strip().strip('"').strip()
-        if k:
-            kv_list.append((k, v))
-
-    # 1) 优先从 TRANSCRIPT_ATTR_KEYS 中取值
-    for key in TRANSCRIPT_ATTR_KEYS:
-        for k, v in kv_list:
-            if k == key and v:
-                return normalize_id_core(v)
-
-    # 2) 回退到 ID= 或 Parent=
-    id_val: Optional[str] = None
-    for k, v in kv_list:
-        if k == "ID" and v:
-            id_val = v
-            break
-    if id_val is None:
-        for k, v in kv_list:
-            if k == "Parent" and v:
-                id_val = v
-                break
-
-    if not id_val:
-        return None
-
-    # 去掉 mRNA 前缀 rna-
-    if id_val.startswith("rna-"):
-        id_val = id_val[len("rna-") :]
-
-    return normalize_id_core(id_val)
+            parts = line.split("\t")
+            if len(parts) != 6:
+                continue
+            seqid_raw = parts[1]
+            seqid_renamed = parts[2]
+            is_chr = parts[5]
+            if is_chr == "yes" and seqid_renamed != "NA":
+                mp[seqid_raw] = seqid_renamed
+    if not mp:
+        raise ValueError(f"No chromosomes kept in {chr_rename_tsv.name}")
+    return mp
 
 
-def parse_gff_gene_intervals(
-    gff_path: Path,
-    chr_map: Dict[str, str],
-    logger: logging.Logger,
-) -> List[Tuple[str, int, int, str]]:
+def detect_gff(sid: str) -> Path:
+    p = detect_first_existing(GFF_DIR, [
+        f"{sid}.gff3", f"{sid}.gff",
+        f"{sid}.gff3.gz", f"{sid}.gff.gz",
+    ])
+    if p is None:
+        raise FileNotFoundError(f"Missing GFF for {sid} under raw_data/gff/")
+    return p
+
+
+def scan_gff_for_feature_types(gff_path: Path) -> Tuple[bool, bool]:
     """
-    从 GFF 中抽取基因坐标，返回：
-      [(chr, start, end, gene_id), ...]
-    仅保留在 chr_map 中出现的 seqid。
-
-    当前版本只使用 mRNA / transcript 层的记录，
-    不再直接使用 feature_type == "gene"，避免同一坐标重复写入 gene-LOC 与转录本 ID。
+    返回：(has_mrna_or_transcript, has_gene)
     """
-    intervals: List[Tuple[str, int, int, str]] = []
-
-    is_gz = gff_path.suffix == ".gz"
-    open_func = gzip.open if is_gz else open
-    mode = "rt" if is_gz else "r"
-
-    with open_func(gff_path, mode, encoding="utf-8") as f:
-        for line in f:
+    has_m = False
+    has_g = False
+    with open_text_auto(gff_path) as fr:
+        for line in fr:
             if not line or line.startswith("#"):
                 continue
             parts = line.rstrip("\n").split("\t")
-            if len(parts) < 9:
+            if len(parts) < 3:
                 continue
-            seqid, feature_type, start_str, end_str, attr = (
-                parts[0],
-                parts[2],
-                parts[3],
-                parts[4],
-                parts[8],
-            )
+            ftype = parts[2].lower()
+            if ftype in ("mrna", "transcript"):
+                has_m = True
+            elif ftype == "gene":
+                has_g = True
+            if has_m and has_g:
+                break
+    return has_m, has_g
 
-            if seqid not in chr_map:
-                continue
-
-            # 只保留 mRNA / transcript 层，丢弃 gene 层，避免重复
-            if feature_type not in {"mRNA", "transcript"}:
-                continue
-
-            try:
-                start = int(start_str)
-                end = int(end_str)
-            except ValueError:
-                continue
-
-            gene_id = extract_id_from_attr(attr)
-            if not gene_id:
-                continue
-
-            chr_name = chr_map[seqid]
-            intervals.append((chr_name, start - 1, end, gene_id))
-
-    logger.info("从 GFF %s 中解析出 %d 个 gene 间隔。", gff_path.name, len(intervals))
-    return intervals
-
-
-def write_geneorder_bed(
-    species_id: str,
-    intervals: List[Tuple[str, int, int, str]],
-    out_dir: Path,
-    logger: logging.Logger,
-) -> Path:
-    out_path = out_dir / f"{species_id}.bed"
-    with out_path.open("w", encoding="utf-8") as f:
-        for chr_name, start, end, gene_id in intervals:
-            f.write(f"{chr_name}\t{start}\t{end}\t{gene_id}\n")
-
-    logger.info("写出 geneorder bed：%s", out_path)
-    return out_path
-
-
-def run_cmd(cmd: List[str], logger: logging.Logger, cwd: Optional[Path] = None) -> int:
-    cmd_str = " ".join(str(x) for x in cmd)
-    logger.info("运行命令：%s", cmd_str)
-    try:
-        result = subprocess.run(
-            cmd,
-            cwd=str(cwd) if cwd is not None else None,
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-    except FileNotFoundError as e:
-        logger.error("命令不存在：%s", e)
-        return 1
-
-    if result.stdout:
-        logger.info("[STDOUT]\n%s\n", result.stdout.strip())
-    if result.stderr:
-        logger.info("[STDERR]\n%s\n", result.stderr.strip())
-
-    if result.returncode != 0:
-        logger.error("命令执行失败，退出码：%d", result.returncode)
-    else:
-        logger.info("命令执行成功。")
-    return result.returncode
-
-
-# =========================
-# BLAST 相关
-# =========================
-
-def build_blast_db(ref_species: str, logger: logging.Logger) -> Path:
-    faa = PROTEIN_DIR / f"{ref_species}.faa"
-    if not faa.exists():
-        logger.error("找不到参考物种蛋白文件：%s", faa)
-        sys.exit(1)
-
-    db_prefix = OUTPUT_ROOT / "blast" / f"{ref_species}_db"
-    cmd = [
-        "makeblastdb",
-        "-in", str(faa),
-        "-dbtype", "prot",
-        "-out", str(db_prefix),
-    ]
-    rc = run_cmd(cmd, logger)
-    if rc != 0:
-        logger.error("makeblastdb 失败，无法继续。")
-        sys.exit(1)
-
-    return db_prefix
-
-
-def run_blast_for_pair(
-    ref_species: str,
-    qry_species: str,
-    db_prefix: Path,
-    logger: logging.Logger,
-) -> Path:
-    qry_faa = PROTEIN_DIR / f"{qry_species}.faa"
-    if not qry_faa.exists():
-        logger.error("找不到物种 %s 的蛋白文件：%s", qry_species, qry_faa)
-        raise FileNotFoundError(str(qry_faa))
-
-    out_blast = OUTPUT_ROOT / "blast" / f"{ref_species}__vs__{qry_species}.blast"
-
-    cmd = [
-        BLAST_PROGRAM,
-        "-query", str(qry_faa),
-        "-db", str(db_prefix),
-        "-evalue", str(BLAST_EVALUE),
-        "-max_target_seqs", str(BLAST_MAX_TARGET_SEQS),
-        "-num_threads", str(BLAST_THREADS_PER_PAIR),
-        "-outfmt", "6",
-        "-out", str(out_blast),
-    ]
-    rc = run_cmd(cmd, logger)
-    if rc != 0:
-        raise RuntimeError(f"BLAST 失败：{ref_species} vs {qry_species}")
-
-    return out_blast
-
-
-# =========================
-# 物种对处理（目前只做 BLAST）
-# =========================
-
-def process_pair_worker(
-    ref_species: str,
-    qry_species: str,
-    db_prefix: Path,
-    logger: logging.Logger,
-) -> None:
-    logger.info("====== 处理物种对：%s (ref) vs %s (qry) ======",
-                ref_species, qry_species)
-
-    if RUN_BLAST:
-        _ = run_blast_for_pair(ref_species, qry_species, db_prefix, logger)
-
-
-# =========================
-# 主流程
-# =========================
 
 def main() -> None:
-    # 先清空输出目录，再初始化日志，避免删掉刚建好的 log 文件
-    clean_output_root(OUTPUT_ROOT)
-    logger = setup_logging(OUTPUT_ROOT / "logs")
+    logger = Logger("synteny01", LOG_DIR / "synteny01_mcscan_catalog.log")
+    t0 = time.time()
 
-    species_ids, ref_species = load_species_meta(SPECIES_META_FILE, logger)
+    logger.info("========== synteny01 — geneorder BED ==========")
+    logger.info(f"PROJECT_ROOT={PROJECT_ROOT}")
+    logger.info(f"OUTPUT_DIR={OUTPUT_DIR}")
+    logger.info(f"CLEAN_OUTPUT={CLEAN_OUTPUT}")
+    logger.info(f"PREFERRED_FEATURES={','.join(PREFERRED_FEATURES)}")
 
-    # 1) 为所有物种生成 geneorder
-    for sid in species_ids:
-        logger.info("====== 生成 geneorder：%s ======", sid)
-        chr_map = load_chr_rename(sid, logger)
-        gff_path = find_gff_for_species(sid, logger)
-        intervals = parse_gff_gene_intervals(gff_path, chr_map, logger)
-        write_geneorder_bed(sid, intervals, OUTPUT_ROOT / "geneorder", logger)
+    if not META_TSV.exists():
+        abort(logger, f"Missing meta: {META_TSV}")
+    if not STEP00_DIR.exists():
+        abort(logger, f"Missing step00 output dir: {STEP00_DIR}")
 
-    # 2) 基于参考物种构建 BLAST DB
-    db_prefix = build_blast_db(ref_species, logger)
+    species, _group = read_meta(META_TSV)
+    logger.info(f"META species count={len(species)}")
 
-    # 3) 并行处理 ref vs 其它物种的 BLAST
-    qry_species_list = [s for s in species_ids if s != ref_species]
-    logger.info("准备处理 %d 个物种对，最大并行数 = %d",
-                len(qry_species_list), PAIR_PARALLELISM)
+    clean_dir(OUTPUT_DIR, CLEAN_OUTPUT, logger)
 
-    with ThreadPoolExecutor(max_workers=PAIR_PARALLELISM) as executor:
-        future_to_pair = {}
-        for qry in qry_species_list:
-            future = executor.submit(
-                process_pair_worker,
-                ref_species,
-                qry,
-                db_prefix,
-                logger,
-            )
-            future_to_pair[future] = qry
+    for sid in species:
+        chr_rename = STEP00_DIR / f"chr_rename_{sid}.tsv"
+        if not chr_rename.exists():
+            abort(logger, f"[{sid}] Missing step00 file: {chr_rename}")
+        mp = load_chr_rename(chr_rename)
 
-        for future in as_completed(future_to_pair):
-            qry = future_to_pair[future]
-            try:
-                future.result()
-            except Exception as e:
-                logger.error("处理物种对 %s vs %s 时发生异常：%s",
-                             ref_species, qry, str(e))
+        gff = detect_gff(sid)
+        has_m, has_g = scan_gff_for_feature_types(gff)
+        use_mrna = has_m
+        fset = set(x.lower() for x in (PREFERRED_FEATURES if use_mrna else ("gene",)))
 
-    logger.info("synteny01 完成。geneorder + BLAST catalog 已生成。")
+        out_bed = OUTPUT_DIR / f"{sid}.geneorder.bed"
+        out_idx = OUTPUT_DIR / f"geneorder_index_{sid}.tsv"
+
+        bed_lines: List[List[str]] = []
+        idx_rows: List[List[str]] = []
+
+        kept_gene = 0
+        dropped_non_chr = 0
+        dropped_no_id = 0
+
+        with open_text_auto(gff) as fr:
+            for line in fr:
+                if not line or line.startswith("#"):
+                    continue
+                parts = line.rstrip("\n").split("\t")
+                if len(parts) < 9:
+                    continue
+                seqid_raw = parts[0]
+                ftype = parts[2].lower()
+                if ftype not in fset:
+                    continue
+                if seqid_raw not in mp:
+                    dropped_non_chr += 1
+                    continue
+
+                start = safe_int(parts[3], 0)
+                end = safe_int(parts[4], 0)
+                strand = parts[6] if len(parts) > 6 else "."
+                attr = parts[8]
+
+                gene_id = extract_gene_id_from_gff_attr(attr)
+                gene_id = normalize_gene_id(gene_id)
+                if not gene_id:
+                    dropped_no_id += 1
+                    continue
+
+                chr_name = mp[seqid_raw]
+                # BED 坐标：0-based start，1-based end（与 jcvi.formats.gff bed 的习惯一致）
+                bed_start = max(0, start - 1)
+                bed_end = max(bed_start + 1, end)
+
+                bed_lines.append([chr_name, str(bed_start), str(bed_end), gene_id])
+                idx_rows.append([gene_id, chr_name, str(bed_start), str(bed_end), strand])
+                kept_gene += 1
+
+        if kept_gene == 0:
+            abort(logger, f"[{sid}] geneorder is empty (no features extracted). Check GFF and chr_rename.")
+
+        # 排序：Chr01.. + start
+        def chr_key(c: str) -> Tuple[int, str]:
+            m = re.match(r"^Chr(\d+)$", c)
+            if m:
+                return (int(m.group(1)), c)
+            return (10**9, c)
+
+        bed_lines.sort(key=lambda r: (chr_key(r[0]), int(r[1]), r[3]))
+        idx_rows.sort(key=lambda r: (chr_key(r[1]), int(r[2]), r[0]))
+
+        # 写文件
+        out_bed.parent.mkdir(parents=True, exist_ok=True)
+        with out_bed.open("w", encoding="utf-8", newline="") as fw:
+            for r in bed_lines:
+                fw.write("\t".join(r) + "\n")
+
+        write_tsv(out_idx, ["gene_id", "chr", "start", "end", "strand"], idx_rows)
+
+        logger.info(
+            f"[{sid}] gff={gff.name} use={'mRNA/transcript' if use_mrna else 'gene'} "
+            f"kept_gene={kept_gene} dropped_non_chr={dropped_non_chr} dropped_no_id={dropped_no_id}"
+        )
+
+    logger.info(f"Done. runtime_sec={int(time.time()-t0)}")
 
 
 if __name__ == "__main__":
-    main()
-
+    try:
+        main()
+    except SystemExit:
+        raise
+    except Exception as e:
+        log_path = Path(__file__).resolve().parents[1] / "logs" / "synteny01_mcscan_catalog.log"
+        lg = Logger("synteny01", log_path)
+        lg.error("Unhandled exception: " + repr(e))
+        lg.error(traceback.format_exc())
+        raise

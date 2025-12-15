@@ -3,640 +3,749 @@
 
 """
 synteny05_plot_karyotype.py
-—— JCVI karyotype 多物种宏观共线性最终绘图脚本（05 终版 · 颜色由 02 的规则复用 + 05 负责落地出图）
+—— Step05：最终出图（相邻连线 + 防爆阀 + 参考红灰横条 + 贯穿连线配色）
 
-目标（皇上钦定）：
-  - ribbons 继续彩色（复用 02 的 ref_chr → 颜色规则，且 simple 中的 #HEX*gene 颜色前缀必须被保留）；
-  - 去掉“空壳两端”：采用方案 A —— 不再绘制“整条染色体背景条”，只保留中间的实心色带；
-  - 圆圈与圆圈数字：要么全有，要么全无（脚本内只保留一个 circles 开关，不再拆分成多个开关）。
+输入（硬位置）：
+- output/synteny_04_layout_tracks/layout_species_tracks.tsv
+- output/synteny_03_order_seqids/global_chr_style.tsv
+- output/synteny_03_order_seqids/seqids_species/<species>.seqids
+- output/synteny_01_mcscan_catalog/<species>.geneorder.bed
+- output/synteny_01_mcscan_catalog/geneorder_index_<species>.tsv
+- output/synteny_02_blocks_macro/anchors_filtered/<A>__vs__<B>.anchors.simple.filtered
+- output/synteny_02_blocks_macro/pair_chr_weight/<A>__vs__<B>.chr_weight.tsv
 
-职责概述：
-  1) 读取 layout_species_tracks.tsv，确定物种顺序、参考物种、轨道位置；
-  2) 读取 synteny_03 产生的各物种 seqids，合并生成全局 seqids 文件；
-  3) 读取 synteny_02/anchors_for_links 中的 *.anchors.simple.filtered，
-     生成 JCVI 需要的 *.simple：
-       - 不把 “#HEX*gene” 当注释；
-       - 仅保留 len(parts) >= 6 且第 5 列 score 可转数字的行；
-       - 将 score 统一写为整数；
-  4) 为每个物种生成 JCVI 所需 BED：
-       - geneorder 中所有基因条目（供锚点定位）；
-       - 彩色宏观色带（paint_segments，颜色复用 02 的 ref_chr 映射）；
-     重要稳健性（颜色注释问题）：
-       - 若 simple 的参考基因带 '#HEX*' 前缀，参考物种 BED 的 gene 行最稳方式：
-         “同时写 plain 和 #HEX* 两份”，避免上游混前缀导致找不到基因。
-  5) 构建 layout 文件并追加 edges；
-  6) 调用 `python -m jcvi.graphics.karyotype` 生成最终 PDF：
-       - circles：只用一个开关控制（要么都有，要么都没有）。
+输出（硬位置）：
+output/synteny_05_plot/
+  bed_noheader/
+  simple/
+  layout/
+  figures/ karyotype.pdf
+  summaries/ step05.links.summary.tsv
+
+硬合同要点（本脚本强制执行）：
+- edges 只写相邻（track i 到 track i+1）
+- simple 只保留两端 color_id 相同且 >0 的块，并在 gene token 前加 #HEX* 前缀
+- 防爆阀门：MAX_LINKS_PER_PAIR（每对相邻最多保留多少条块）
+  截断规则：优先保留 chr-pair total_span_bp 更大的块；同权重保持输入顺序（稳定截断）
+- 横条颜色 + 标签颜色：读取 Step04 的 chr_bar_color_hex / label_color_hex
+- seqids 翻转编码：ChrNN-（严格）；严禁 ChrNNr（发现立即报错退出）
+- 图形：只输出 PDF；并强制去除白色圆圈与染色体数字（强制 --nocircles）
+- 字体：默认 Arial（与 jcvi karyotype 的 --font 选项兼容）
 """
 
-from __future__ import annotations
+# ============================================================
+# 【用户参数区】（皇上只改这里；脚本不接受命令行参数）
+# ============================================================
 
-import csv
-import logging
-import shutil
-import subprocess
-import sys
-from pathlib import Path
-from typing import Dict, List, Tuple, Optional
+# 1) 项目根目录
+# - 留空/None：自动用脚本所在位置的上两级作为项目根（.../magic）
+# - 如果你把脚本拷到别处运行，可以手动填绝对路径
+PROJECT_ROOT = None
 
+# 2) 是否清空并重建 Step05 输出目录
+# - True：每次运行都 rm -rf output/synteny_05_plot 再重建（推荐）
+# - False：保留旧结果，覆盖同名文件
+CLEAN_OUTPUT = True
 
-# =========================
-# 参数自定义区（皇上可在此手动修改）
-# =========================
+# 3) 防爆阀：每对相邻物种最多绘制多少条块（越大越容易“杂线爆炸”）
+# - 建议先 2000~10000 试探，再逐步加
+MAX_LINKS_PER_PAIR = 25000
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-
-# 上游目录
-STEP01_GENEORDER_DIR = PROJECT_ROOT / "output" / "synteny_01_mcscan_catalog" / "geneorder"
-STEP02_DIR = PROJECT_ROOT / "output" / "synteny_02_blocks_macro"
-PAINT_SEGMENTS_DIR = STEP02_DIR / "paint_segments"
-ANCHORS_FOR_LINKS_DIR = STEP02_DIR / "anchors_for_links"
-STEP03_DIR = PROJECT_ROOT / "output" / "synteny_03_chr_order"
-SEQIDS_SPECIES_DIR = STEP03_DIR / "seqids_species"
-STEP04_DIR = PROJECT_ROOT / "output" / "synteny_04_layout"
-LAYOUT_TRACKS_FILE = STEP04_DIR / "layout_species_tracks.tsv"
-
-# 输出目录
-OUTPUT_ROOT = PROJECT_ROOT / "output" / "synteny_05_plot"
-BED_DIR = OUTPUT_ROOT / "bed_noheader"
-SIMPLE_DIR = OUTPUT_ROOT / "simple"
-LOG_DIR = OUTPUT_ROOT / "logs"
-
-# JCVI 调用参数
+# 4) JCVI 运行入口（一般写 "python" 即可；也可写绝对路径）
+# - 关键：要指向装了 jcvi 的那个 Python
 JCVI_PYTHON = "python"
-FIG_WIDTH = 16
-FIG_HEIGHT = 7
 
-# 字体控制：True 则尝试使用 FONT_FAMILY；False 则交给 matplotlib 默认
-USE_CUSTOM_FONT = True
+# 5) 输出 PDF 文件名（只会在 figures/ 下生成这一份）
+OUT_PDF = "karyotype.pdf"
+
+# 6) 字体（默认 Arial）
+# - 说明：jcvi karyotype 的 --font 不是系统任意字体，而是固定枚举
+# - 你若要改，只能从下面列表选一个：
+#   Arial / Helvetica / Liberation Sans / Palatino / Schoolbook
 FONT_FAMILY = "Arial"
 
-# circles（圆圈+圆圈数字）：True=显示；False=全部去掉
-SHOW_CIRCLES = False
+# 7) 画布大小（英寸）
+# - FIGURE_WIDTH_INCH：宽度建议 12~20
+# - FIGURE_HEIGHT_INCH：
+#     - None：根据物种数自动估算高度（更省心）
+#     - 指定数值：强制高度（适合你要对齐论文版式时）
+FIGURE_WIDTH_INCH = 14.0
+FIGURE_HEIGHT_INCH = None
 
-# ---------- 物种名左侧空间 & 名称到染色体的水平距离（皇上可调） ----------
-TRACK_XSTART_BASE = 0.120
-NAME_TO_TRACK_GAP = 0.001
-TRACK_XEND = 0.950
-TRACK_XSTART = TRACK_XSTART_BASE + NAME_TO_TRACK_GAP
+# 8) 轨道横向占比（0~1）
+# - TRACK_XSTART：轨道起点（越小越靠左，留给物种名的空间越大）
+# - TRACK_XEND  ：轨道终点（越大越靠右）
+TRACK_XSTART = 0.10
+TRACK_XEND = 0.92
 
-# 染色体颜色调色板（按 Chr1..ChrN 顺序循环）
-CHR_COLOR_PALETTE = [
-    "#F79D93",  # A - 干燥玫瑰 (Dusty Rose) - 比原红更柔和
-    "#F6CD96",  # B - 杏仁奶油 (Apricot) - 去掉了刺眼的橙光
-    "#9FD5CB",  # D - 灰豆绿 (Sage Green) - 很有质感的植物绿
-    "#95C8F2",  # F - 雾霾蓝 (Hazy Blue) - 非常经典的科研蓝
-    "#C8C0F0",  # G - 丁香紫 (Lilac) - 淡雅的紫色
-    "#F6C6E7"   # H - 柔粉色 (Soft Pink) - 少女感但稳重
-]
+# 9) 物种名的垂直对齐方式（传给 layout 的 va 字段）
+# - 常用：top / center / bottom
+LABEL_VA = "top"
 
-DEFAULT_GRAY = "#D3D3D3"
-REF_LABEL_COLOR = "#E64B35"
+# ============================================================
+# 实现区（皇上勿改）
+# ============================================================
 
-# 日志级别
-LOG_LEVEL = "INFO"
-
-
-# =========================
-# 工具函数
-# =========================
-
-def setup_logging() -> logging.Logger:
-    LOG_DIR.mkdir(parents=True, exist_ok=True)
-    log_file = LOG_DIR / "synteny05_plot_karyotype.log"
-
-    logger = logging.getLogger("synteny05")
-    logger.setLevel(getattr(logging, LOG_LEVEL.upper(), logging.INFO))
-
-    for h in list(logger.handlers):
-        logger.removeHandler(h)
-
-    fmt = logging.Formatter(
-        "%(asctime)s [%(levelname)s] %(message)s", "%Y-%m-%d %H:%M:%S"
-    )
-    fh = logging.FileHandler(log_file, encoding="utf-8")
-    fh.setFormatter(fmt)
-    ch = logging.StreamHandler(sys.stdout)
-    ch.setFormatter(fmt)
-
-    logger.addHandler(fh)
-    logger.addHandler(ch)
-    return logger
+import csv
+import gzip
+import time
+import shutil
+import traceback
+import subprocess
+import re
+from pathlib import Path
+from typing import Dict, List, Tuple, Optional, Iterable
 
 
-def clean_output_root(logger: logging.Logger) -> None:
-    if OUTPUT_ROOT.exists():
-        shutil.rmtree(OUTPUT_ROOT)
-    BED_DIR.mkdir(parents=True, exist_ok=True)
-    SIMPLE_DIR.mkdir(parents=True, exist_ok=True)
-    LOG_DIR.mkdir(parents=True, exist_ok=True)
-    logger.info("OUTPUT_ROOT 已清空并重建：%s", OUTPUT_ROOT)
+_ALLOWED_JCVI_FONTS = {"Helvetica", "Liberation Sans", "Palatino", "Schoolbook", "Arial"}
+_HEX_PREFIX_RE = re.compile(r"^#[0-9a-fA-F]{6}\*")
+_HEX_COLOR_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
+_SEQ_TOKEN_RE = re.compile(r"^Chr\d+(?:-)?$")
 
 
-def _norm_key(k: str) -> str:
-    return str(k).strip().strip("\ufeff").replace("\r", "")
+def now_ts() -> str:
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
 
 
-def _norm_val(v: str) -> str:
-    return str(v).strip().replace("\r", "")
+class Logger:
+    def __init__(self, log_file: Path):
+        self.log_file = log_file
+        self.log_file.parent.mkdir(parents=True, exist_ok=True)
+
+    def _write(self, level: str, msg: str) -> None:
+        line = f"{now_ts()} [{level}] {msg}"
+        print(line, flush=True)
+        with self.log_file.open("a", encoding="utf-8") as fw:
+            fw.write(line + "\n")
+
+    def info(self, msg: str) -> None:
+        self._write("INFO", msg)
+
+    def warn(self, msg: str) -> None:
+        self._write("WARN", msg)
+
+    def error(self, msg: str) -> None:
+        self._write("ERROR", msg)
 
 
-def _normalize_row(row: Dict[str, str]) -> Dict[str, str]:
-    out: Dict[str, str] = {}
-    for k, v in row.items():
-        out[_norm_key(k)] = _norm_val(v)
-    return out
+def die(logger: Logger, msg: str, code: int = 1) -> None:
+    logger.error(msg)
+    raise SystemExit(code)
 
 
-def load_layout_tracks(logger: logging.Logger) -> Tuple[List[Dict[str, str]], str]:
+def open_text_auto(path: Path):
+    if str(path).endswith(".gz"):
+        return gzip.open(path, "rt", encoding="utf-8", errors="replace")
+    return path.open("r", encoding="utf-8", errors="replace")
+
+
+def clean_dir(path: Path, clean: bool, logger: Logger) -> None:
+    if clean and path.exists():
+        logger.info(f"Clean output dir: {path}")
+        shutil.rmtree(path)
+    path.mkdir(parents=True, exist_ok=True)
+
+
+def write_tsv(path: Path, header: List[str], rows: Iterable[List[str]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8", newline="") as fw:
+        w = csv.writer(fw, delimiter="\t")
+        w.writerow(header)
+        for r in rows:
+            w.writerow(r)
+
+
+def strip_color_prefix(token: str) -> str:
+    token = token.strip()
+    if _HEX_PREFIX_RE.match(token):
+        return token.split("*", 1)[1]
+    return token
+
+
+def normalize_gene_id(raw: str) -> str:
+    x = raw.strip().strip('"').strip("'").strip()
+    if "|" in x:
+        x = x.split("|")[-1]
+    if x.startswith("rna-"):
+        x = x[4:]
+    return x
+
+
+def validate_seqids_line(line: str) -> Tuple[List[str], List[str]]:
     """
-    读取 layout_species_tracks.tsv，得到物种顺序和参考物种 ID。
-    兼容 Windows CRLF（字段名/字段值可能带 \\r）。
+    防线：允许 ChrNN / ChrNN-；禁止 ChrNNr；禁止空 token；禁止重复 base Chr
+    返回：(tokens, base_tokens)
     """
-    if not LAYOUT_TRACKS_FILE.exists():
-        logger.error("layout_tracks 文件不存在：%s", LAYOUT_TRACKS_FILE)
-        sys.exit(1)
+    raw = (line or "").strip()
+    if not raw:
+        raise ValueError("seqids line is empty")
 
-    rows: List[Dict[str, str]] = []
-    ref_species: Optional[str] = None
+    tokens = [t.strip() for t in raw.split(",")]
+    if any(t == "" for t in tokens):
+        raise ValueError(f"seqids contains empty token (extra commas?): {raw}")
 
-    with LAYOUT_TRACKS_FILE.open("r", encoding="utf-8", newline="") as f:
-        reader = csv.DictReader(f, delimiter="\t")
-        for r in reader:
-            rr = _normalize_row(r)
-            rows.append(rr)
-            if (rr.get("is_reference", "") or "").lower() == "yes":
-                ref_species = rr.get("species_id", "").strip()
-
-    if not rows:
-        logger.error("layout_tracks 文件为空：%s", LAYOUT_TRACKS_FILE)
-        sys.exit(1)
-    if ref_species is None or not ref_species.strip():
-        logger.error("layout_tracks 中未找到参考物种（is_reference==yes）")
-        sys.exit(1)
-
-    def _safe_int(x: str) -> int:
-        try:
-            return int(str(x).strip())
-        except ValueError:
-            return 0
-
-    rows.sort(key=lambda x: _safe_int(x.get("order_index", "0")))
-    logger.info("共读取物种轨道 %d 条，参考物种 = %s", len(rows), ref_species)
-    return rows, ref_species
+    base_seen = set()
+    base_tokens: List[str] = []
+    for t in tokens:
+        if t.endswith("r") or t.endswith("R"):
+            raise ValueError(f"seqids token uses 'r' (FORBIDDEN). Use '-' for flip: {t}")
+        if not _SEQ_TOKEN_RE.match(t):
+            raise ValueError(f"illegal seqids token: {t} (must be ChrNN or ChrNN-)")
+        base = t[:-1] if t.endswith("-") else t
+        if base in base_seen:
+            raise ValueError(f"duplicated chromosome in seqids: {base}")
+        base_seen.add(base)
+        base_tokens.append(base)
+    return tokens, base_tokens
 
 
-def get_short_label(species_id: str, track_rows: List[Dict[str, str]]) -> str:
-    for r in track_rows:
-        if (r.get("species_id") or "").strip() == species_id:
-            sl = (r.get("short_label") or "").strip()
-            if sl:
-                return sl
-    parts = species_id.split("_")
-    if len(parts) >= 2:
-        return f"{parts[0][0]}{parts[1][:2]}"
-    return species_id[:3]
-
-
-def build_seqids_file(track_rows: List[Dict[str, str]], logger: logging.Logger) -> None:
-    out_path = OUTPUT_ROOT / "seqids"
-    with out_path.open("w", encoding="utf-8") as fout:
-        for row in track_rows:
-            sid = (row.get("species_id") or "").strip()
-            seqids_path = SEQIDS_SPECIES_DIR / f"{sid}.seqids"
-            chroms: List[str] = []
-            if seqids_path.exists():
-                with seqids_path.open("r", encoding="utf-8") as f:
-                    for line in f:
-                        line = line.strip()
-                        if not line or line.startswith(">"):
-                            continue
-                        chroms.append(line)
-            logger.info("  seqids[%s]：%d 条 Chr。", sid, len(chroms))
-            fout.write(",".join(chroms) + "\n")
-    logger.info("  seqids 写出：%s", out_path)
-
-
-def collect_ref_chr_and_colors(logger: logging.Logger) -> Dict[str, str]:
-    ref_chrs: set[str] = set()
-
-    if not PAINT_SEGMENTS_DIR.exists():
-        logger.error("paint_segments 目录不存在：%s", PAINT_SEGMENTS_DIR)
-        sys.exit(1)
-
-    for tsv in sorted(PAINT_SEGMENTS_DIR.glob("paint_segments_*.tsv")):
-        with tsv.open("r", encoding="utf-8", newline="") as f:
-            reader = csv.DictReader(f, delimiter="\t")
-            for row in reader:
-                row = _normalize_row(row)
-                rc = (row.get("ref_chr") or "").strip()
-                if rc:
-                    ref_chrs.add(rc)
-
-    if not ref_chrs:
-        logger.error("在 paint_segments 中未找到任何 ref_chr，请检查上游 02 步。")
-        sys.exit(1)
-
-    def chr_sort_key(x: str) -> Tuple[int, int, str]:
-        s = x.replace("chr", "").replace("Chr", "")
-        try:
-            return (0, int(s), x)
-        except ValueError:
-            return (1, 10**9, x)
-
-    sorted_ref = sorted(ref_chrs, key=chr_sort_key)
-    logger.info(
-        "从 paint_segments 中共收集到 %d 个 ref_chr：%s",
-        len(sorted_ref),
-        ", ".join(sorted_ref),
-    )
-
-    color_map: Dict[str, str] = {}
-    for idx, chr_name in enumerate(sorted_ref):
-        color_map[chr_name] = CHR_COLOR_PALETTE[idx % len(CHR_COLOR_PALETTE)]
-
-    logger.info(
-        "参考染色体颜色映射（复用 synteny02 规则）：%s",
-        ", ".join(f"{c}#{h.lstrip('#')}" for c, h in color_map.items()),
-    )
-    return color_map
-
-
-def _first_valid_record_from_file(path: Path) -> Optional[List[str]]:
+def read_layout_tracks(path: Path) -> List[Dict[str, str]]:
+    """
+    Step04 layout_species_tracks.tsv
+    header:
+      order_index species_id display_label group y_center track_height chr_bar_color_hex label_color_hex
+    """
     if not path.exists():
-        return None
-    with path.open("r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
+        raise FileNotFoundError(f"Missing layout tracks: {path}")
+    rows: List[Dict[str, str]] = []
+    need = ["order_index", "species_id", "display_label", "group", "y_center", "track_height", "chr_bar_color_hex", "label_color_hex"]
+    with open_text_auto(path) as fr:
+        header = fr.readline().rstrip("\n").split("\t")
+        if header != need:
+            raise ValueError(f"Bad header in {path.name}: {header}")
+        for line in fr:
+            line = line.rstrip("\n")
             if not line:
                 continue
-            parts = line.split()
-            if len(parts) >= 6:
-                return parts[:6]
-    return None
+            parts = line.split("\t")
+            if len(parts) != len(need):
+                continue
+            d = dict(zip(need, parts))
+            rows.append(d)
+    rows.sort(key=lambda d: int(d["order_index"]))
+    return rows
 
 
-def detect_ref_gene_prefix_needed(
-    track_rows: List[Dict[str, str]],
-    ref_species: str,
-    logger: logging.Logger,
-) -> bool:
-    ref_short = get_short_label(ref_species, track_rows)
+def load_global_chr_style(path: Path) -> Dict[str, Dict[str, Tuple[int, str]]]:
+    """
+    global_chr_style.tsv
+    header:
+      species_id chr order_index orientation dominant_prev_chr dominant_weight_span_bp color_id color_hex
+    返回：
+      style[species][chr] = (color_id, color_hex)
+    """
+    if not path.exists():
+        raise FileNotFoundError(f"Missing global chr style: {path}")
+    style: Dict[str, Dict[str, Tuple[int, str]]] = {}
+    with open_text_auto(path) as fr:
+        header = fr.readline().rstrip("\n").split("\t")
+        need = ["species_id", "chr", "order_index", "orientation", "dominant_prev_chr", "dominant_weight_span_bp", "color_id", "color_hex"]
+        if header != need:
+            raise ValueError(f"Bad header in {path.name}: {header}")
+        for line in fr:
+            line = line.rstrip("\n")
+            if not line:
+                continue
+            parts = line.split("\t")
+            if len(parts) != 8:
+                continue
+            sid = parts[0]
+            chr_ = parts[1]
+            cid = int(parts[6]) if parts[6].isdigit() else 0
+            chex = parts[7]
+            style.setdefault(sid, {})[chr_] = (cid, chex)
+    return style
 
-    for row in track_rows:
-        sid = (row.get("species_id") or "").strip()
-        if sid == ref_species:
-            continue
-        qry_short = get_short_label(sid, track_rows)
-        src = ANCHORS_FOR_LINKS_DIR / f"{ref_short}__vs__{qry_short}.anchors.simple.filtered"
-        parts = _first_valid_record_from_file(src)
-        if not parts:
-            continue
-        gene_a = parts[0]
-        if gene_a.startswith("#") and "*" in gene_a and len(gene_a.split("*", 1)[0]) == 7:
-            logger.info("检测到 simple 参考基因带颜色前缀（#HEX*）：True（示例：%s）", gene_a)
-            return True
-        logger.info("检测到 simple 参考基因带颜色前缀（#HEX*）：False（示例：%s）", gene_a)
-        return False
 
-    logger.warning("未能从任何 filtered 文件中抽到有效记录，默认不使用 #HEX* 前缀。")
-    return False
+def load_gene_index(step01_dir: Path, sid: str) -> Dict[str, str]:
+    """
+    geneorder_index_<sid>.tsv：gene_id -> chr
+    """
+    p = step01_dir / f"geneorder_index_{sid}.tsv"
+    if not p.exists():
+        raise FileNotFoundError(f"Missing gene index: {p}")
+    mp: Dict[str, str] = {}
+    with open_text_auto(p) as fr:
+        header = fr.readline().rstrip("\n").split("\t")
+        if header[:2] != ["gene_id", "chr"]:
+            raise ValueError(f"Bad header in {p.name}: {header}")
+        for line in fr:
+            line = line.rstrip("\n")
+            if not line:
+                continue
+            parts = line.split("\t")
+            if len(parts) < 2:
+                continue
+            gid = normalize_gene_id(strip_color_prefix(parts[0]))
+            chr_ = parts[1]
+            if gid:
+                mp[gid] = chr_
+    if not mp:
+        raise ValueError(f"Empty gene index: {p}")
+    return mp
 
 
-def copy_simple_files(
-    track_rows: List[Dict[str, str]],
-    ref_species: str,
-    logger: logging.Logger,
+def load_pair_chr_weight(step02_dir: Path, pair_id: str) -> Dict[Tuple[str, str], int]:
+    """
+    pair_chr_weight/<pair>.chr_weight.tsv
+    header: pair_id a_chr b_chr total_span_bp n_blocks
+    返回： (a_chr,b_chr) -> total_span_bp
+    """
+    p = step02_dir / "pair_chr_weight" / f"{pair_id}.chr_weight.tsv"
+    if not p.exists():
+        raise FileNotFoundError(f"Missing chr_weight: {p}")
+    mp: Dict[Tuple[str, str], int] = {}
+    with open_text_auto(p) as fr:
+        header = fr.readline().rstrip("\n").split("\t")
+        need = ["pair_id", "a_chr", "b_chr", "total_span_bp", "n_blocks"]
+        if header != need:
+            raise ValueError(f"Bad header in {p.name}: {header}")
+        for line in fr:
+            line = line.rstrip("\n")
+            if not line:
+                continue
+            parts = line.split("\t")
+            if len(parts) != 5:
+                continue
+            a_chr, b_chr = parts[1], parts[2]
+            w = int(parts[3]) if parts[3].isdigit() else 0
+            mp[(a_chr, b_chr)] = w
+    return mp
+
+
+def prepare_bed_with_color_dups(
+    sid: str,
+    step01_dir: Path,
+    chr_style: Dict[str, Tuple[int, str]],
+    out_bed: Path,
+    logger: Logger
 ) -> None:
     """
-    关键：不把行首 '#' 当注释（因为 #HEX*gene 是数据）。
-    仅收：len(parts)>=6 且第 5 列 score 可转数字。
+    bed_noheader/<sid>.bed
+    - 先写原始 gene_id
+    - 若该 gene 所在 chr 的 color_id>0 且 color_hex 合法(#RRGGBB)，则再写一条 #HEX*gene_id 的镜像记录
     """
-    ref_short = get_short_label(ref_species, track_rows)
-    total_kept = 0
-    total_skipped = 0
+    src = step01_dir / f"{sid}.geneorder.bed"
+    if not src.exists():
+        raise FileNotFoundError(f"Missing geneorder bed: {src}")
 
-    logger.info("Step 1: 复制 simple 文件（列数>=6 且 score 可转数字才收）...")
+    n_in = 0
+    n_out = 0
+    n_pref = 0
+    n_bad_hex = 0
 
-    for row in track_rows:
-        sid = (row.get("species_id") or "").strip()
-        if sid == ref_species:
-            continue
-
-        qry_short = get_short_label(sid, track_rows)
-        src = ANCHORS_FOR_LINKS_DIR / f"{ref_short}__vs__{qry_short}.anchors.simple.filtered"
-        dst = SIMPLE_DIR / f"{ref_short}.{qry_short}.simple"
-
-        if not src.exists():
-            logger.warning("  simple 源文件缺失，跳过：%s", src)
-            continue
-
-        kept = 0
-        skipped = 0
-
-        with src.open("r", encoding="utf-8") as fin, dst.open("w", encoding="utf-8") as fout:
-            for line in fin:
-                line = line.strip()
-                if not line:
-                    continue
-
-                parts = line.split()
-                if len(parts) < 6:
-                    skipped += 1
-                    continue
-
-                gene_a, gene_b, chr_a, chr_b, score_raw, orient = parts[:6]
-
-                try:
-                    score_float = float(score_raw)
-                except ValueError:
-                    skipped += 1
-                    continue
-
-                score_int = int(score_float)
-                fout.write("\t".join([gene_a, gene_b, chr_a, chr_b, str(score_int), orient]) + "\n")
-                kept += 1
-
-        total_kept += kept
-        total_skipped += skipped
-        logger.info("  simple 写出：%s（保留 %d，跳过 %d）。", dst, kept, skipped)
-
-    logger.info("simple 文件合计保留锚点 %d 条，跳过 %d 条。", total_kept, total_skipped)
-
-
-def load_geneorder(species_id: str) -> List[Tuple[str, int, int, str]]:
-    bed_path = STEP01_GENEORDER_DIR / f"{species_id}.bed"
-    records: List[Tuple[str, int, int, str]] = []
-    if not bed_path.exists():
-        return records
-
-    with bed_path.open("r", encoding="utf-8") as f:
-        for line in f:
-            if not line.strip():
+    out_bed.parent.mkdir(parents=True, exist_ok=True)
+    with src.open("r", encoding="utf-8", errors="replace") as fr, out_bed.open("w", encoding="utf-8", newline="") as fw:
+        for line in fr:
+            line = line.rstrip("\n")
+            if not line:
                 continue
-            parts = line.rstrip("\n").split("\t")
+            parts = line.split("\t")
             if len(parts) < 4:
                 continue
-            chrom = parts[0].strip()
-            try:
-                start = int(parts[1])
-                end = int(parts[2])
-            except ValueError:
+            n_in += 1
+            chr_, start, end, gid = parts[0], parts[1], parts[2], parts[3]
+            gid0 = normalize_gene_id(strip_color_prefix(gid))
+
+            fw.write("\t".join([chr_, start, end, gid0]) + "\n")
+            n_out += 1
+
+            if chr_ in chr_style:
+                cid, chex = chr_style[chr_]
+                if cid > 0 and chex != "NA":
+                    if not _HEX_COLOR_RE.match(chex):
+                        n_bad_hex += 1
+                    else:
+                        fw.write("\t".join([chr_, start, end, f"{chex}*{gid0}"]) + "\n")
+                        n_out += 1
+                        n_pref += 1
+
+    if n_bad_hex > 0:
+        logger.warn(f"[BED] {sid}: found {n_bad_hex} invalid color_hex (must be #RRGGBB); colored duplicates skipped for those")
+    logger.info(f"[BED] {sid}: in_lines={n_in} out_lines={n_out} colored_dups={n_pref}")
+
+
+def build_simple_for_pair(
+    a: str,
+    b: str,
+    step02_dir: Path,
+    gene_chr_a: Dict[str, str],
+    gene_chr_b: Dict[str, str],
+    style_a: Dict[str, Tuple[int, str]],
+    style_b: Dict[str, Tuple[int, str]],
+    pair_weight: Dict[Tuple[str, str], int],
+    out_simple: Path,
+    logger: Logger
+) -> Tuple[int, int, int, int, int]:
+    """
+    anchors_filtered/<pair>.anchors.simple.filtered
+    6列：a1 a2 b1 b2 n orient
+
+    过滤规则（蓝图）：
+    - 四个端点基因都必须存在于 gene_index（硬防线）
+    - A 端点两基因必须在同一 chr；B 端点两基因必须在同一 chr（不自洽则丢弃）
+    - 两端 chr 的 color_id 相同 且 color_id>0
+    - 输出时给基因 token 前加 #HEX* 前缀（HEX 为该 color_id 对应的 color_hex）
+
+    防爆截断（蓝图）：
+    - 若候选块数 > MAX_LINKS_PER_PAIR：
+      先按 chrpair total_span_bp 降序，再按输入顺序稳定截断
+    """
+    pair_id = f"{a}__vs__{b}"
+    in_path = step02_dir / "anchors_filtered" / f"{pair_id}.anchors.simple.filtered"
+    if not in_path.exists():
+        raise FileNotFoundError(f"Missing anchors_filtered: {in_path}")
+
+    anchors_in = 0
+    dropped_missing = 0
+    dropped_inconsistent = 0
+    candidates: List[Tuple[int, int, List[str]]] = []  # (weight, order, parts_out)
+    order = 0
+
+    with open_text_auto(in_path) as fr:
+        for line in fr:
+            line = line.rstrip("\n")
+            if not line:
                 continue
-            gene_id = parts[3].strip().replace("\r", "")
-            records.append((chrom, start, end, gene_id))
-    return records
-
-
-def load_paint_segments(species_id: str, logger: logging.Logger) -> List[Tuple[str, int, int, str]]:
-    tsv = PAINT_SEGMENTS_DIR / f"paint_segments_{species_id}.tsv"
-    segs: List[Tuple[str, int, int, str]] = []
-    if not tsv.exists():
-        logger.warning("paint_segments 文件缺失：%s", tsv)
-        return segs
-
-    with tsv.open("r", encoding="utf-8", newline="") as f:
-        reader = csv.DictReader(f, delimiter="\t")
-        for row in reader:
-            row = _normalize_row(row)
-            chrom = (row.get("chr") or "").strip()
-            ref_chr = (row.get("ref_chr") or "").strip()
-            if not chrom or not ref_chr:
+            parts = line.split("\t")
+            if len(parts) != 6:
                 continue
-            try:
-                start = int(str(row.get("start", "0")).strip())
-                end = int(str(row.get("end", "0")).strip())
-            except ValueError:
+            anchors_in += 1
+            order += 1
+
+            ga1 = normalize_gene_id(strip_color_prefix(parts[0]))
+            ga2 = normalize_gene_id(strip_color_prefix(parts[1]))
+            gb1 = normalize_gene_id(strip_color_prefix(parts[2]))
+            gb2 = normalize_gene_id(strip_color_prefix(parts[3]))
+
+            if ga1 not in gene_chr_a or ga2 not in gene_chr_a or gb1 not in gene_chr_b or gb2 not in gene_chr_b:
+                dropped_missing += 1
                 continue
-            segs.append((chrom, start, end, ref_chr))
 
-    logger.info("  paint_segments 加载：%s → %d 条宏观色带。", species_id, len(segs))
-    return segs
+            a_chr1 = gene_chr_a[ga1]
+            a_chr2 = gene_chr_a[ga2]
+            b_chr1 = gene_chr_b[gb1]
+            b_chr2 = gene_chr_b[gb2]
+
+            if a_chr1 != a_chr2 or b_chr1 != b_chr2:
+                dropped_inconsistent += 1
+                continue
+
+            a_chr = a_chr1
+            b_chr = b_chr1
+
+            if a_chr not in style_a or b_chr not in style_b:
+                dropped_missing += 1
+                continue
+
+            ca_id, ca_hex = style_a[a_chr]
+            cb_id, cb_hex = style_b[b_chr]
+
+            if ca_id <= 0 or cb_id <= 0 or ca_id != cb_id:
+                continue
+
+            chex = ca_hex
+            if chex == "NA" or (not _HEX_COLOR_RE.match(chex)):
+                continue
+
+            out_parts = [
+                f"{chex}*{ga1}",
+                f"{chex}*{ga2}",
+                f"{chex}*{gb1}",
+                f"{chex}*{gb2}",
+                parts[4],
+                parts[5],
+            ]
+
+            w = pair_weight.get((a_chr, b_chr), 0)
+            candidates.append((w, order, out_parts))
+
+    n_cand = len(candidates)
+    if n_cand == 0:
+        logger.warn(
+            f"[{pair_id}] no blocks after color-chain filter "
+            f"(anchors_in_filtered={anchors_in}, dropped_missing_endpoints={dropped_missing}, dropped_inconsistent_chr={dropped_inconsistent})"
+        )
+        out_simple.parent.mkdir(parents=True, exist_ok=True)
+        out_simple.write_text("", encoding="utf-8")
+        return anchors_in, 0, 0, dropped_missing, dropped_inconsistent
+
+    candidates.sort(key=lambda x: (-x[0], x[1]))
+    if n_cand > MAX_LINKS_PER_PAIR:
+        candidates = candidates[:MAX_LINKS_PER_PAIR]
+
+    out_simple.parent.mkdir(parents=True, exist_ok=True)
+    with out_simple.open("w", encoding="utf-8", newline="") as fw:
+        for _w, _ord, parts_out in candidates:
+            fw.write("\t".join(parts_out) + "\n")
+
+    drawn = len(candidates)
+    logger.info(
+        f"[{pair_id}] anchors_in_filtered={anchors_in} candidates={n_cand} drawn={drawn} "
+        f"dropped_missing_endpoints={dropped_missing} dropped_inconsistent_chr={dropped_inconsistent}"
+    )
+    return anchors_in, n_cand, drawn, dropped_missing, dropped_inconsistent
 
 
-def generate_bed_files(
-    track_rows: List[Dict[str, str]],
-    ref_species: str,
-    ref_chr_color_map: Dict[str, str],
-    ref_gene_need_prefix: bool,
-    logger: logging.Logger,
+def write_seqids_file(track_species: List[str], seqids_species_dir: Path, out_seqids: Path, logger: Logger) -> None:
+    """
+    jcvi karyotype 的 seqids 文件：每行一个 track（逗号分隔 chr 列表）
+    加硬防线：只允许 ChrNN / ChrNN-；禁止 ChrNNr；并校验 base chr 不重复
+    """
+    lines: List[str] = []
+    for sid in track_species:
+        p = seqids_species_dir / f"{sid}.seqids"
+        if not p.exists():
+            raise FileNotFoundError(f"Missing seqids for {sid}: {p}")
+        line = p.read_text(encoding="utf-8", errors="replace").strip()
+        tokens, _bases = validate_seqids_line(line)
+        logger.info(f"[SEQIDS-OK] {sid}: n_tokens={len(tokens)} flip_tokens={sum(1 for x in tokens if x.endswith('-'))}")
+        lines.append(line)
+    out_seqids.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def write_layout_file(
+    tracks: List[Dict[str, str]],
+    out_layout: Path,
+    bed_dir: Path,
+    simple_dir: Path,
+    logger: Logger
 ) -> None:
     """
-    方案 A（皇上选择）：不再绘制“整条染色体背景条”，只保留中间实心色带（paint segments）。
-
-    颜色注释稳健性：
-      - 参考物种 gene 行：如果需要前缀，则“同时写两份”（plain + #HEX*），避免 simple 混前缀导致找不到。
+    JCVI layout（tracks 行 + edges 行）
+    tracks 行格式（jcvi help）：
+      y, xstart, xend, rotation, color, label, va, bed, label_va
+    edges 行：
+      e, i, i+1, simplefile
     """
-    logger.info("Step 2: 生成 BED 文件（基因 + 彩色宏观色带）...")
-    logger.info("参考物种基因是否需要 '#HEX*' 前缀：%s", "True" if ref_gene_need_prefix else "False")
+    rot = 0
+    lines: List[str] = []
 
-    for row in track_rows:
-        sid = (row.get("species_id") or "").strip()
-        out_bed = BED_DIR / f"{sid}.bed"
+    for i, d in enumerate(tracks):
+        sid = d["species_id"]
+        y = float(d["y_center"])
+        bar_hex = d["chr_bar_color_hex"]
+        label_hex = d["label_color_hex"]
+        label_text = d["display_label"]
 
-        gene_records = load_geneorder(sid)
-        segs = load_paint_segments(sid, logger)
+        if not _HEX_COLOR_RE.match(bar_hex):
+            logger.warn(f"[LAYOUT] {sid}: chr_bar_color_hex not #RRGGBB: {bar_hex}")
+        if not _HEX_COLOR_RE.match(label_hex):
+            logger.warn(f"[LAYOUT] {sid}: label_color_hex not #RRGGBB: {label_hex}")
 
-        is_ref = sid == ref_species
+        label = f"{label_hex}*{label_text}"
+        bed = bed_dir / f"{sid}.bed"
 
-        n_prefixed = 0
-        n_missing_color = 0
-        n_plain = 0
+        lines.append(
+            f"{y:.6f}, {TRACK_XSTART:.2f}, {TRACK_XEND:.2f}, {rot}, {bar_hex}, {label}, {LABEL_VA}, {bed.as_posix()}, center"
+        )
 
-        with out_bed.open("w", encoding="utf-8") as fout:
-            # 1) gene 行（供锚点定位使用）
-            for chrom, start, end, gene_id in gene_records:
-                if is_ref and ref_gene_need_prefix:
-                    # 先写 plain（兜底）
-                    fout.write(f"{chrom}\t{start}\t{end}\t{gene_id}\n")
-                    n_plain += 1
+    for i in range(len(tracks) - 1):
+        a = tracks[i]["species_id"]
+        b = tracks[i + 1]["species_id"]
+        simple = simple_dir / f"{a}__vs__{b}.simple"
+        lines.append(f"e, {i}, {i+1}, {simple.as_posix()}")
 
-                    # 再写 prefixed（给 simple 中 #HEX*gene 找到用）
-                    color = ref_chr_color_map.get(chrom)
-                    if not color:
-                        color = DEFAULT_GRAY
-                        n_missing_color += 1
-                    fout.write(f"{chrom}\t{start}\t{end}\t{color}*{gene_id}\n")
-                    n_prefixed += 1
-                else:
-                    fout.write(f"{chrom}\t{start}\t{end}\t{gene_id}\n")
-
-            chrom_max_end: Dict[str, int] = {}
-            for chrom, start, end, ref_chr in segs:
-                prev = chrom_max_end.get(chrom, 0)
-                if end > prev:
-                    chrom_max_end[chrom] = end
-            if not chrom_max_end:
-                for chrom, start, end, gene_id in gene_records:
-                    prev = chrom_max_end.get(chrom, 0)
-                    if end > prev:
-                        chrom_max_end[chrom] = end
-            for chrom, max_end in chrom_max_end.items():
-                if max_end > 0:
-                    fout.write(f"{chrom}\t0\t{max_end}\t.\t#D9D9D9\n")
-
-            # 2) 宏观色带（paint segments）：只画实心的中间部分
-            for chrom, start, end, ref_chr in segs:
-                color = ref_chr_color_map.get(ref_chr, DEFAULT_GRAY)
-                fout.write(f"{chrom}\t{start}\t{end}\t.\t{color}\n")
-
-        if is_ref and ref_gene_need_prefix:
-            logger.info(
-                "  写出：%s（基因原始=%d；plain=%d；prefixed=%d；宏观色带=%d；找不到Chr颜色=%d）。",
-                out_bed, len(gene_records), n_plain, n_prefixed, len(segs), n_missing_color
-            )
-        else:
-            logger.info(
-                "  写出：%s（基因=%d；宏观色带=%d）。",
-                out_bed, len(gene_records), len(segs)
-            )
+    out_layout.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
-def format_species_label(species_id: str) -> str:
-    parts = species_id.split("_")
-    if len(parts) >= 2:
-        return f"{parts[0][0]}. {parts[1]}"
-    return species_id
+def _estimate_height_inch(n_tracks: int) -> float:
+    h = max(6.0, 0.66 * float(n_tracks))
+    return round(h, 2)
 
 
-def build_layout_file(
-    track_rows: List[Dict[str, str]],
-    ref_species: str,
-    logger: logging.Logger,
-) -> None:
-    layout_path = OUTPUT_ROOT / "layout"
-    ref_short = get_short_label(ref_species, track_rows)
-
-    ref_index = None
-    for i, r in enumerate(track_rows):
-        if (r.get("species_id") or "").strip() == ref_species:
-            ref_index = i
-            break
-    if ref_index is None:
-        logger.error("未在 track_rows 中找到参考物种：%s", ref_species)
-        sys.exit(1)
-
-    with layout_path.open("w", encoding="utf-8") as f:
-        f.write("# y, xstart, xend, rotation, color, label, va, bed\n")
-
-        for idx, row in enumerate(track_rows):
-            sid = (row.get("species_id") or "").strip()
-            y_center = float((row.get("y_center") or "0.5").strip() or "0.5")
-            label = format_species_label(sid)
-
-            if sid == ref_species:
-                color = REF_LABEL_COLOR
-            else:
-                color = "black"
-
-            f.write(
-                f"{y_center:.3f}, {TRACK_XSTART:.3f}, {TRACK_XEND:.3f}, "
-                f"0, {color}, {label}, top, bed_noheader/{sid}.bed\n"
-            )
-
-        f.write("# edges\n")
-        for idx, row in enumerate(track_rows):
-            sid = (row.get("species_id") or "").strip()
-            if sid == ref_species:
-                continue
-            qry_short = get_short_label(sid, track_rows)
-            simple_path = SIMPLE_DIR / f"{ref_short}.{qry_short}.simple"
-            if simple_path.exists():
-                f.write(f"e, {ref_index}, {idx}, simple/{ref_short}.{qry_short}.simple\n")
-
-    logger.info("  layout 写出：%s", layout_path)
-
-
-def call_jcvi(logger: logging.Logger) -> None:
+def run_jcvi_karyotype(seqids: Path, layout: Path, fig_dir: Path, n_tracks: int, logger: Logger) -> Path:
     """
-    circles（圆圈+数字）只用一个开关控制：
-      - SHOW_CIRCLES=False：固定加 --nocircles（全无）
-      - SHOW_CIRCLES=True ：不加 --nocircles（全有）
+    通过 subprocess 调用 jcvi.graphics.karyotype
+    - 只生成 PDF
+    - 强制 --nocircles（去掉白色圆圈与染色体数字）
+    - 强制 --font=Arial（默认，可由用户参数区改为 jcvi 支持的字体枚举）
     """
-    cmd: List[str] = [
-        JCVI_PYTHON,
-        "-m",
-        "jcvi.graphics.karyotype",
-        "seqids",
-        "layout",
-        "--format",
-        "pdf",
-        f"--figsize={FIG_WIDTH}x{FIG_HEIGHT}",
+    fig_dir.mkdir(parents=True, exist_ok=True)
+
+    if FONT_FAMILY not in _ALLOWED_JCVI_FONTS:
+        die(logger, f"FONT_FAMILY illegal: {FONT_FAMILY}. Allowed: {', '.join(sorted(_ALLOWED_JCVI_FONTS))}")
+
+    w = float(FIGURE_WIDTH_INCH)
+    h = float(FIGURE_HEIGHT_INCH) if FIGURE_HEIGHT_INCH is not None else _estimate_height_inch(n_tracks)
+
+    cmd = [
+        JCVI_PYTHON, "-m", "jcvi.graphics.karyotype",
+        str(seqids), str(layout),
+        "--format=pdf",
         "--notex",
-#        "--chrstyle",
-#        "rect",
+        f"--font={FONT_FAMILY}",
+        f"--figsize={int(round(w))}x{int(round(h))}",
+        "--nocircles",
     ]
 
-    if not SHOW_CIRCLES:
-        cmd.append("--nocircles")
+    logger.info("[CMD] " + " ".join(cmd))
+    r = subprocess.run(cmd, cwd=str(fig_dir), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
 
-    if USE_CUSTOM_FONT and FONT_FAMILY:
-        cmd.extend(["--font", FONT_FAMILY])
+    out = (r.stdout or "").rstrip("\n")
+    if out:
+        noisy = (
+            "pkg_resources is deprecated",
+            "brewer2mpl/brewer2mpl.py",
+            "setuptools.pypa.io",
+            "slated for removal",
+        )
+        for ln in out.splitlines():
+            if any(x in ln for x in noisy):
+                continue
+            logger.info(f"[JCVI] {ln}")
 
-    logger.info("Step 4: 调用 JCVI 绘图生成 PDF...")
-    logger.info("运行命令：%s", " ".join(cmd))
+    if r.returncode != 0:
+        raise RuntimeError(f"jcvi karyotype failed (exit={r.returncode})")
 
-    proc = subprocess.run(
-        cmd,
-        cwd=str(OUTPUT_ROOT),
-        text=True,
-        capture_output=True,
-    )
-    if proc.stdout:
-        logger.info("[STDOUT]\n%s", proc.stdout.strip())
-    if proc.stderr:
-        logger.info("[STDERR]\n%s", proc.stderr.strip())
+    pdf = None
+    for p in sorted(fig_dir.glob("*.pdf")):
+        pdf = p
+        break
+    if pdf is None or (not pdf.exists()):
+        raise RuntimeError("jcvi did not produce any PDF in figures/")
 
-    if proc.returncode != 0:
-        logger.error("synteny05 — JCVI 绘图失败，请根据日志排查。")
-    else:
-        logger.info("synteny05 — 运行完成。请在输出目录查看生成的 PDF：%s", OUTPUT_ROOT)
+    return pdf
 
-
-# =========================
-# Main
-# =========================
 
 def main() -> None:
-    logger = setup_logging()
-    logger.info("========== synteny05 — JCVI karyotype 最终绘图 ==========")
-    logger.info("PROJECT_ROOT = %s", PROJECT_ROOT)
-    logger.info("OUTPUT_ROOT  = %s", OUTPUT_ROOT)
-    logger.info("USE_CUSTOM_FONT = %s (font=%s)", "True" if USE_CUSTOM_FONT else "False", FONT_FAMILY)
-    logger.info("TRACK_XSTART_BASE = %.3f", TRACK_XSTART_BASE)
-    logger.info("NAME_TO_TRACK_GAP = %.3f", NAME_TO_TRACK_GAP)
-    logger.info("TRACK_XSTART = %.3f, TRACK_XEND = %.3f", TRACK_XSTART, TRACK_XEND)
-    logger.info("SHOW_CIRCLES = %s", "True" if SHOW_CIRCLES else "False")
+    pr = PROJECT_ROOT
+    if pr is None or str(pr).strip() == "":
+        project = Path(__file__).resolve().parents[1]
+    else:
+        project = Path(str(pr)).expanduser().resolve()
 
-    clean_output_root(logger)
+    step01_dir = project / "output/synteny_01_mcscan_catalog"
+    step02_dir = project / "output/synteny_02_blocks_macro"
+    step03_dir = project / "output/synteny_03_order_seqids"
+    step04_dir = project / "output/synteny_04_layout_tracks"
+    out_dir = project / "output/synteny_05_plot"
+    log_dir = project / "logs"
 
-    # 1) 读取物种轨道信息
-    track_rows, ref_species = load_layout_tracks(logger)
+    logger = Logger(log_dir / "synteny05_plot_karyotype.log")
+    t0 = time.time()
 
-    # 2) 生成 seqids
-    logger.info("Step 0: 生成全局 seqids 文件...")
-    build_seqids_file(track_rows, logger)
+    logger.info("========== synteny05 — plot karyotype (adjacent + defense) ==========")
+    logger.info(f"PROJECT_ROOT={project}")
+    logger.info(f"OUTPUT_DIR={out_dir}")
+    logger.info(f"CLEAN_OUTPUT={CLEAN_OUTPUT}")
+    logger.info(f"MAX_LINKS_PER_PAIR={MAX_LINKS_PER_PAIR}")
+    logger.info(f"JCVI_PYTHON={JCVI_PYTHON}")
+    logger.info(f"OUT_PDF={OUT_PDF}")
+    logger.info(f"FONT_FAMILY={FONT_FAMILY}")
+    logger.info(f"FIGURE_WIDTH_INCH={FIGURE_WIDTH_INCH}")
+    logger.info(f"FIGURE_HEIGHT_INCH={FIGURE_HEIGHT_INCH}")
+    logger.info("Seqids defense: allow ChrNN / ChrNN- ; forbid ChrNNr")
+    logger.info("Plot defense: force --nocircles (remove white circles and chr numbers)")
 
-    # 3) 构建参考染色体颜色表（复用 02 规则）
-    ref_chr_color_map = collect_ref_chr_and_colors(logger)
+    for p in (step01_dir, step02_dir, step03_dir, step04_dir):
+        if not p.exists():
+            die(logger, f"Missing required dir: {p}")
 
-    # 4) 检测参考基因是否使用 #HEX* 前缀
-    ref_gene_need_prefix = detect_ref_gene_prefix_needed(track_rows, ref_species, logger)
+    layout_tracks_path = step04_dir / "layout_species_tracks.tsv"
+    global_style_path = step03_dir / "global_chr_style.tsv"
+    seqids_species_dir = step03_dir / "seqids_species"
 
-    # 5) 复制 simple 文件（列数>=6 且 score 可转数字才收）
-    copy_simple_files(track_rows, ref_species, logger)
+    tracks = read_layout_tracks(layout_tracks_path)
+    track_species = [d["species_id"] for d in tracks]
+    logger.info("Track order=" + " | ".join(track_species))
 
-    # 6) 生成每个物种的 BED（基因 + 彩色宏观色带）
-    generate_bed_files(track_rows, ref_species, ref_chr_color_map, ref_gene_need_prefix, logger)
+    clean_dir(out_dir, CLEAN_OUTPUT, logger)
+    bed_dir = out_dir / "bed_noheader"
+    simple_dir = out_dir / "simple"
+    layout_dir = out_dir / "layout"
+    fig_dir = out_dir / "figures"
+    summ_dir = out_dir / "summaries"
+    for d in (bed_dir, simple_dir, layout_dir, fig_dir, summ_dir):
+        d.mkdir(parents=True, exist_ok=True)
 
-    # 7) 构建 layout
-    logger.info("Step 3: 生成 layout 文件...")
-    build_layout_file(track_rows, ref_species, logger)
+    global_style = load_global_chr_style(global_style_path)
 
-    # 8) 调用 JCVI 绘图
-    call_jcvi(logger)
+    gene_chr: Dict[str, Dict[str, str]] = {}
+    for sid in track_species:
+        gene_chr[sid] = load_gene_index(step01_dir, sid)
+
+    for sid in track_species:
+        if sid not in global_style:
+            die(logger, f"Missing {sid} in global_chr_style.tsv")
+        prepare_bed_with_color_dups(sid, step01_dir, global_style[sid], bed_dir / f"{sid}.bed", logger)
+
+    link_rows: List[List[str]] = []
+    for i in range(len(track_species) - 1):
+        a = track_species[i]
+        b = track_species[i + 1]
+        pair_id = f"{a}__vs__{b}"
+
+        pair_w = load_pair_chr_weight(step02_dir, pair_id)
+        out_simple = simple_dir / f"{pair_id}.simple"
+
+        anchors_in, cand, drawn, drop_missing, drop_incon = build_simple_for_pair(
+            a=a,
+            b=b,
+            step02_dir=step02_dir,
+            gene_chr_a=gene_chr[a],
+            gene_chr_b=gene_chr[b],
+            style_a=global_style[a],
+            style_b=global_style[b],
+            pair_weight=pair_w,
+            out_simple=out_simple,
+            logger=logger
+        )
+
+        link_rows.append([
+            pair_id,
+            str(anchors_in),
+            str(cand),
+            str(drawn),
+            str(MAX_LINKS_PER_PAIR),
+            str(drop_missing),
+            str(drop_incon),
+        ])
+
+    write_tsv(
+        summ_dir / "step05.links.summary.tsv",
+        ["pair_id", "anchors_in_filtered", "anchors_candidates", "anchors_drawn", "max_links_per_pair", "dropped_missing_endpoints", "dropped_inconsistent_chr"],
+        link_rows
+    )
+
+    seqids_path = layout_dir / "seqids"
+    layout_path = layout_dir / "karyotype.layout"
+
+    try:
+        write_seqids_file(track_species, seqids_species_dir, seqids_path, logger)
+    except Exception as e:
+        die(logger, f"Failed to build seqids file: {e}")
+
+    write_layout_file(tracks, layout_path, bed_dir, simple_dir, logger)
+
+    logger.info(f"Generated seqids: {seqids_path}")
+    logger.info(f"Generated layout: {layout_path}")
+
+    pdf_tmp = run_jcvi_karyotype(seqids_path, layout_path, fig_dir, n_tracks=len(track_species), logger=logger)
+
+    pdf_out = fig_dir / OUT_PDF
+    if pdf_tmp != pdf_out:
+        if pdf_out.exists():
+            pdf_out.unlink()
+        pdf_tmp.rename(pdf_out)
+
+    logger.info(f"Output PDF: {pdf_out}")
+    logger.info(f"Done. runtime_sec={int(time.time() - t0)}")
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except SystemExit:
+        raise
+    except Exception as e:
+        pr = PROJECT_ROOT
+        if pr is None or str(pr).strip() == "":
+            project = Path(__file__).resolve().parents[1]
+        else:
+            project = Path(str(pr)).expanduser().resolve()
+        lg = Logger(project / "logs" / "synteny05_plot_karyotype.log")
+        lg.error("Unhandled exception: " + repr(e))
+        lg.error(traceback.format_exc())
+        raise
 
