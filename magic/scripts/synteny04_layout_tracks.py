@@ -3,33 +3,19 @@
 
 """
 synteny04_layout_tracks.py
-—— Step04：轨道布局 + 横条/标签颜色表（严格按蓝图合同 + 加硬防线）
+—— 朴素模式 Step04：生成 tracks 布局表（y_center 等），不再强做苛刻校验
 
 输入（硬位置）：
 - raw_data/synteny_species_meta.tsv
-- output/synteny_03_order_seqids/seqids_species/<species>.seqids   （用于校验非空 + 合法性）
 
 输出（硬位置）：
 output/synteny_04_layout_tracks/
   layout_species_tracks.tsv
   summaries/step04.summary.tsv
 
-layout_species_tracks.tsv（硬表头）：
-  order_index
-  species_id
-  display_label
-  group
-  y_center
-  track_height
-  chr_bar_color_hex
-  label_color_hex
-
-硬合同要点：
-- 顺序严格按 meta 行顺序（order_index=1..N）
-- display_label：Genus_species_xxx -> "G. species"
-- 参考物种：chr_bar_color_hex 与 label_color_hex = 红
-- 其它物种：chr_bar_color_hex=浅灰，label_color_hex=黑
-- 防线：seqids token 必须是 ChrNN 或 ChrNN-；严禁 ChrNNr；发现即报错退出
+说明：
+- 物种名颜色不管：本表仍保留 label_color_hex 字段，但 Step05 不再把颜色写进 label 前缀
+- chr_bar_color_hex：你可以继续用“参考红、其它灰”
 """
 
 # ============================================================
@@ -41,17 +27,14 @@ CLEAN_OUTPUT = True
 
 REFERENCE_SPECIES_ID = "Sinonovacula_constricta"
 
-# 轨道几何（固定默认写在参数区，允许皇上手动改）
 TRACK_HEIGHT = 0.040
 TRACK_SPACING = 0.018
 
-# 默认颜色（按蓝图）
 REF_RED_HEX = "#E64B35"
-OTHER_BAR_HEX = "#D9D9D9"
+OTHER_BAR_HEX = "#B3B3B3"
 OTHER_LABEL_HEX = "#000000"
 
 META_TSV_REL = "raw_data/synteny_species_meta.tsv"
-STEP03_DIR_REL = "output/synteny_03_order_seqids"
 OUTPUT_DIR_REL = "output/synteny_04_layout_tracks"
 LOG_DIR_REL = "logs"
 
@@ -64,7 +47,6 @@ import gzip
 import time
 import shutil
 import traceback
-import re
 from pathlib import Path
 from typing import List, Tuple, Iterable
 
@@ -155,99 +137,36 @@ def parse_display_label(species_id: str) -> str:
     return f"{genus[0].upper()}. {sp.lower()}"
 
 
-_SEQ_TOKEN_RE = re.compile(r"^Chr\d+(?:-)?$")
-
-
-def validate_seqids_line(sid: str, line: str, logger: Logger) -> None:
-    """
-    防线：seqids 单行逗号分隔；每个 token 必须是 ChrNN 或 ChrNN-
-    严禁 ChrNNr；严禁空 token；严禁重复 base Chr。
-    """
-    raw = (line or "").strip()
-    if not raw:
-        raise ValueError(f"[{sid}] seqids is empty")
-
-    tokens = [t.strip() for t in raw.split(",")]
-    if any(t == "" for t in tokens):
-        raise ValueError(f"[{sid}] seqids contains empty token (check extra commas): {raw}")
-
-    base_seen = set()
-    for t in tokens:
-        if t.endswith("r") or t.endswith("R"):
-            raise ValueError(f"[{sid}] seqids token uses 'r' (FORBIDDEN). Use '-' for flip: {t}")
-
-        if not _SEQ_TOKEN_RE.match(t):
-            raise ValueError(f"[{sid}] illegal seqids token: {t}  (must be ChrNN or ChrNN-)")
-
-        base = t[:-1] if t.endswith("-") else t
-        if base in base_seen:
-            raise ValueError(f"[{sid}] duplicated chromosome in seqids: {base}")
-        base_seen.add(base)
-
-    logger.info(f"[SEQIDS-OK] {sid}: n_tokens={len(tokens)} flip_tokens={sum(1 for x in tokens if x.endswith('-'))}")
-
-
 def main() -> None:
     pr = PROJECT_ROOT
     if pr is None or str(pr).strip() == "":
-        PROJECT = Path(__file__).resolve().parents[1]
+        project = Path(__file__).resolve().parents[1]
     else:
-        PROJECT = Path(str(pr)).expanduser().resolve()
+        project = Path(str(pr)).expanduser().resolve()
 
-    meta_tsv = PROJECT / META_TSV_REL
-    step03_dir = PROJECT / STEP03_DIR_REL
-    out_dir = PROJECT / OUTPUT_DIR_REL
-    log_dir = PROJECT / LOG_DIR_REL
+    meta_tsv = project / META_TSV_REL
+    out_dir = project / OUTPUT_DIR_REL
+    log_dir = project / LOG_DIR_REL
 
     logger = Logger(log_dir / "synteny04_layout_tracks.log")
     t0 = time.time()
 
-    logger.info("========== synteny04 — layout tracks + bar/label colors ==========")
-    logger.info(f"PROJECT_ROOT={PROJECT}")
-    logger.info(f"OUTPUT_DIR={out_dir}")
+    logger.info("========== synteny04 — plain layout ==========")
+    logger.info(f"PROJECT_ROOT={project}")
     logger.info(f"CLEAN_OUTPUT={CLEAN_OUTPUT}")
     logger.info(f"REFERENCE_SPECIES_ID={REFERENCE_SPECIES_ID}")
-    logger.info(f"TRACK_HEIGHT={TRACK_HEIGHT}")
-    logger.info(f"TRACK_SPACING={TRACK_SPACING}")
-    logger.info(f"REF_RED_HEX={REF_RED_HEX}")
-    logger.info(f"OTHER_BAR_HEX={OTHER_BAR_HEX}")
-    logger.info(f"OTHER_LABEL_HEX={OTHER_LABEL_HEX}")
-    logger.info(f"META={meta_tsv}")
-    logger.info(f"STEP03_DIR={step03_dir}")
-    logger.info("Seqids defense: allow ChrNN / ChrNN- ; forbid ChrNNr")
 
     if not meta_tsv.exists():
         die(logger, f"Missing meta: {meta_tsv}")
-    if not step03_dir.exists():
-        die(logger, f"Missing step03 dir: {step03_dir}")
 
     meta_rows = read_meta(meta_tsv)
-    species = [sid for sid, grp in meta_rows]
+    species = [sid for sid, _ in meta_rows]
     logger.info("META species order=" + " | ".join(species))
-
-    if REFERENCE_SPECIES_ID not in species:
-        die(logger, f"REFERENCE_SPECIES_ID not in meta: {REFERENCE_SPECIES_ID}")
-
-    # 校验 Step03 seqids 存在、非空、合法（硬防线）
-    seqids_dir = step03_dir / "seqids_species"
-    if not seqids_dir.exists():
-        die(logger, f"Missing step03 seqids_species dir: {seqids_dir}")
-
-    for sid in species:
-        p = seqids_dir / f"{sid}.seqids"
-        if not p.exists():
-            die(logger, f"Missing seqids for {sid}: {p}")
-        txt = p.read_text(encoding="utf-8", errors="replace")
-        try:
-            validate_seqids_line(sid, txt, logger)
-        except Exception as e:
-            die(logger, f"Seqids validation failed: {e}")
 
     clean_dir(out_dir, CLEAN_OUTPUT, logger)
     d_sum = out_dir / "summaries"
     d_sum.mkdir(parents=True, exist_ok=True)
 
-    # y_center 从上到下递减，范围大致落在 (0,1)
     N = len(species)
     top_margin = 0.95
     step = TRACK_HEIGHT + TRACK_SPACING
@@ -278,18 +197,13 @@ def main() -> None:
         ])
         sum_rows.append([sid, str(i), display_label])
 
-    layout_path = out_dir / "layout_species_tracks.tsv"
     write_tsv(
-        layout_path,
+        out_dir / "layout_species_tracks.tsv",
         ["order_index", "species_id", "display_label", "group", "y_center", "track_height", "chr_bar_color_hex", "label_color_hex"],
         layout_rows
     )
+    write_tsv(d_sum / "step04.summary.tsv", ["species_id", "order_index", "display_label"], sum_rows)
 
-    sum_path = d_sum / "step04.summary.tsv"
-    write_tsv(sum_path, ["species_id", "order_index", "display_label"], sum_rows)
-
-    logger.info(f"Layout: {layout_path}")
-    logger.info(f"Summary: {sum_path}")
     logger.info(f"Done. runtime_sec={int(time.time()-t0)}")
 
 
@@ -301,10 +215,10 @@ if __name__ == "__main__":
     except Exception as e:
         pr = PROJECT_ROOT
         if pr is None or str(pr).strip() == "":
-            PROJECT = Path(__file__).resolve().parents[1]
+            project = Path(__file__).resolve().parents[1]
         else:
-            PROJECT = Path(str(pr)).expanduser().resolve()
-        lg = Logger(PROJECT / LOG_DIR_REL / "synteny04_layout_tracks.log")
+            project = Path(str(pr)).expanduser().resolve()
+        lg = Logger(project / LOG_DIR_REL / "synteny04_layout_tracks.log")
         lg.error("Unhandled exception: " + repr(e))
         lg.error(traceback.format_exc())
         raise

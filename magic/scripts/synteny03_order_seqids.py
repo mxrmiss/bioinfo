@@ -3,34 +3,24 @@
 
 """
 synteny03_order_seqids.py
-—— Step03：颜色链式继承 + chr 排序/翻转 + seqids 生成（严格按蓝图合同）
+—— Step03：基于 S. constricta 的 dominant-ref 调序 + chr 级 flip（仅读 Step02 anchors.simple，不改 Step02 输出）
 
 输入（硬位置）：
 - raw_data/synteny_species_meta.tsv
-- raw_data/palette.tsv                           (rank, color_hex)
-- output/synteny_00_chr_rename/chr_rename_<sp>.tsv
-- output/synteny_02_blocks_macro/pair_chr_weight/<A>__vs__<B>.chr_weight.tsv
-- output/synteny_02_blocks_macro/blocks_merged/<A>__vs__<B>.blocks.merged.tsv
+- output/synteny_01_mcscan_catalog/<species>.geneorder.bed
+- output/synteny_02_blocks_macro/raw_anchors/<A>__vs__<B>.anchors.simple
 
 输出（硬位置）：
 output/synteny_03_order_seqids/
-  global_chr_style.tsv
-  seqids_species/<species>.seqids                (jcvi 使用：单行逗号分隔；ChrXX- 表示翻转)
-  chr_order/<species>.chr_order.tsv              (便于检查；global 的子集视图)
-  chr_colors/<species>.chr_colors.tsv            (便于检查)
+  seqids_species/<species>.seqids
+  chr2ref/chr2ref.tsv
+  chr2ref/chr_flip.tsv
   summaries/step03.summary.tsv
-  summaries/palette.tsv                          (落盘备查)
 
-硬合同要点：
-- 颜色链式继承：从 meta 的第一个物种 s1 开始，向后传播到 sN（不以 reference 为锚点）
-- dominant mapping：对 pair (Si-1,Si)，对每个 Si_chr 取 total_span_bp 最大的 prev_chr
-- orientation：对每个 Si_chr，用 blocks_merged 中涉及该 chr 的所有块做投票，权重 = span_bp
-  （固定实现：对 i>1 的物种 Si，仅使用 pair (Si-1,Si) 的 blocks_merged 来给 Si 投票，符合“相邻链式”）
-- chr 排序键（写死）：
-  1) color_id（1..K 在前，0 在后）
-  2) dominant_prev_chr 在上一物种的 order_index（小的在前）
-  3) Step00 的 rank（小的在前）
-- 翻转编码（蓝图硬规则）：ChrNN- 表示翻转；严禁 ChrNNr
+核心策略：
+- 以 REFERENCE_SPECIES_ID（默认 Sinonovacula_constricta）作为全图唯一参考色带坐标系
+- dominant ref：每条 chr 只映射到一个 ref_chr（票数最多）
+- flip：chr 级别，沿链传播（异或），不设“最小连线数门槛”
 """
 
 # ============================================================
@@ -40,27 +30,32 @@ output/synteny_03_order_seqids/
 PROJECT_ROOT = None
 CLEAN_OUTPUT = True
 
+REFERENCE_SPECIES_ID = "Sinonovacula_constricta"
+
 META_TSV_REL = "raw_data/synteny_species_meta.tsv"
-PALETTE_TSV_REL = "raw_data/palette.tsv"
-
-STEP00_DIR_REL = "output/synteny_00_chr_rename"
+STEP01_DIR_REL = "output/synteny_01_mcscan_catalog"
 STEP02_DIR_REL = "output/synteny_02_blocks_macro"
-
 OUTPUT_DIR_REL = "output/synteny_03_order_seqids"
 LOG_DIR_REL = "logs"
+
+# flip 判向最小支持点数：<3 时默认视为同向（不翻）
+MIN_POINTS_FOR_ORIENTATION = 3
 
 # ============================================================
 # 实现区（皇上勿改）
 # ============================================================
 
-import re
 import csv
-import gzip
 import time
 import shutil
 import traceback
+import gzip
+import re
 from pathlib import Path
-from typing import Dict, List, Tuple, Iterable
+from typing import Dict, List, Tuple, Iterable, Optional
+
+
+_CHR_NUM_RE = re.compile(r"^Chr0*([0-9]+)$")
 
 
 def now_ts() -> str:
@@ -137,64 +132,171 @@ def read_meta(meta_tsv: Path) -> List[str]:
     return species
 
 
-def safe_int(x: str, default: int = 0) -> int:
-    try:
-        return int(x)
-    except Exception:
-        return default
+def chr_num(chr_name: str) -> int:
+    m = _CHR_NUM_RE.match(chr_name)
+    if m:
+        try:
+            return int(m.group(1))
+        except Exception:
+            return 10**9
+    return 10**9
 
 
-def load_palette(palette_tsv: Path) -> List[str]:
+def normalize_gene_id(raw: str) -> str:
+    x = (raw or "").strip().strip('"').strip("'").strip()
+    if not x:
+        return ""
+    if "*" in x and x.startswith("#") and len(x) >= 8:
+        # 兼容 #RRGGBB*gene
+        try:
+            x = x.split("*", 1)[1]
+        except Exception:
+            pass
+    if "|" in x:
+        x = x.split("|")[-1]
+    if x.startswith("rna-"):
+        x = x[4:]
+    return x.strip()
+
+
+def median(values: List[int]) -> Optional[float]:
+    if not values:
+        return None
+    s = sorted(values)
+    n = len(s)
+    mid = n // 2
+    if n % 2 == 1:
+        return float(s[mid])
+    return (float(s[mid - 1]) + float(s[mid])) / 2.0
+
+
+def corr_sign(pairs: List[Tuple[int, int]]) -> int:
     """
-    raw_data/palette.tsv
-    header: rank, color_hex
-    返回：按 rank 升序的 color_hex 列表（K = len）
+    最小化方向判定：看协方差符号
+    返回：+1（同向） 或 -1（反向）
     """
-    if not palette_tsv.exists():
-        raise FileNotFoundError(f"Missing palette: {palette_tsv}")
-    rows: List[Tuple[int, str]] = []
-    with open_text_auto(palette_tsv) as fr:
-        header = fr.readline().rstrip("\n").split("\t")
-        if header != ["rank", "color_hex"]:
-            raise ValueError(f"palette header must be: rank<TAB>color_hex, got: {header}")
-        for ln, line in enumerate(fr, start=2):
+    if len(pairs) < MIN_POINTS_FOR_ORIENTATION:
+        return +1
+    xs = [p[0] for p in pairs]
+    ys = [p[1] for p in pairs]
+    n = len(xs)
+    mx = sum(xs) / float(n)
+    my = sum(ys) / float(n)
+    cov = 0.0
+    vx = 0.0
+    vy = 0.0
+    for x, y in zip(xs, ys):
+        dx = x - mx
+        dy = y - my
+        cov += dx * dy
+        vx += dx * dx
+        vy += dy * dy
+    if vx <= 0.0 or vy <= 0.0:
+        return +1
+    return +1 if cov >= 0.0 else -1
+
+
+def load_geneorder_bed(bed_path: Path) -> Tuple[Dict[str, str], Dict[str, int], List[str]]:
+    """
+    返回：
+      gene2chr: gene -> ChrNN
+      gene2pos: gene -> midpoint (int)
+      chrs:     unique chrs sorted by Chr number
+    """
+    if not bed_path.exists():
+        raise FileNotFoundError(f"Missing geneorder bed: {bed_path}")
+    gene2chr: Dict[str, str] = {}
+    gene2pos: Dict[str, int] = {}
+    chr_set = set()
+
+    with bed_path.open("r", encoding="utf-8", errors="replace") as fr:
+        for line in fr:
             line = line.rstrip("\n")
             if not line:
                 continue
             parts = line.split("\t")
-            if len(parts) != 2:
-                raise ValueError(f"palette line {ln} must have 2 columns: {line}")
-            rk = safe_int(parts[0], 0)
-            hx = parts[1].strip()
-            if rk <= 0 or not hx:
+            if len(parts) < 4:
                 continue
-            rows.append((rk, hx))
-    rows.sort(key=lambda x: x[0])
-    pal = [hx for _, hx in rows]
-    if len(pal) < 6:
-        raise ValueError(f"palette must contain >=6 colors, got {len(pal)}")
-    return pal
+            chr_, s, e, gid = parts[:4]
+            gid = normalize_gene_id(gid)
+            if not gid:
+                continue
+            try:
+                ss = int(float(s))
+                ee = int(float(e))
+            except Exception:
+                continue
+            mid = (ss + ee) // 2
+            gene2chr[gid] = chr_
+            gene2pos[gid] = mid
+            chr_set.add(chr_)
+
+    chrs = sorted(list(chr_set), key=lambda c: (chr_num(c), c))
+    if not chrs:
+        raise ValueError(f"No chromosomes extracted from: {bed_path}")
+    if not gene2chr:
+        raise ValueError(f"No genes parsed from: {bed_path}")
+    return gene2chr, gene2pos, chrs
 
 
-def load_chr_list_and_rank(step00_dir: Path, sid: str) -> Tuple[List[str], Dict[str, int]]:
+class PairInfo:
     """
-    Step00 chr_rename_<sid>.tsv
-    header:
-      species_id seqid_raw seqid_renamed rank length_bp is_chromosome
-    返回：
-      chr_list：按 rank 升序的 ChrNN 列表（仅 is_chromosome==yes）
-      rank_map：ChrNN -> rank
+    存储相邻 pair 的 chr 票数与方向证据：
+      votes[(chrA, chrB)] = count
+      pospairs[(chrA, chrB)] = list of (posA, posB)
+    并提供：
+      bestA2B[chrA] = (chrB, support)
+      bestB2A[chrB] = (chrA, support)
+      sign[(chrA, chrB)] = +1/-1
+      medA[(chrA, chrB)] = median posA
+      medB[(chrA, chrB)] = median posB
     """
-    p = step00_dir / f"chr_rename_{sid}.tsv"
-    if not p.exists():
-        raise FileNotFoundError(f"Missing step00 file: {p}")
-    rows: List[Tuple[int, str]] = []
-    rank_map: Dict[str, int] = {}
-    with open_text_auto(p) as fr:
-        header = fr.readline().rstrip("\n").split("\t")
-        need = ["species_id", "seqid_raw", "seqid_renamed", "rank", "length_bp", "is_chromosome"]
-        if header != need:
-            raise ValueError(f"Bad header in {p.name}: {header}")
+    def __init__(self):
+        self.votes: Dict[Tuple[str, str], int] = {}
+        self.pospairs: Dict[Tuple[str, str], List[Tuple[int, int]]] = {}
+        self.bestA2B: Dict[str, Tuple[str, int]] = {}
+        self.bestB2A: Dict[str, Tuple[str, int]] = {}
+        self.sign: Dict[Tuple[str, str], int] = {}
+        self.medA: Dict[Tuple[str, str], Optional[float]] = {}
+        self.medB: Dict[Tuple[str, str], Optional[float]] = {}
+
+    def finalize(self) -> None:
+        # bestA2B
+        tmpA: Dict[str, List[Tuple[str, int]]] = {}
+        tmpB: Dict[str, List[Tuple[str, int]]] = {}
+        for (ca, cb), v in self.votes.items():
+            tmpA.setdefault(ca, []).append((cb, v))
+            tmpB.setdefault(cb, []).append((ca, v))
+        for ca, lst in tmpA.items():
+            lst.sort(key=lambda x: (-x[1], chr_num(x[0]), x[0]))
+            self.bestA2B[ca] = lst[0]
+        for cb, lst in tmpB.items():
+            lst.sort(key=lambda x: (-x[1], chr_num(x[0]), x[0]))
+            self.bestB2A[cb] = lst[0]
+
+        # sign + median positions
+        for (ca, cb), pairs in self.pospairs.items():
+            self.sign[(ca, cb)] = corr_sign(pairs)
+            xs = [p[0] for p in pairs]
+            ys = [p[1] for p in pairs]
+            self.medA[(ca, cb)] = median(xs)
+            self.medB[(ca, cb)] = median(ys)
+
+
+def load_pair_info(
+    a: str,
+    b: str,
+    anchors_simple: Path,
+    gene2chr_a: Dict[str, str],
+    gene2pos_a: Dict[str, int],
+    gene2chr_b: Dict[str, str],
+    gene2pos_b: Dict[str, int],
+) -> PairInfo:
+    pi = PairInfo()
+    if not anchors_simple.exists():
+        raise FileNotFoundError(f"Missing anchors.simple: {anchors_simple}")
+
+    with open_text_auto(anchors_simple) as fr:
         for line in fr:
             line = line.rstrip("\n")
             if not line:
@@ -202,324 +304,220 @@ def load_chr_list_and_rank(step00_dir: Path, sid: str) -> Tuple[List[str], Dict[
             parts = line.split("\t")
             if len(parts) != 6:
                 continue
-            if parts[5] != "yes":
-                continue
-            rk = safe_int(parts[3], 0)
-            chr_ = parts[2]
-            if rk > 0 and chr_ != "NA":
-                rows.append((rk, chr_))
-                rank_map[chr_] = rk
-    rows.sort(key=lambda x: x[0])
-    chr_list = [c for _, c in rows]
-    if not chr_list:
-        raise ValueError(f"No chromosomes found in {p.name}")
-    return chr_list, rank_map
+            a1, a2, b1, b2, _n, _o = parts
+            a1 = normalize_gene_id(a1)
+            a2 = normalize_gene_id(a2)
+            b1 = normalize_gene_id(b1)
+            b2 = normalize_gene_id(b2)
 
+            # 两个锚点对 (a1,b1) 与 (a2,b2) 都计票
+            for ga, gb in ((a1, b1), (a2, b2)):
+                if ga not in gene2chr_a or gb not in gene2chr_b:
+                    continue
+                ca = gene2chr_a[ga]
+                cb = gene2chr_b[gb]
+                pi.votes[(ca, cb)] = pi.votes.get((ca, cb), 0) + 1
+                if ga in gene2pos_a and gb in gene2pos_b:
+                    pa = gene2pos_a[ga]
+                    pb = gene2pos_b[gb]
+                    pi.pospairs.setdefault((ca, cb), []).append((pa, pb))
 
-def load_pair_chr_weight(step02_dir: Path, pair_id: str) -> List[Tuple[str, str, int]]:
-    """
-    pair_chr_weight/<pair>.chr_weight.tsv
-    header: pair_id a_chr b_chr total_span_bp n_blocks
-    返回：(a_chr, b_chr, total_span_bp)
-    """
-    p = step02_dir / "pair_chr_weight" / f"{pair_id}.chr_weight.tsv"
-    if not p.exists():
-        raise FileNotFoundError(f"Missing chr_weight: {p}")
-    out: List[Tuple[str, str, int]] = []
-    with open_text_auto(p) as fr:
-        header = fr.readline().rstrip("\n").split("\t")
-        need = ["pair_id", "a_chr", "b_chr", "total_span_bp", "n_blocks"]
-        if header != need:
-            raise ValueError(f"Bad header in {p.name}: {header}")
-        for line in fr:
-            line = line.rstrip("\n")
-            if not line:
-                continue
-            parts = line.split("\t")
-            if len(parts) != 5:
-                continue
-            a_chr, b_chr = parts[1], parts[2]
-            tot = safe_int(parts[3], 0)
-            out.append((a_chr, b_chr, tot))
-    return out
-
-
-def build_dominant_prev_map(weight_rows: List[Tuple[str, str, int]]) -> Tuple[Dict[str, str], Dict[str, int]]:
-    """
-    对每个 b_chr：选择 total_span_bp 最大的 a_chr 作为 dominant_prev_chr
-    返回：
-      dom_prev: b_chr -> a_chr
-      dom_w:    b_chr -> total_span_bp
-    """
-    best: Dict[str, Tuple[int, str]] = {}
-    for a_chr, b_chr, tot in weight_rows:
-        if b_chr not in best or tot > best[b_chr][0]:
-            best[b_chr] = (tot, a_chr)
-    dom_prev = {b: a for b, (tot, a) in best.items()}
-    dom_w = {b: tot for b, (tot, a) in best.items()}
-    return dom_prev, dom_w
-
-
-def load_blocks_for_pair(step02_dir: Path, pair_id: str) -> List[Tuple[str, str, str, int, int, str, int]]:
-    """
-    blocks_merged/<pair>.blocks.merged.tsv
-    header:
-      pair_id a_species b_species a_chr a_start a_end b_chr b_start b_end orientation block_id n_anchors span_bp
-    返回（仅保留需要字段）：
-      (a_chr, b_chr, orientation, a_start, a_end, b_chr(占位), span_bp)
-    """
-    p = step02_dir / "blocks_merged" / f"{pair_id}.blocks.merged.tsv"
-    if not p.exists():
-        raise FileNotFoundError(f"Missing blocks_merged: {p}")
-    out: List[Tuple[str, str, str, int, int, str, int]] = []
-    with open_text_auto(p) as fr:
-        header = fr.readline().rstrip("\n").split("\t")
-        need = [
-            "pair_id", "a_species", "b_species",
-            "a_chr", "a_start", "a_end",
-            "b_chr", "b_start", "b_end",
-            "orientation", "block_id", "n_anchors", "span_bp",
-        ]
-        if header != need:
-            raise ValueError(f"Bad header in {p.name}: {header}")
-        for line in fr:
-            line = line.rstrip("\n")
-            if not line:
-                continue
-            parts = line.split("\t")
-            if len(parts) != 13:
-                continue
-            a_chr = parts[3]
-            b_chr = parts[6]
-            orient = parts[9].strip()
-            a_start = safe_int(parts[4], 0)
-            a_end = safe_int(parts[5], 0)
-            span_bp = safe_int(parts[12], 0)
-            out.append((a_chr, b_chr, orient, a_start, a_end, b_chr, span_bp))
-    return out
-
-
-def orientation_vote_for_bchr(blocks: List[Tuple[str, str, str, int, int, str, int]]) -> Dict[str, str]:
-    """
-    对 b_chr 做投票：权重 = span_bp
-    若 plus >= minus 则 '+', 否则 '-'
-    """
-    acc: Dict[str, List[int]] = {}  # b_chr -> [plus_w, minus_w]
-    for a_chr, b_chr, orient, a_s, a_e, _b_chr2, span_bp in blocks:
-        if b_chr not in acc:
-            acc[b_chr] = [0, 0]
-        w = max(span_bp, 1)
-        if orient == "-":
-            acc[b_chr][1] += w
-        else:
-            acc[b_chr][0] += w
-    out: Dict[str, str] = {}
-    for b_chr, (pw, mw) in acc.items():
-        out[b_chr] = "+" if pw >= mw else "-"
-    return out
+    pi.finalize()
+    return pi
 
 
 def main() -> None:
     pr = PROJECT_ROOT
     if pr is None or str(pr).strip() == "":
-        PROJECT = Path(__file__).resolve().parents[1]
+        project = Path(__file__).resolve().parents[1]
     else:
-        PROJECT = Path(str(pr)).expanduser().resolve()
+        project = Path(str(pr)).expanduser().resolve()
 
-    meta_tsv = PROJECT / META_TSV_REL
-    palette_tsv = PROJECT / PALETTE_TSV_REL
-    step00_dir = PROJECT / STEP00_DIR_REL
-    step02_dir = PROJECT / STEP02_DIR_REL
-    out_dir = PROJECT / OUTPUT_DIR_REL
-    log_dir = PROJECT / LOG_DIR_REL
+    meta_tsv = project / META_TSV_REL
+    step01_dir = project / STEP01_DIR_REL
+    step02_dir = project / STEP02_DIR_REL
+    out_dir = project / OUTPUT_DIR_REL
+    log_dir = project / LOG_DIR_REL
 
     logger = Logger(log_dir / "synteny03_order_seqids.log")
     t0 = time.time()
 
-    logger.info("========== synteny03 — chain colors + order + orientation ==========")
-    logger.info(f"PROJECT_ROOT={PROJECT}")
-    logger.info(f"OUTPUT_DIR={out_dir}")
+    logger.info("========== synteny03 — dominant-ref ordering + chr flip (read Step02 only) ==========")
+    logger.info(f"PROJECT_ROOT={project}")
     logger.info(f"CLEAN_OUTPUT={CLEAN_OUTPUT}")
-    logger.info(f"META={meta_tsv}")
-    logger.info(f"PALETTE={palette_tsv}")
-    logger.info(f"STEP00_DIR={step00_dir}")
-    logger.info(f"STEP02_DIR={step02_dir}")
-    logger.info("Flip encoding: ChrNN- (strict); forbid ChrNNr")
+    logger.info(f"REFERENCE_SPECIES_ID={REFERENCE_SPECIES_ID}")
+    logger.info(f"MIN_POINTS_FOR_ORIENTATION={MIN_POINTS_FOR_ORIENTATION}")
 
     if not meta_tsv.exists():
         die(logger, f"Missing meta: {meta_tsv}")
-    if not palette_tsv.exists():
-        die(logger, f"Missing palette: {palette_tsv}")
-    if not step00_dir.exists():
-        die(logger, f"Missing step00 dir: {step00_dir}")
+    if not step01_dir.exists():
+        die(logger, f"Missing step01 dir: {step01_dir}")
     if not step02_dir.exists():
         die(logger, f"Missing step02 dir: {step02_dir}")
 
     species = read_meta(meta_tsv)
+    if REFERENCE_SPECIES_ID not in species:
+        die(logger, f"REFERENCE_SPECIES_ID not found in meta order: {REFERENCE_SPECIES_ID}")
+    ref_idx = species.index(REFERENCE_SPECIES_ID)
     logger.info("META species order=" + " | ".join(species))
-    if len(species) < 2:
-        die(logger, "meta must contain at least 2 species")
+    logger.info(f"Reference index={ref_idx+1}/{len(species)}")
 
-    palette_hex = load_palette(palette_tsv)
-    K = len(palette_hex)
-    logger.info(f"PALETTE_N={K} (K=palette rows)")
+    # 读 Step01 geneorder，建立每个物种的 gene->chr/pos + chr list
+    gene2chr: Dict[str, Dict[str, str]] = {}
+    gene2pos: Dict[str, Dict[str, int]] = {}
+    chrs: Dict[str, List[str]] = {}
+    for sid in species:
+        bed = step01_dir / f"{sid}.geneorder.bed"
+        g2c, g2p, clist = load_geneorder_bed(bed)
+        gene2chr[sid] = g2c
+        gene2pos[sid] = g2p
+        chrs[sid] = clist
+        logger.info(f"[BED] {sid}: n_chr={len(clist)} n_gene={len(g2c)}")
+
+    # 读 Step02 的相邻 anchors.simple，缓存每条边的 PairInfo
+    raw_anchors = step02_dir / "raw_anchors"
+    if not raw_anchors.exists():
+        die(logger, f"Missing step02 raw_anchors dir: {raw_anchors}")
+
+    pairinfo: Dict[Tuple[str, str], PairInfo] = {}
+    for i in range(len(species) - 1):
+        a = species[i]
+        b = species[i + 1]
+        p = raw_anchors / f"{a}__vs__{b}.anchors.simple"
+        pi = load_pair_info(
+            a, b, p,
+            gene2chr[a], gene2pos[a],
+            gene2chr[b], gene2pos[b],
+        )
+        pairinfo[(a, b)] = pi
+        logger.info(f"[PAIR] {a}__vs__{b}: n_chr_pairs={len(pi.votes)}")
 
     clean_dir(out_dir, CLEAN_OUTPUT, logger)
-    d_seqids = out_dir / "seqids_species"
-    d_chr_order = out_dir / "chr_order"
-    d_chr_colors = out_dir / "chr_colors"
+    d_seq = out_dir / "seqids_species"
+    d_map = out_dir / "chr2ref"
     d_sum = out_dir / "summaries"
-    for d in (d_seqids, d_chr_order, d_chr_colors, d_sum):
+    for d in (d_seq, d_map, d_sum):
         d.mkdir(parents=True, exist_ok=True)
 
-    # palette 落盘备查（严格两列：rank,color_hex）
-    write_tsv(d_sum / "palette.tsv", ["rank", "color_hex"], [[str(i + 1), palette_hex[i]] for i in range(K)])
+    # 结果容器
+    chr_ref: Dict[str, Dict[str, str]] = {sid: {} for sid in species}
+    chr_flip: Dict[str, Dict[str, int]] = {sid: {} for sid in species}
+    chr_proj: Dict[str, Dict[str, Optional[float]]] = {sid: {} for sid in species}
+    chr_support: Dict[str, Dict[str, int]] = {sid: {} for sid in species}
 
-    # Step00：chr 列表与 rank_map
-    chr_list: Dict[str, List[str]] = {}
-    chr_rank_map: Dict[str, Dict[str, int]] = {}
+    # 初始化参考物种
+    ref = REFERENCE_SPECIES_ID
+    for c in chrs[ref]:
+        chr_ref[ref][c] = c
+        chr_flip[ref][c] = 0
+        chr_proj[ref][c] = float(chr_num(c))
+        chr_support[ref][c] = 0
+
+    # 向左传播（更靠左的物种通过右邻（更靠近 ref）继承 ref_chr 与 flip）
+    for idx in range(ref_idx - 1, -1, -1):
+        cur = species[idx]
+        nei = species[idx + 1]  # 更靠近 ref
+        pi = pairinfo[(cur, nei)]  # 文件是 cur__vs__nei (A=cur,B=nei)
+
+        for ccur in chrs[cur]:
+            # dominant mapping：cur chr -> neighbor chr
+            if ccur in pi.bestA2B:
+                cnei, sup = pi.bestA2B[ccur]
+            else:
+                cnei, sup = ("", 0)
+
+            if cnei and cnei in chr_ref[nei] and chr_ref[nei][cnei] != "NA":
+                chr_ref[cur][ccur] = chr_ref[nei][cnei]
+            else:
+                chr_ref[cur][ccur] = "NA"
+
+            chr_support[cur][ccur] = sup
+
+            # projected position：用 neighbor 坐标（B 侧）中位数做组内排序依据
+            proj = None
+            if cnei:
+                proj = pi.medB.get((ccur, cnei), None)
+            chr_proj[cur][ccur] = proj
+
+            # flip 传播：flip_cur = flip_nei XOR (sign==-1)
+            flip_nei = chr_flip[nei].get(cnei, 0) if cnei else 0
+            sgn = pi.sign.get((ccur, cnei), +1) if cnei else +1
+            chr_flip[cur][ccur] = flip_nei ^ (1 if sgn == -1 else 0)
+
+        logger.info(f"[PROP-L] {cur} <= {nei}: mapped={sum(1 for c in chrs[cur] if chr_ref[cur].get(c,'NA')!='NA')}")
+
+    # 向右传播（更靠右的物种通过左邻（更靠近 ref）继承）
+    for idx in range(ref_idx + 1, len(species)):
+        cur = species[idx]
+        nei = species[idx - 1]  # 更靠近 ref
+        pi = pairinfo[(nei, cur)]  # 文件是 nei__vs__cur (A=nei,B=cur)
+
+        for ccur in chrs[cur]:
+            # dominant mapping：cur chr (B) -> neighbor chr (A)
+            if ccur in pi.bestB2A:
+                cnei, sup = pi.bestB2A[ccur]
+            else:
+                cnei, sup = ("", 0)
+
+            if cnei and cnei in chr_ref[nei] and chr_ref[nei][cnei] != "NA":
+                chr_ref[cur][ccur] = chr_ref[nei][cnei]
+            else:
+                chr_ref[cur][ccur] = "NA"
+
+            chr_support[cur][ccur] = sup
+
+            # projected position：用 neighbor 坐标（A 侧）中位数做组内排序依据
+            proj = None
+            if cnei:
+                proj = pi.medA.get((cnei, ccur), None)
+            chr_proj[cur][ccur] = proj
+
+            flip_nei = chr_flip[nei].get(cnei, 0) if cnei else 0
+            sgn = pi.sign.get((cnei, ccur), +1) if cnei else +1
+            chr_flip[cur][ccur] = flip_nei ^ (1 if sgn == -1 else 0)
+
+        logger.info(f"[PROP-R] {cur} <= {nei}: mapped={sum(1 for c in chrs[cur] if chr_ref[cur].get(c,'NA')!='NA')}")
+
+    # 写 seqids：按 (ref_chr_rank, projected_pos, chr_num) 排序
+    def ref_rank(ref_chr: str) -> int:
+        return chr_num(ref_chr) if ref_chr and ref_chr != "NA" else 10**9
+
     for sid in species:
-        cl, rm = load_chr_list_and_rank(step00_dir, sid)
-        chr_list[sid] = cl
-        chr_rank_map[sid] = rm
-        logger.info(f"[{sid}] n_chr={len(cl)}")
+        def keyfunc(c: str) -> Tuple[int, float, int, str]:
+            rr = ref_rank(chr_ref[sid].get(c, "NA"))
+            pj = chr_proj[sid].get(c, None)
+            pjv = float(pj) if pj is not None else 1e18
+            cn = chr_num(c)
+            return (rr, pjv, cn, c)
 
-    # 全局容器
-    ordered: Dict[str, List[str]] = {}
-    orient: Dict[str, Dict[str, str]] = {}
-    dom_prev: Dict[str, Dict[str, str]] = {}
-    dom_w: Dict[str, Dict[str, int]] = {}
-    color_id: Dict[str, Dict[str, int]] = {}
+        ordered = sorted(chrs[sid], key=keyfunc)
+        (d_seq / f"{sid}.seqids").write_text(",".join(ordered) + "\n", encoding="utf-8")
+        logger.info(f"[SEQIDS] {sid}: n_chr={len(ordered)} mapped_ref={sum(1 for c in ordered if chr_ref[sid].get(c,'NA')!='NA')} flips={sum(chr_flip[sid].get(c,0) for c in ordered)}")
 
-    # s1 初始化：按 Step00 rank 顺序
-    s1 = species[0]
-    ordered[s1] = list(chr_list[s1])
-    orient[s1] = {c: "+" for c in ordered[s1]}
-    dom_prev[s1] = {c: "NA" for c in ordered[s1]}
-    dom_w[s1] = {c: 0 for c in ordered[s1]}
+    # 写 chr2ref + chr_flip
+    chr2ref_rows: List[List[str]] = []
+    flip_rows: List[List[str]] = []
+    for sid in species:
+        # 保持输出顺序与 seqids 一致
+        ordered = (d_seq / f"{sid}.seqids").read_text(encoding="utf-8").strip().split(",")
+        for c in ordered:
+            chr2ref_rows.append([sid, c, chr_ref[sid].get(c, "NA"), str(chr_support[sid].get(c, 0))])
+            flip_rows.append([sid, c, str(chr_flip[sid].get(c, 0)), str(chr_support[sid].get(c, 0))])
 
-    cid1: Dict[str, int] = {}
-    for i, c in enumerate(ordered[s1], start=1):
-        cid1[c] = i if i <= K else 0
-    color_id[s1] = cid1
+    write_tsv(d_map / "chr2ref.tsv", ["species_id", "chr", "ref_chr", "support"], chr2ref_rows)
+    write_tsv(d_map / "chr_flip.tsv", ["species_id", "chr", "flip", "support"], flip_rows)
 
-    def order_index_map(sid: str) -> Dict[str, int]:
-        return {c: i for i, c in enumerate(ordered[sid], start=1)}
-
-    # 向后链式传播：s2..sN
-    for i in range(1, len(species)):
-        prev = species[i - 1]
-        cur = species[i]
-        pair_id = f"{prev}__vs__{cur}"
-
-        wrows = load_pair_chr_weight(step02_dir, pair_id)
-        cur2prev, cur2w = build_dominant_prev_map(wrows)
-
-        blocks = load_blocks_for_pair(step02_dir, pair_id)
-        cur_orient_vote = orientation_vote_for_bchr(blocks)
-
-        prev_order = order_index_map(prev)
-
-        cur_dom_prev: Dict[str, str] = {}
-        cur_dom_w: Dict[str, int] = {}
-        cur_cid: Dict[str, int] = {}
-        cur_ori: Dict[str, str] = {}
-
-        for c in chr_list[cur]:
-            dp = cur2prev.get(c, "NA")
-            cur_dom_prev[c] = dp
-            cur_dom_w[c] = cur2w.get(c, 0)
-
-            if dp != "NA":
-                cur_cid[c] = color_id[prev].get(dp, 0)
-            else:
-                cur_cid[c] = 0
-
-            cur_ori[c] = cur_orient_vote.get(c, "+")  # 没证据则 '+'
-
-        def sort_key(chr_c: str):
-            cid = cur_cid.get(chr_c, 0)
-            dp = cur_dom_prev.get(chr_c, "NA")
-            oi = prev_order.get(dp, 10**9)
-            rk = chr_rank_map[cur].get(chr_c, 10**9)
-            return (999 if cid == 0 else cid, oi, rk, chr_c)
-
-        ordered[cur] = sorted(chr_list[cur], key=sort_key)
-        orient[cur] = cur_ori
-        dom_prev[cur] = cur_dom_prev
-        dom_w[cur] = cur_dom_w
-        color_id[cur] = cur_cid
-
-        mapped_n = sum(1 for x in cur_dom_prev.values() if x != "NA")
-        colored_n = sum(1 for x in cur_cid.values() if x > 0)
-        flipped_n = sum(1 for x in cur_ori.values() if x == "-")
-        logger.info(f"[prop] {prev} -> {cur}: mapped={mapped_n}/{len(chr_list[cur])} colored={colored_n}/{len(chr_list[cur])} flipped={flipped_n}/{len(chr_list[cur])}")
-
-    # 输出
-    global_header = ["species_id", "chr", "order_index", "orientation", "dominant_prev_chr", "dominant_weight_span_bp", "color_id", "color_hex"]
-    global_rows: List[List[str]] = []
-
-    sum_header = ["species_id", "n_chr", "n_assigned_color", "n_flipped", "prev_species_id"]
+    # summary
     sum_rows: List[List[str]] = []
+    for sid in species:
+        ordered = (d_seq / f"{sid}.seqids").read_text(encoding="utf-8").strip().split(",")
+        n_chr = len(ordered)
+        n_map = sum(1 for c in ordered if chr_ref[sid].get(c, "NA") != "NA")
+        n_flip = sum(chr_flip[sid].get(c, 0) for c in ordered)
+        sum_rows.append([sid, str(n_chr), str(n_map), str(n_flip), ordered[0], ordered[-1]])
+    write_tsv(d_sum / "step03.summary.tsv", ["species_id", "n_chr", "n_mapped_ref", "n_flip", "first_chr", "last_chr"], sum_rows)
 
-    for i, sid in enumerate(species):
-        prev_sid = "NA" if i == 0 else species[i - 1]
-        n_chr = len(ordered[sid])
-
-        n_col = 0
-        n_flip = 0
-
-        chr_order_rows: List[List[str]] = []
-        chr_colors_rows: List[List[str]] = []
-        seqids_tokens: List[str] = []
-
-        for j, c in enumerate(ordered[sid], start=1):
-            o = orient[sid].get(c, "+")
-            if o == "-":
-                n_flip += 1
-
-            cid = color_id[sid].get(c, 0)
-            if cid > 0:
-                n_col += 1
-                chex = palette_hex[cid - 1]
-            else:
-                chex = "NA"
-
-            dp = dom_prev[sid].get(c, "NA")
-            dw = dom_w[sid].get(c, 0)
-
-            global_rows.append([sid, c, str(j), o, dp, str(dw), str(cid), chex])
-
-            # ====== 翻转编码：ChrNN-（硬规则）======
-            seqid_for_plot = c + ("-" if o == "-" else "")
-            seqids_tokens.append(seqid_for_plot)
-
-            chr_order_rows.append([sid, c, str(j), o, seqid_for_plot, dp, str(dw), str(cid), chex])
-            chr_colors_rows.append([sid, c, str(cid), chex])
-
-        write_tsv(
-            d_chr_order / f"{sid}.chr_order.tsv",
-            ["species_id", "chr", "order_index", "orientation", "seqid_for_plot", "dominant_prev_chr", "dominant_weight_span_bp", "color_id", "color_hex"],
-            chr_order_rows,
-        )
-
-        write_tsv(
-            d_chr_colors / f"{sid}.chr_colors.tsv",
-            ["species_id", "chr", "color_id", "color_hex"],
-            chr_colors_rows,
-        )
-
-        # jcvi karyotype：每个 track 一行逗号分隔
-        (d_seqids / f"{sid}.seqids").write_text(",".join(seqids_tokens) + "\n", encoding="utf-8")
-
-        sum_rows.append([sid, str(n_chr), str(n_col), str(n_flip), prev_sid])
-        logger.info(f"[{sid}] n_chr={n_chr} n_assigned_color={n_col} n_flipped={n_flip} prev_species_id={prev_sid}")
-
-    write_tsv(out_dir / "global_chr_style.tsv", global_header, global_rows)
-    write_tsv(d_sum / "step03.summary.tsv", sum_header, sum_rows)
-
-    logger.info(f"Done. runtime_sec={int(time.time()-t0)}")
-    logger.info(f"Global style: {out_dir / 'global_chr_style.tsv'}")
+    logger.info(f"Done. runtime_sec={int(time.time() - t0)}")
 
 
 if __name__ == "__main__":
@@ -530,10 +528,10 @@ if __name__ == "__main__":
     except Exception as e:
         pr = PROJECT_ROOT
         if pr is None or str(pr).strip() == "":
-            PROJECT = Path(__file__).resolve().parents[1]
+            project = Path(__file__).resolve().parents[1]
         else:
-            PROJECT = Path(str(pr)).expanduser().resolve()
-        lg = Logger(PROJECT / LOG_DIR_REL / "synteny03_order_seqids.log")
+            project = Path(str(pr)).expanduser().resolve()
+        lg = Logger(project / LOG_DIR_REL / "synteny03_order_seqids.log")
         lg.error("Unhandled exception: " + repr(e))
         lg.error(traceback.format_exc())
         raise
