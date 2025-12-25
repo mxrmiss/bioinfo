@@ -22,6 +22,8 @@ DEFAULT_PEP2CDS_TSV   = "data/maps/pep2cds.tsv"
 STRICT_NORMALIZE_CDS  = True                   # True=未能规范化为真实 FASTA 头则硬失败
 DEFAULT_CDS_DIR       = "data/cds"
 DEFAULT_CDS_SUFFIX    = ".fna"
+DEFAULT_RAW_MSA_SUFFIX = ".raw.fa"
+
 
 # 数据库前缀白名单（基于 NCBI SeqID 规范，可在 config.publish.db_prefix_allowlist 扩展）
 ALLOWED_DB_PREFIXES: Set[str] = {
@@ -109,6 +111,93 @@ def read_fasta_headers(path: Path) -> List[str]:
             heads.append(line[1:].strip())
     return heads
 
+
+
+def read_fasta_as_ordered_dict(path: Path) -> "OrderedDict[str,str]":
+    """读取 FASTA 为 OrderedDict[header->seq]（去空白、保留顺序、全大写）"""
+    from collections import OrderedDict
+    d = OrderedDict()
+    name = None
+    buf: List[str] = []
+    with open(path, "r", encoding="utf-8", errors="ignore") as f:
+        for line in f:
+            if line.startswith(">"):
+                if name is not None:
+                    d[name] = re.sub(r"\s+", "", "".join(buf)).upper()
+                name = line[1:].strip()
+                buf = []
+            else:
+                buf.append(line.strip())
+        if name is not None:
+            d[name] = re.sub(r"\s+", "", "".join(buf)).upper()
+    return d
+
+def write_fasta_ordered_dict(path: Path, d: "OrderedDict[str,str]", linewrap: int = 60) -> None:
+    """写 FASTA（按顺序）"""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as w:
+        for h, s in d.items():
+            w.write(f">{h}\n")
+            if linewrap and linewrap > 0:
+                for i in range(0, len(s), linewrap):
+                    w.write(s[i:i+linewrap] + "\n")
+            else:
+                w.write(s + "\n")
+
+def normalize_of_msa_headers_to_species(of_msa: Path,
+                                       alias_map: Dict[str,str],
+                                       leaves: Set[str]) -> "OrderedDict[str,str]":
+    """把 OrthoFinder 的原始 MSA（header 常为 Species|Gene）转换为：header=规范物种名，序列保持对齐。"""
+    from collections import OrderedDict
+    recs = read_fasta_as_ordered_dict(of_msa)
+    if not recs:
+        raise RuntimeError(f"[ERR] OrthoFinder 原始 MSA 为空：{of_msa}")
+    out = OrderedDict()
+    for h, seq in recs.items():
+        tok = h.split()[0]
+        sp_raw = tok.split("|", 1)[0] if "|" in tok else tok
+        sp = canon_species(sp_raw, alias_map)
+        if sp in out:
+            raise RuntimeError(f"[ERR] OrthoFinder 原始 MSA 出现重复物种名（header 归一后冲突）：{sp} —— {of_msa}")
+        out[sp] = seq
+    # 等长性检查
+    Ls = {len(s) for s in out.values()}
+    if len(Ls) != 1:
+        raise RuntimeError(f"[ERR] OrthoFinder 原始 MSA 非等长对齐：{of_msa}")
+    if leaves and set(out.keys()) != set(leaves):
+        miss = sorted(set(leaves) - set(out.keys()))
+        extra = sorted(set(out.keys()) - set(leaves))
+        raise RuntimeError(
+            f"[ERR] OrthoFinder 原始 MSA 物种覆盖与物种树不一致：{of_msa}\n"
+            f"      missing={miss[:5]}... ({len(miss)})\n"
+            f"      extra  ={extra[:5]}... ({len(extra)})"
+        )
+    return out
+
+def find_of_raw_msa_file(msa_dir: Path, ogid: str) -> Path:
+    """在 OrthoFinder 的 MultipleSequenceAlignments 目录中定位 OG 的原始 AA MSA 文件（稳健查找）。"""
+    # 优先常见命名
+    preferred = [f"{ogid}.fa", f"{ogid}.fasta", f"{ogid}.faa", f"{ogid}.aln.fa", f"{ogid}.aln.fasta"]
+    for name in preferred:
+        p = msa_dir / name
+        if p.is_file():
+            return p
+    # 退化：匹配所有以 ogid 开头的文件（避免不同版本后缀差异）
+    cands = sorted([p for p in msa_dir.glob(f"{ogid}*") if p.is_file()])
+    if len(cands) == 1:
+        return cands[0]
+    if not cands:
+        raise FileNotFoundError(f"[ERR] 未找到 OrthoFinder 原始 MSA：{msa_dir}/{ogid}*")
+    # 多个候选时：尽量挑选最短文件名且后缀在常见集合里
+    common_ext = {".fa", ".faa", ".fasta"}
+    cands2 = [p for p in cands if p.suffix.lower() in common_ext]
+    if len(cands2) == 1:
+        return cands2[0]
+    # 仍然不唯一则报错，避免选错
+    raise RuntimeError(
+        f"[ERR] OrthoFinder 原始 MSA 存在多个候选，无法唯一判定：{ogid}\n"
+        f"      candidates={','.join([x.name for x in cands[:10]])}"
+    )
 # ---------- Newick 叶标签解析（忽略内部节点/分支长度/支持值） ----------
 def parse_newick_tips(nwk_text: str) -> List[str]:
     tips: List[str] = []
@@ -529,6 +618,25 @@ def main():
     for src in kept_files:
         shutil.copy2(src, sco_dir / src.name)
 
+    # ---------- A2) 发布 OrthoFinder 原始 AA MSA（同目录；header 归一为物种名） ----------
+    # 说明：
+    #   - downstream 的 aphylo 03 会使用 “raw AA + raw→trim colmask” 来回译 codon；
+    #   - 为了让 raw 与 trim 的 header 均为物种名，这里将 OrthoFinder 原始 header（常为 Species|Gene）
+    #     在发布时统一转换为规范物种名（canon_species + alias_map），并写入 strict_sco_msa/。
+    #   - 产物命名固定为：OGxxxx{DEFAULT_RAW_MSA_SUFFIX}（默认 .raw.fa）
+    of_msa_dir = of_results_dir / "MultipleSequenceAlignments"
+    need_dir(of_msa_dir, "OrthoFinder MultipleSequenceAlignments 缺失")
+    raw_suffix = str((cfg.get("publish", {}) or {}).get("raw_msa_suffix", DEFAULT_RAW_MSA_SUFFIX)) or DEFAULT_RAW_MSA_SUFFIX
+
+    raw_published = 0
+    for ogid in kept_ogs:
+        of_raw = find_of_raw_msa_file(of_msa_dir, ogid)
+        raw_norm = normalize_of_msa_headers_to_species(of_raw, alias_map, leaves)
+        out_raw = sco_dir / f"{ogid}{raw_suffix}"
+        write_fasta_ordered_dict(out_raw, raw_norm, linewrap=60)
+        raw_published += 1
+
+
     # ---------- B) colmask（可无；若存在必须是 AA 位串且长度=AA） ----------
     pub_colmask = pub / "colmask"; pub_colmask.mkdir(parents=True, exist_ok=True)
     mask_checked = 0
@@ -538,10 +646,22 @@ def main():
             mask_src = colmask_dir / f"{ogid}.colmask"
             if not mask_src.is_file():
                 continue
-            L = _aa_length_from_faa(aa_path)
+            # 新掩码契约：
+            #   - colmask 长度 = raw AA 列数（Lraw）
+            #   - colmask 中 '1' 的数量 = trim AA 列数（Ltrim）
+            aa_trim_path = aa_path
+            aa_raw_path = sco_dir / f"{ogid}{raw_suffix}"
+            if not aa_raw_path.is_file():
+                raise RuntimeError(f"[ERR] 发布包缺少 raw AA MSA：{aa_raw_path}；请检查 10 步 A2 是否成功发布 OrthoFinder 原始对齐")
+
+            Ltrim = _aa_length_from_faa(aa_trim_path)
+            Lraw  = _aa_length_from_faa(aa_raw_path)
             bits = _read_mask_bits_strict(mask_src)
-            if len(bits) != L:
-                raise RuntimeError(f"[ERR] 掩码长度 != AA 列数：{mask_src}（mask={len(bits)} vs AA={L}）")
+            if len(bits) != Lraw:
+                raise RuntimeError(f"[ERR] 掩码长度 != raw AA 列数：{mask_src}（mask={len(bits)} vs raw_AA={Lraw}）")
+            ones = bits.count('1')
+            if ones != Ltrim:
+                raise RuntimeError(f"[ERR] 掩码中 '1' 的数量 != trim AA 列数：{mask_src}（ones={ones} vs trim_AA={Ltrim}）")
             shutil.copy2(mask_src, pub_colmask / mask_src.name)
             mask_checked += 1
 
@@ -738,3 +858,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

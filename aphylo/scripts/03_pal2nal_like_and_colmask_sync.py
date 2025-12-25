@@ -14,6 +14,7 @@ CONFIG_FILE   = "config.yaml"
 # —— phylo 发布的输入（AA 与 AA 位串 colmask）——
 MSA_DIR        = "../phylo/results/publish/aphylo_ready/strict_sco_msa"
 MSA_SUFFIX     = ".trim.faa"
+RAW_MSA_SUFFIX = ".raw.fa"   # 与 10_publish_aphylo_ready.py 发布的 raw AA MSA 后缀一致
 COLMASK_DIR    = "../phylo/results/publish/aphylo_ready/colmask"
 COLMASK_SUFFIX = ".colmask"   # 0/1 位串
 
@@ -87,6 +88,46 @@ def coalesce_from_config(cfg: dict):
     else:                        SENTINEL_PATH = f"{BT_DIR}/.pal2nal.done"
     if sp.get("log_dir"):        LOG_DIR = sp["log_dir"]
 
+
+def _expand_publish_dir_placeholder(s: str, publish_dir: str) -> str:
+    """替换 <publish_dir> 占位符（保持原逻辑不变：仅做字符串替换，不做扫描或猜测）"""
+    if not isinstance(s, str):
+        return s
+    if "<publish_dir>" in s:
+        return s.replace("<publish_dir>", publish_dir)
+    return s
+
+def _coalesce_from_inputs_block(cfg: dict):
+    """
+    兼容 aphylo 的统一配置结构：
+      publish_dir: "../phylo/results/publish/aphylo_ready"
+      inputs:
+        sco_msa_dir: "<publish_dir>/strict_sco_msa"
+        sco_msa_suffix: ".trim.faa"
+        raw_msa_suffix: ".raw.fa"   # 新增
+        colmask_dir: "<publish_dir>/colmask"
+        colmask_suffix: ".colmask"
+    说明：只做“显式键读取 + <publish_dir> 替换”，不做目录扫描/猜测。
+    """
+    global MSA_DIR, MSA_SUFFIX, RAW_MSA_SUFFIX, COLMASK_DIR, COLMASK_SUFFIX
+    if not isinstance(cfg, dict):
+        return
+    pub = cfg.get("publish_dir", None)
+    inputs = cfg.get("inputs", None)
+    if not isinstance(inputs, dict):
+        return
+    if isinstance(pub, str) and pub.strip():
+        pub = pub.strip()
+        if isinstance(inputs.get("sco_msa_dir"), str):
+            MSA_DIR = _expand_publish_dir_placeholder(inputs["sco_msa_dir"], pub)
+        if isinstance(inputs.get("colmask_dir"), str):
+            COLMASK_DIR = _expand_publish_dir_placeholder(inputs["colmask_dir"], pub)
+    if isinstance(inputs.get("sco_msa_suffix"), str) and inputs.get("sco_msa_suffix").strip():
+        MSA_SUFFIX = inputs["sco_msa_suffix"].strip()
+    if isinstance(inputs.get("raw_msa_suffix"), str) and inputs.get("raw_msa_suffix").strip():
+        RAW_MSA_SUFFIX = inputs["raw_msa_suffix"].strip()
+    if isinstance(inputs.get("colmask_suffix"), str) and inputs.get("colmask_suffix").strip():
+        COLMASK_SUFFIX = inputs["colmask_suffix"].strip()
 def read_fasta_dict(path: Path) -> "OrderedDict[str,str]":
     d: "OrderedDict[str,str]" = OrderedDict()
     with open(path, "r", encoding="utf-8") as f:
@@ -120,6 +161,40 @@ def load_colmask_bits(cm_path: Path, n_cols: int) -> str:
     if len(bits)!=n_cols: raise ValueError(f"[ERR] {cm_path.name} 长度≠AA 列数：mask={len(bits)} vs AA={n_cols}")
     return bits
 
+
+def _apply_aa_mask(raw_aa: str, bits: str) -> str:
+    """按 bits(0/1) 从 raw AA 对齐中取出保留列（'1'），返回 trim AA 字符串。"""
+    if len(raw_aa) != len(bits):
+        raise ValueError(f"[ERR] _apply_aa_mask 长度不一致：raw_aa={len(raw_aa)} vs bits={len(bits)}")
+    out=[]
+    for ch, b in zip(raw_aa, bits):
+        if b == "1":
+            out.append(ch)
+    return "".join(out)
+
+def _apply_codon_mask(raw_codon: str, bits: str) -> str:
+    """
+    raw_codon 为 pal2nal-like 输出的“raw 坐标”密码子对齐（长度 = raw_cols*3）。
+    bits 长度 = raw_cols（raw AA 列数）。返回投影到 trim 坐标的密码子对齐（长度 = ones*3）。
+    """
+    raw_cols = len(bits)
+    if len(raw_codon) != raw_cols * 3:
+        raise ValueError(f"[ERR] _apply_codon_mask 长度不一致：raw_codon={len(raw_codon)} vs raw_cols*3={raw_cols*3}")
+    out=[]
+    for i, b in enumerate(bits):
+        if b == "1":
+            out.append(raw_codon[i*3:(i+1)*3])
+    return "".join(out)
+
+def _first_mismatch(a: str, b: str) -> int:
+    """返回第一处不等的位置（0-based）；若相等返回 -1。"""
+    n = min(len(a), len(b))
+    for i in range(n):
+        if a[i] != b[i]:
+            return i
+    if len(a) != len(b):
+        return n
+    return -1
 def _looks_like_header(parts: List[str]) -> bool:
     cols = [re.sub(r"\s+","", x).lower() for x in parts]
     return len(cols)>=4 and cols[:4]==["og","species","protein_id","cds_id"]
@@ -169,6 +244,7 @@ def main():
                 if k in ("paths",): continue
                 cfg[k]=v
         coalesce_from_config(cfg)
+        _coalesce_from_inputs_block(cfg)
 
     log("APhylo 03 —— pal2nal-like（输出到 results/03_codon/*）")
     log(f"msa_dir      = {MSA_DIR}")
@@ -194,8 +270,9 @@ def main():
         og = og_from_filename(msa_path)
         oglog_path = Path(LOG_DIR) / f"pal2nal_{og}.log"
         try:
-            aa = read_fasta_dict(msa_path)
-            headers=list(aa.keys())
+            # 读取 trim AA（发布包中的 strict_sco_msa/*.trim.faa）
+            aa_trim = read_fasta_dict(msa_path)
+            headers=list(aa_trim.keys())
             bad=[h for h in headers if "|" in h]
             if bad: raise ValueError(f"[契约违规] AA 表头必须仅为物种名；发现含 '|' 的 header：{bad[:3]}")
 
@@ -210,22 +287,68 @@ def main():
                 if cds_id not in cds_fa: raise KeyError(f"[ERR] ordered_cds.fna 缺少条目：{cds_id}")
                 cds_map[sp]=cds_fa[cds_id]
 
-            n_cols = len(next(iter(aa.values()))) if aa else 0
-            codon_out, stats = aa_to_codon_msa(aa, cds_map, strict=STRICT_CHECK)
-
-            out_fa = Path(CODON_MSA_DIR) / f"{og}.codon.fna"
-            write_fasta_dict(out_fa, codon_out, linewrap=LINE_WRAP)
-
+            # 新方案：使用 raw AA + raw→trim colmask 来生成“trim 坐标”的 codon 对齐
+            #  - raw AA：strict_sco_msa/OGxxxx{RAW_MSA_SUFFIX}
+            #  - colmask：publish/colmask/OGxxxx.colmask（长度=raw_cols；'1' 的数量=trim_cols）
             cm_path = Path(COLMASK_DIR) / f"{og}{COLMASK_SUFFIX}"
+            raw_cols = None
+            trim_cols = None
+            bits = None
             if cm_path.exists():
-                bits = load_colmask_bits(cm_path, n_cols)
-                ntmask = "".join(ch*3 for ch in bits)
+                raw_path = msa_dir / f"{og}{RAW_MSA_SUFFIX}"
+                if not raw_path.exists():
+                    raise FileNotFoundError(f"[ERR] OG={og} 存在 colmask 但缺少 raw AA：{raw_path}")
+                aa_raw = read_fasta_dict(raw_path)
+                bad2=[h for h in aa_raw.keys() if "|" in h]
+                if bad2:
+                    raise ValueError(f"[契约违规] raw AA 表头必须仅为物种名；发现含 '|' 的 header：{bad2[:3]}")
+                # 覆盖检查：raw/trim 必须有同一批物种
+                if set(aa_raw.keys()) != set(headers):
+                    miss = sorted(set(headers) - set(aa_raw.keys()))
+                    extra = sorted(set(aa_raw.keys()) - set(headers))
+                    raise ValueError(f"[ERR] raw/trim 物种集合不一致：missing={miss[:5]} extra={extra[:5]}")
+
+                trim_cols = len(next(iter(aa_trim.values()))) if aa_trim else 0
+                raw_cols  = len(next(iter(aa_raw.values())))  if aa_raw  else 0
+
+                bits = load_colmask_bits(cm_path, raw_cols)
+                ones = bits.count("1")
+                if ones != trim_cols:
+                    raise ValueError(f"[ERR] colmask 的 1 数量 != trim AA 列数：OG={og} ones={ones} trim_cols={trim_cols}")
+
+                # 强校验：raw 上按 colmask 投影后必须逐物种严格等于 trim AA
+                for sp in headers:
+                    proj = _apply_aa_mask(aa_raw[sp], bits)
+                    if proj != aa_trim[sp]:
+                        mm = _first_mismatch(proj, aa_trim[sp])
+                        raise ValueError(f"[ERR] raw→trim 投影不一致：OG={og} sp={sp} first_mismatch_col={mm}")
+
+                # 以 raw AA 为坐标回译，再投影到 trim 坐标（避免“trim AA 与 CDS”在 gap 位置映射出错）
+                from collections import OrderedDict
+                aa_raw_ord = OrderedDict((sp, aa_raw[sp]) for sp in headers)
+                codon_raw_out, stats = aa_to_codon_msa(aa_raw_ord, cds_map, strict=STRICT_CHECK)
+
+                codon_out = OrderedDict()
+                for sp, ntseq in codon_raw_out.items():
+                    codon_out[sp] = _apply_codon_mask(ntseq, bits)
+
+                # 输出的 codon 对齐列数（trim 坐标）
+                n_cols = trim_cols
+
+                # ntmask 仍需与 codon_out 一致：trim 坐标下全部为 1（因为已经投影/删列）
+                ntmask = "1" * (n_cols * 3)
                 (Path(NTMASK_DIR)/f"{og}.ntmask").write_text(ntmask+"\n", encoding="utf-8")
                 have_bits=True
             else:
-                warn(f"OG={og} 缺少发布的 colmask；跳过 ntmask 生成。")
+                # 兼容旧模式：没有 colmask 时，直接用 trim AA 回译（保持原逻辑）
+                aa = aa_trim
+                n_cols = len(next(iter(aa.values()))) if aa else 0
+                codon_out, stats = aa_to_codon_msa(aa, cds_map, strict=STRICT_CHECK)
+                warn(f"OG={og} 缺少发布的 colmask；使用旧模式直接回译 trim AA，跳过 ntmask 生成。")
                 have_bits=False
 
+            out_fa = Path(CODON_MSA_DIR) / f"{og}.codon.fna"
+            write_fasta_dict(out_fa, codon_out, linewrap=LINE_WRAP)
             with open(oglog_path,"w",encoding="utf-8") as lf:
                 lf.write(f"# OG={og}\n")
                 lf.write(f"aa_cols={n_cols}\n")
@@ -233,7 +356,11 @@ def main():
                 if have_bits:
                     lf.write("colmask=bitstring\n")
                     lf.write(f"colmask_len={len(bits)}\n")
-                    lf.write(f"ntmask_len={len(bits)*3}\n")
+                    lf.write(f"raw_aa_cols={raw_cols}\n")
+                    lf.write(f"trim_aa_cols={n_cols}\n")
+                    lf.write(f"colmask_ones={bits.count('1')}\n")
+                    lf.write(f"colmask_zeros={len(bits)-bits.count('1')}\n")
+                    lf.write(f"ntmask_len={n_cols*3}\n")
                 else:
                     lf.write("colmask=absent\n")
                 total_left=0
@@ -255,4 +382,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 

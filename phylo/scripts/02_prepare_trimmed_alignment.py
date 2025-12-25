@@ -5,8 +5,10 @@
 
 改动点（最小化改动）：
   * 当 config.trimming.save_colmask = true 时，生成的掩码改为
-    **AA 位串（长度=裁剪后 AA 列数的 0/1 串）**，每列均为 '1'（表示裁剪后的列全部保留）。
-    文件内容仅一行 0/1 串 + 换行，不再写注释或索引，避免后续统计混淆。
+    **RAW→TRIM 的列映射掩码（长度=原始 RAW AA 对齐列数 L0 的 0/1 串）**：
+      - 第 i 位为 '1' 表示该 RAW 列被 trimal 保留进入 TRIM；
+      - 第 i 位为 '0' 表示该 RAW 列被 trimal 删除；
+    文件内容仅一行 0/1 串 + 换行，不写注释或索引，避免后续统计混淆。
 
 其它逻辑保持不变：
   1) 读取 OrthoFinder 单基因 AA 对齐，使用 trimal 裁剪到 paths.msa_trim_dir
@@ -43,7 +45,15 @@ def compute_colmask_indices_by_id(orig_ids, orig_seqs, trim_ids, trim_seqs):
     """
     给定原始与裁剪后的对齐（均为等长），按裁剪后的顺序对原始序列重排，
     逐列比较得到被保留的原始列索引（1-based）。
-    仅用于一致性校验；最终掩码输出为 AA 位串（长度=L1，全部为 '1'）。
+
+    说明：
+      - kept: 原始 RAW 对齐中被保留进入 TRIM 的列索引（1-based）
+      - L0:   原始 RAW 对齐列数
+      - L1:   TRIM 后对齐列数
+
+    约束：
+      - 该函数会严格验证：TRIM 的每一列都能在 RAW 中按顺序匹配到；
+        否则直接报错（防止静默产生错误掩码）。
     """
     id2idx = {sid: i for i, sid in enumerate(orig_ids)}
     try:
@@ -119,6 +129,10 @@ def main():
     trimmed_cnt = 0
     colmask_cnt = 0
 
+    # 额外统计（不影响主流程）
+    colmask_zero_cnt = 0
+    colmask_one_cnt_sum = 0
+
     for og in ogs:
         src = os.path.join(msa_src, og + of_suffix)
         if not os.path.exists(src):
@@ -133,21 +147,36 @@ def main():
             print(f"[ERR] trimal 失败：{src}", file=sys.stderr); sys.exit(7)
         trimmed_cnt += 1
 
-        # 可选：产出列掩码（AA 位串；长度=裁剪后 AA 列数；全部为 '1'）
+        # 可选：产出列掩码（RAW→TRIM：长度=L0；0/1 位串）
         if save_colmask:
             try:
-                # 仍做一次映射校验，确保源/裁剪一致；但最终掩码输出为位串
+                # 仍做一次映射校验，确保源/裁剪一致；最终掩码输出为 RAW→TRIM 位串
                 orig_ids, orig_seqs = read_alignment_fasta(src)
                 tri_ids,  tri_seqs  = read_alignment_fasta(dst)
-                _, L0, L1 = compute_colmask_indices_by_id(orig_ids, orig_seqs, tri_ids, tri_seqs)
+                kept, L0, L1 = compute_colmask_indices_by_id(orig_ids, orig_seqs, tri_ids, tri_seqs)
 
-                # 生成位串掩码（与裁剪后 AA 列一致，全部保留为 '1'）
-                mask_bits = "1" * L1
+                # 生成 RAW→TRIM 位串掩码（长度=L0；保留列为 '1'，其余为 '0'）
+                # 注意：kept 为 1-based 索引
+                mask_list = ["0"] * L0
+                for idx1 in kept:
+                    # 防御性：kept 必须在 1..L0
+                    if idx1 < 1 or idx1 > L0:
+                        raise RuntimeError(f"[ERR] kept 索引越界：{og} idx={idx1} L0={L0}")
+                    mask_list[idx1 - 1] = "1"
+                mask_bits = "".join(mask_list)
+
+                # 额外一致性自检（不改变流程，只用于报错更早更直观）
+                if mask_bits.count("1") != L1:
+                    raise RuntimeError(
+                        f"[ERR] 掩码中 '1' 的数量 != TRIM 列数：{og} ones={mask_bits.count('1')} vs L1={L1}"
+                    )
 
                 # 只写 0/1 位串一行，避免任何注释或数字干扰下游统计
                 with open(os.path.join(colmask_dir, f"{og}.colmask"), 'w', encoding='utf-8') as f:
                     f.write(mask_bits + "\n")
                 colmask_cnt += 1
+                colmask_zero_cnt += mask_bits.count("0")
+                colmask_one_cnt_sum += mask_bits.count("1")
             except Exception as e:
                 print(str(e), file=sys.stderr); sys.exit(8)
 
@@ -158,7 +187,9 @@ def main():
 
     msg = f"[DONE] 对齐裁剪完成：{trimmed_cnt} 个 → {msa_trim_dir}"
     if save_colmask:
-        msg += f"；列掩码生成（AA位串）：{colmask_cnt} 个 → {colmask_dir}"
+        msg += f"；列掩码生成（RAW→TRIM 位串）：{colmask_cnt} 个 → {colmask_dir}"
+        # 额外统计（方便你肉眼快速判断）
+        msg += f"；mask_ones_sum={colmask_one_cnt_sum}；mask_zeros_sum={colmask_zero_cnt}"
     print(msg)
 
 if __name__ == '__main__':

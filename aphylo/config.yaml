@@ -11,6 +11,7 @@ inputs:
   sco_msa_suffix: ".trim.faa"                     # 严格使用固定后缀
   colmask_dir: "<publish_dir>/colmask"            # 可选：不提供则跳过列同步
   colmask_suffix: ".colmask"
+  raw_msa_suffix: ".raw.fa"
   pep2cds_map: "<publish_dir>/pep2cds_resolved.tsv"       # 严格单拷贝
   all_members_tsv: "<publish_dir>/all_pep2cds_resolved.tsv"   # 全家族成员（多拷贝）
   species_tree: "<publish_dir>/species_tree.nwk"
@@ -45,7 +46,7 @@ codon:
   stopcodon_action: "fail"   # fail | mask(NNN)
 
 codeml:
-  threads: 31                                   # 并行请用 `snakemake -j` 控制；脚本逐任务运行更稳
+  threads: 30                                   # 并行请用 `snakemake -j` 控制；脚本逐任务运行更稳
   alt_template: "templates/branch_site_alt.ctl"
   null_template: "templates/branch_site_null.ctl"
   ctl_template: "templates/branch_site.ctl"    # 固定模板文件（保留不影响）
