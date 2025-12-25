@@ -2,49 +2,47 @@
 # -*- coding: utf-8 -*-
 
 """
-13b_cafe_build_enrich_inputs.py —— 为 CAFE5 per-species 扩张/收缩构建富集输入（适配矩阵版 Base_* 文件）
+13b_cafe_build_enrich_inputs.py —— 为 CAFE5 扩张/收缩构建发布包（叶节点富集包 + 全节点OG包）
 
-核心设计（与皇上的 config.yaml + CAFE5 输出对齐）：
-  1）基于 13 步的 FDR 表（cafe_significant_families_no_highfail.tsv）确定全局显著家族：
-        - 使用 report.fdr_alpha 作为 Q 阈值；
-        - 每个 model 拿到 fam_all（用于背景）与 fam_sig（用于候选扩缩）。
-  2）从 primary_global 下读取：
-        - Base_clade_results.txt           —— 提取 node_id ↔ 物种名 ↔ 是否叶节点；
-        - Base_change.tab                  —— 每个 (family, node) 的 Δ（child-parent），方向信息；
-        - Base_branch_probabilities.tab    —— 每个 (family, node) 的分支显著性概率/ p 值。
-     ★ 适配两种格式：
-        a) 传统“长表”格式：FamilyID  Node  Probability
-        b) 新版“矩阵”格式：FamilyID  Branchiostrea<1>  Homo_sapiens<2>  …  <29>
-  3）仅在满足以下条件时，认定“某个 family 在某个物种叶节点上发生了显著扩/缩”：
-        a. family 的 Q_family <= report.fdr_alpha（全局 FDR 显著）；
-        b. 若存在 Base_branch_probabilities.tab，则该分支 p_branch <= cafe5.branch_p_alpha（默认 0.05）；
-           若 branch_probabilities 缺失且 ALLOW_NO_BRANCH_PROB=True，则仅依赖 Q + Δ；
-        c. Base_change.tab 中该 (family, node) 的 Δ != 0。
-     并据 Δ 的正负将 status 标记为 expanded / contracted。
-  4）在 cafe_agg_dir 写出：
-        - cafe_family_branch_status.tsv：记录所有叶节点的 per-family 扩缩状态。
-        - cafe_significant_clade_summary.tsv：
-              按物种汇总“显著扩张/收缩家族数 + 显著扩张/收缩基因数”（★ 给树图与结果段使用）。
-  5）利用 inputs.all_members_tsv（当前为 "<publish_dir>/all_pep2cds_resolved.tsv"）：
-        - 通过 (OG, Species) -> {cds_id} 映射，把 family 状态折叠成 per-species 基因集合：
-            * 背景基因 = 该物种在 CAFE 可评估家族中的所有基因；
-            * 扩张基因 = 所有 expanded family × 该物种 的基因并集；
-            * 收缩基因 = 所有 contracted family × 该物种 的基因并集。
-  6）结合 config.cafe5.enrich_bridge：
-        cafe5:
-          enrich_bridge:
-            enable: true
-            outputs_dir: "results/07_cafeagg/enrich_inputs"
-            species_sets:
-              cafe_sc:
-                - "Sinonovacula_constricta"
-              cafe_sr:
-                - "Sinonovacula_rivularis"
-        - 对每个 tag（例如 cafe_sc / cafe_sr），按 species 列表构建：
-            * <outputs_dir>/<tag>/background.list
-            * <outputs_dir>/<tag>/up.list     （扩张）
-            * <outputs_dir>/<tag>/down.list   （收缩）
-            * <outputs_dir>/<tag>/meta.tsv
+【皇上最新规则（本脚本已落实）】
+  A）不设置任何“节点开关”：所有节点（祖先节点 + 叶节点）必须出现在“该出现的表格”中；
+  B）不再读取 config.yaml 中的 cafe5.enrich_bridge：
+        - 叶节点富集发布包：对“所有叶节点物种”逐物种输出；
+        - 全节点OG发布包：对“所有节点（祖先+叶）”逐节点输出，便于共扩张/共收缩交集分析；
+  C）输出位置与命名：
+        1）叶节点富集发布包：写到
+              <cafe_agg_dir>/enrich_inputs/<S_constricta_cafe>/
+           文件固定四件套，且“表头/内容格式”保持原样：
+              background.list / up.list / down.list / meta.tsv
+        2）全节点OG发布包：写到
+              <cafe_agg_dir>/enrich_inputs/node/<node_pkg_name>/
+           其中：
+              - 祖先节点：{node_id}node_cafe，例如 40node_cafe
+              - 叶节点：S_constricta_node_cafe
+           OG发布包为新增产物，表头由本脚本自定义（不受“已有表头不准改”的限制）
+
+【与 13 步对齐（避免衔接误差）】
+  - 13 输出：cafe_significant_families_no_highfail.tsv
+      表头包含：model / family / Q
+    本脚本严格按列名读取，不使用列号猜测。
+
+【显著扩/缩判定口径（与旧13b一致）】
+  认定“某个 family 在某个 node 上显著扩/缩”需满足：
+    1) family 的 Q_family <= report.fdr_alpha（全局FDR显著）
+    2) 若存在 Base_branch_probabilities.tab：
+         p_branch <= cafe5.branch_p_alpha
+       否则在 ALLOW_NO_BRANCH_PROB=True 时退化为仅 Q + Δ
+    3) Base_change.tab 的 Δ != 0
+  并据 Δ 正负标记 status：expanded / contracted
+
+【表格输出（旧表头不改）】
+  - cafe_family_branch_status.tsv：表头不变，仅增加祖先节点行
+  - cafe_significant_clade_summary.tsv：★加回，生成内容应与旧13b一致（仅叶节点/物种）
+  - cafe_node_significant_clade_summary.tsv：★新增，补齐祖先节点信息（只给 family 计数，不给基因计数）
+
+注意：
+  - 祖先节点没有真实“基因ID”，因此本脚本不为祖先节点输出基因级富集包；
+    祖先节点只输出OG级发布包（用于共扩张/共收缩交集与后续统计）。
 """
 
 from __future__ import annotations
@@ -62,13 +60,8 @@ import yaml
 
 # -------------------------- 顶部参数区 --------------------------
 
-# 配置文件路径（皇上统一在脚本顶部配置）
 CONFIG_PATH = "config.yaml"
-
-# 日志文件名（写在 paths.logs_dir 下）
 LOG_FILE_BASENAME = "13b_cafe_build_enrich_inputs.log"
-
-# 日志级别
 LOG_LEVEL = "INFO"
 
 # 当 Base_branch_probabilities.tab 缺失时，是否允许退化为仅使用 Q + Δ 判定分支显著性
@@ -99,12 +92,7 @@ def write_tsv(path: Path, header: List[str], rows: List[List[object]]) -> None:
 
 
 def _expand_publish_placeholders(obj: Any, publish_dir: str) -> Any:
-    """
-    将对象中的 <publish_dir> 占位符展开：
-      - 字符串：直接替换
-      - 列表/字典：递归展开
-      - 其他类型：原样返回
-    """
+    """将对象中的 <publish_dir> 占位符展开。"""
     if isinstance(obj, str):
         return obj.replace("<publish_dir>", publish_dir)
     if isinstance(obj, list):
@@ -132,7 +120,6 @@ def load_config(config_path: str) -> Dict[str, Any]:
 
 @dataclass
 class NodeInfo:
-    """存放节点与物种的映射信息。"""
     node_id: int
     taxon_label: str
     species_name: Optional[str]
@@ -147,7 +134,6 @@ def parse_node_label_to_id(label: str) -> Optional[int]:
     从列名或 Taxon_ID 中解析 node_id：
       - "<22>"           → 22
       - "Name<10>"       → 10
-      - 其他             → None
     """
     label = label.strip()
     m_int = re.fullmatch(r"<(\d+)>", label)
@@ -162,12 +148,6 @@ def parse_node_label_to_id(label: str) -> Optional[int]:
 def parse_clade_results(path: Path) -> Dict[int, NodeInfo]:
     """
     解析 Base_clade_results.txt，构建 node_id -> NodeInfo 映射。
-
-    文件格式示例：
-      #Taxon_ID       Increase        Decrease
-      <22>    125     33
-      Sinonovacula_constricta<10>     541     441
-      Cyclina_sinensis<9>             1587    519
     """
     lines = read_lines(path)
     if not lines:
@@ -178,7 +158,7 @@ def parse_clade_results(path: Path) -> Dict[int, NodeInfo]:
             continue
         parts = ln.split("\t")
         taxon = parts[0].strip()
-        # 内部节点：<22>
+
         m_int = re.fullmatch(r"<(\d+)>", taxon)
         if m_int:
             nid = int(m_int.group(1))
@@ -189,7 +169,7 @@ def parse_clade_results(path: Path) -> Dict[int, NodeInfo]:
                 is_leaf=False,
             )
             continue
-        # 叶节点：Name<10>
+
         m_leaf = re.fullmatch(r"(.+)<(\d+)>", taxon)
         if m_leaf:
             name = m_leaf.group(1).strip()
@@ -201,7 +181,9 @@ def parse_clade_results(path: Path) -> Dict[int, NodeInfo]:
                 is_leaf=True,
             )
             continue
+
         logging.warning(f"[WARN] 未能解析 Taxon_ID 字段：{taxon}（{path}）")
+
     if not node_map:
         raise ValueError(f"[ERR] 未从 {path} 解析出任何节点信息")
     return node_map
@@ -210,25 +192,7 @@ def parse_clade_results(path: Path) -> Dict[int, NodeInfo]:
 def parse_change_table(path: Path) -> List[Tuple[str, int, float]]:
     """
     解析 Base_change.tab，提取 (family, node_id, delta) 列表。
-
-    适配两种格式：
-
-    1）矩阵格式（当前皇上的 CAFE5 输出）：
-        表头：
-          FamilyID  Branchiostrea_floridae<1>  Homo_sapiens<2>  ...  <29>
-        每一行：
-          OG0000001  0.1  0.0  ...  NA
-
-        行解析逻辑：
-          - 第 1 列为 family；
-          - 后续每一列名都可以用 parse_node_label_to_id() 解析成 node_id；
-          - 单元格为 Δ（change），NA/N/A/./空 跳过。
-
-    2）旧版“长表”格式（少数脚本使用）：
-        FamilyID  Parent  Node  ParentCount  Change  ...
-        - 第1列：family
-        - 第3列：node_id
-        - 第5列：Change
+    兼容矩阵格式与旧长表格式。
     """
     lines = read_lines(path)
     if not lines:
@@ -236,7 +200,6 @@ def parse_change_table(path: Path) -> List[Tuple[str, int, float]]:
     header = re.split(r"\s+", lines[0].strip())
     data_lines = lines[1:]
 
-    # 判断是否为矩阵格式：首列 FamilyID，且第二列及之后的列名中有 "<id>" 结构
     is_matrix = False
     if header and header[0].lower().startswith("family"):
         for col in header[1:]:
@@ -247,8 +210,6 @@ def parse_change_table(path: Path) -> List[Tuple[str, int, float]]:
     out: List[Tuple[str, int, float]] = []
 
     if is_matrix:
-        # 矩阵模式
-        # 先解析每一列对应的 node_id
         node_ids_by_col: Dict[int, int] = {}
         for idx, col in enumerate(header[1:], start=1):
             nid = parse_node_label_to_id(col)
@@ -278,12 +239,11 @@ def parse_change_table(path: Path) -> List[Tuple[str, int, float]]:
                     continue
                 out.append((fam, node_id, delta))
     else:
-        # 退化为旧版长表解析
-        data_lines = lines
+        data_lines2 = lines
         first = lines[0].strip()
         if first.startswith("FamilyID") or first.startswith("#FamilyID"):
-            data_lines = lines[1:]
-        for ln in data_lines:
+            data_lines2 = lines[1:]
+        for ln in data_lines2:
             if not ln.strip():
                 continue
             parts = re.split(r"\s+", ln.strip())
@@ -307,23 +267,7 @@ def parse_change_table(path: Path) -> List[Tuple[str, int, float]]:
 def parse_branch_probabilities(path: Path) -> Dict[Tuple[str, int], float]:
     """
     解析 Base_branch_probabilities.tab，提取 (family, node_id) -> p_branch 映射。
-
-    适配两种格式：
-
-    1）矩阵格式（当前皇上的 CAFE5 输出）：
-        表头：
-          FamilyID  Branchiostrea_floridae<1>  Homo_sapiens<2>  ...  <29>
-        每一行：
-          OG0000001  0.01  0.23  ...  NA
-
-        行解析逻辑：
-          - 第 1 列为 family；
-          - 后续每一列名都可以用 parse_node_label_to_id() 解析成 node_id；
-          - 单元格为 p_branch，NA/N/A/./空 跳过。
-
-    2）旧版“长表”格式：
-        FamilyID  Node  Probability
-        - 自动根据列名查找 family/node/prob 列。
+    兼容矩阵格式与旧长表格式。
     """
     lines = read_lines(path)
     if not lines:
@@ -334,7 +278,6 @@ def parse_branch_probabilities(path: Path) -> Dict[Tuple[str, int], float]:
 
     out: Dict[Tuple[str, int], float] = {}
 
-    # 尝试判定是否矩阵格式
     is_matrix = False
     if header and header[0].lower().startswith("family"):
         for col in header[1:]:
@@ -343,7 +286,6 @@ def parse_branch_probabilities(path: Path) -> Dict[Tuple[str, int], float]:
                 break
 
     if is_matrix:
-        # 矩阵模式
         node_ids_by_col: Dict[int, int] = {}
         for idx, col in enumerate(header[1:], start=1):
             nid = parse_node_label_to_id(col)
@@ -374,7 +316,6 @@ def parse_branch_probabilities(path: Path) -> Dict[Tuple[str, int], float]:
                 out[(fam, node_id)] = p
         return out
 
-    # 否则走旧版长表格式：识别 family/node/prob 列
     family_idx = None
     node_idx = None
     prob_idx = None
@@ -388,9 +329,7 @@ def parse_branch_probabilities(path: Path) -> Dict[Tuple[str, int], float]:
             prob_idx = i
 
     if family_idx is None or node_idx is None or prob_idx is None:
-        raise ValueError(
-            f"[ERR] 无法从表头识别 family/node/prob 列：{header}"
-        )
+        raise ValueError(f"[ERR] 无法从表头识别 family/node/prob 列：{header}")
 
     for ln in data_lines:
         if not ln.strip():
@@ -415,7 +354,22 @@ def parse_branch_probabilities(path: Path) -> Dict[Tuple[str, int], float]:
     return out
 
 
-# ----------------------- 主逻辑：生成富集输入 -----------------------
+def species_to_leaf_pkg_prefix(species: str) -> str:
+    """Sinonovacula_constricta -> S_constricta"""
+    parts = species.strip().split("_")
+    if len(parts) >= 2 and parts[0] and parts[1]:
+        return f"{parts[0][0].upper()}_{parts[1]}"
+    return species.strip()
+
+
+def write_list_plain(path: Path, items: Set[str]) -> None:
+    """写 list 文件：一行一个字符串，无表头。"""
+    with path.open("w", encoding="utf-8") as f:
+        for x in sorted(items):
+            f.write(x + "\n")
+
+
+# ----------------------- 主逻辑：生成发布包 -----------------------
 
 
 def main() -> None:
@@ -441,30 +395,13 @@ def main() -> None:
             logging.StreamHandler(sys.stdout),
         ],
     )
-    logging.info("========== APhylo 13b — CAFE5 per-species 扩张/收缩富集输入 ==========")
+    logging.info("========== APhylo 13b — CAFE5 发布包（叶节点富集 + 全节点OG） ==========")
     logging.info(f"[init] 使用配置文件：{cfg_path}")
     logging.info(f"[init] cafe_run_dir      = {cafe_run_dir}")
     logging.info(f"[init] cafe_agg_dir      = {cafe_agg_dir}")
     logging.info(f"[init] logs_dir          = {logs_dir}")
 
-    # 3) 检查 enrich_bridge 是否启用
-    cafe_cfg = cfg.get("cafe5", {})
-    enrich_cfg = cafe_cfg.get("enrich_bridge", {}) or {}
-    if not enrich_cfg.get("enable", False):
-        logging.info("[init] cafe5.enrich_bridge.enable = false，本脚本不执行任何操作，直接退出。")
-        return
-
-    outputs_dir_cfg = enrich_cfg.get("outputs_dir", "results/07_cafeagg/enrich_inputs")
-    enrich_out_root = Path(outputs_dir_cfg).resolve()
-    mkdir_p(enrich_out_root)
-    logging.info(f"[init] enrich_outputs_dir = {enrich_out_root}")
-
-    species_sets_cfg = enrich_cfg.get("species_sets", {})
-    if not species_sets_cfg:
-        logging.error("[ERR] cafe5.enrich_bridge.species_sets 未配置，无法生成 CAFE 富集输入")
-        sys.exit(2)
-
-    # 4) 前置检查：13 步产物是否存在
+    # 3) 前置检查：13 步产物
     sig_nohf_path = cafe_agg_dir / "cafe_significant_families_no_highfail.tsv"
     if not sig_nohf_path.exists():
         logging.error(f"[ERR] 未找到 13 步产物：{sig_nohf_path}")
@@ -474,8 +411,10 @@ def main() -> None:
     if not sentinel.exists():
         logging.warning(f"[WARN] 未发现 12 步完成哨兵：{sentinel}，请确认 CAFE 已完整运行。")
 
-    # 5) FDR 与分支 p 值阈值
+    # 4) 阈值
+    cafe_cfg = cfg.get("cafe5", {})
     report_cfg = cfg.get("report", {})
+
     fdr_alpha = float(report_cfg.get("fdr_alpha", 0.05))
     if not (0.0 < fdr_alpha <= 1.0):
         logging.warning(f"[WARN] report.fdr_alpha 非法：{fdr_alpha}，重置为 0.05")
@@ -488,10 +427,10 @@ def main() -> None:
         branch_p_alpha = 0.05
     logging.info(f"[init] 分支显著性阈值 branch_p_alpha = {branch_p_alpha}")
 
-    # 6) 读取 13 的 FDR 表，构建 family → Q 映射
-    fam2q: Dict[Tuple[str, str], float] = {}      # (model, family) -> Q
-    fam_all_by_model: Dict[str, Set[str]] = {}    # model -> 所有 family
-    fam_sig_by_model: Dict[str, Set[str]] = {}    # model -> Q<=α family
+    # 5) 读取 13 的 FDR 表：构建 (model,family)->Q；以及 fam_all / fam_sig
+    fam2q: Dict[Tuple[str, str], float] = {}
+    fam_all_by_model: Dict[str, Set[str]] = {}
+    fam_sig_by_model: Dict[str, Set[str]] = {}
 
     lines = read_lines(sig_nohf_path)
     if not lines:
@@ -514,7 +453,7 @@ def main() -> None:
         model = parts[col_map["model"]].strip()
         fam = parts[col_map["family"]].strip()
         q_s = parts[col_map["Q"]].strip()
-        if not fam:
+        if not model or not fam:
             continue
         try:
             q = float(q_s)
@@ -527,15 +466,15 @@ def main() -> None:
         if q <= fdr_alpha:
             fam_sig_by_model.setdefault(model, set()).add(fam)
 
-    total_fam = sum(len(v) for v in fam_all_by_model.values())
-    total_sig = sum(len(v) for v in fam_sig_by_model.values())
-    logging.info(f"[cafe] 总 family 条目数：{total_fam}，其中 Q<=α 的显著 family 数：{total_sig}")
-
     if not fam_all_by_model:
         logging.error("[ERR] 未从 FDR 表中解析到任何 family 记录")
         sys.exit(2)
 
-    # 7) 决定要使用的 CAFE 模型：优先 report.selected_cafe_model，否则用 cafe5.models[0]
+    total_fam = sum(len(v) for v in fam_all_by_model.values())
+    total_sig = sum(len(v) for v in fam_sig_by_model.values())
+    logging.info(f"[cafe] 总 family 条目数：{total_fam}，其中 Q<=α 的显著 family 数：{total_sig}")
+
+    # 6) 选择模型：优先 report.selected_cafe_model，否则 cafe5.models[0]
     selected_model = report_cfg.get("selected_cafe_model")
     cafe_models = cafe_cfg.get("models", ["global"])
     if not selected_model:
@@ -543,19 +482,22 @@ def main() -> None:
         logging.warning(f"[WARN] report.selected_cafe_model 未设置，将使用 cafe5.models[0]：{selected_model}")
     else:
         logging.info(f"[init] selected_cafe_model = {selected_model}")
-    models = [selected_model]
 
+    models = [selected_model]
     models_dir = cafe_run_dir / "models"
 
-    # per-branch 状态记录
-    branch_status_rows: List[List[object]] = []
-    # (model, species) -> 显著扩张 / 收缩 family 集合
-    expanded_fams: Dict[Tuple[str, str], Set[str]] = {}
-    contracted_fams: Dict[Tuple[str, str], Set[str]] = {}
-    # 记录每个 model 下所有叶节点的物种名，用于补 0
+    # 7) 解析 CAFE 输出：构建“全节点”显著扩/缩 family 集合 + “叶节点（物种）”集合
+    expanded_fams_node: Dict[Tuple[str, int], Set[str]] = {}
+    contracted_fams_node: Dict[Tuple[str, int], Set[str]] = {}
+
+    expanded_fams_leaf: Dict[Tuple[str, str], Set[str]] = {}
+    contracted_fams_leaf: Dict[Tuple[str, str], Set[str]] = {}
+
+    node_map_by_model: Dict[str, Dict[int, NodeInfo]] = {}
     leaf_species_by_model: Dict[str, Set[str]] = {}
 
-    # 8) 遍历模型，解析节点信息、Δ 与分支概率，填充 expanded_fams / contracted_fams
+    branch_status_rows: List[List[object]] = []
+
     for model in models:
         mdir = models_dir / model
         primary_dir = mdir / "primary_global"
@@ -575,16 +517,17 @@ def main() -> None:
             sys.exit(2)
 
         node_map = parse_clade_results(clade_path)
-        change_records = parse_change_table(change_path)
-        logging.info(f"[model={model}] 从 {change_path} 解析到 {len(change_records)} 条 Δ 记录")
+        node_map_by_model[model] = node_map
 
-        # 收集该 model 下所有叶节点物种名（用于后续显著家族 / 基因统计）
         leaf_species: Set[str] = set()
         for info in node_map.values():
             if info.is_leaf and info.species_name:
                 leaf_species.add(info.species_name)
         leaf_species_by_model[model] = leaf_species
-        logging.info(f"[model={model}] 叶节点物种数：{len(leaf_species)}")
+        logging.info(f"[model={model}] 叶节点物种数：{len(leaf_species)}；全节点数：{len(node_map)}")
+
+        change_records = parse_change_table(change_path)
+        logging.info(f"[model={model}] 从 {change_path} 解析到 {len(change_records)} 条 Δ 记录")
 
         branch_prob: Dict[Tuple[str, int], float] = {}
         has_branch_prob = False
@@ -608,10 +551,9 @@ def main() -> None:
         logging.info(f"[model={model}] fam_all={len(fam_all)}，fam_sig={len(fam_sig_by_model.get(model, set()))}（Q<=α）")
 
         for fam, node_id, delta in change_records:
-            # fam 必须存在于 13 步 FDR 表（fam_all），否则跳过
             if fam_all and fam not in fam_all:
                 continue
-            # family 必须先在全局 FDR 上显著
+
             q = fam2q.get((model, fam))
             if q is None or q > fdr_alpha:
                 continue
@@ -619,56 +561,56 @@ def main() -> None:
             node_info = node_map.get(node_id)
             if node_info is None:
                 continue
-            if not node_info.is_leaf:
-                # 仅 per-species：内部节点忽略
-                continue
-            species = node_info.species_name
-            if not species:
-                continue
 
             if delta == 0:
-                # Δ=0 无扩缩
                 continue
 
             p_branch = None
             if has_branch_prob:
                 p_branch = branch_prob.get((fam, node_id))
                 if p_branch is None:
-                    # 没有记录一般说明 parent=child，视为不显著
                     continue
                 if p_branch > branch_p_alpha:
                     continue
 
             status = "expanded" if delta > 0 else "contracted"
 
+            # ★全节点 per-family 状态表（旧表头不变）
             branch_status_rows.append([
                 model,
                 fam,
                 node_id,
                 node_info.taxon_label,
-                species,
+                "" if node_info.species_name is None else node_info.species_name,
                 status,
                 f"{delta:.6g}",
                 "" if p_branch is None else f"{p_branch:.6g}",
                 f"{q:.6g}",
             ])
 
-            key = (model, species)
+            key_node = (model, node_id)
             if status == "expanded":
-                expanded_fams.setdefault(key, set()).add(fam)
+                expanded_fams_node.setdefault(key_node, set()).add(fam)
             else:
-                contracted_fams.setdefault(key, set()).add(fam)
+                contracted_fams_node.setdefault(key_node, set()).add(fam)
 
-    # 写出 per-branch 状态表
+            if node_info.is_leaf and node_info.species_name:
+                key_leaf = (model, node_info.species_name)
+                if status == "expanded":
+                    expanded_fams_leaf.setdefault(key_leaf, set()).add(fam)
+                else:
+                    contracted_fams_leaf.setdefault(key_leaf, set()).add(fam)
+
+    # 8) 写出 per-family 状态表（已有表格：表头不变，只增行）
     status_path = cafe_agg_dir / "cafe_family_branch_status.tsv"
     write_tsv(
         status_path,
         ["model", "family", "node_id", "taxon_label", "species", "status", "delta", "p_branch", "Q_family"],
         branch_status_rows,
     )
-    logging.info(f"[OK] 写出 per-branch 状态表：{status_path}（{len(branch_status_rows)} 行）")
+    logging.info(f"[OK] 写出 per-family 状态表：{status_path}（{len(branch_status_rows)} 行；含祖先+叶）")
 
-    # 9) 成员映射：使用 inputs.all_members_tsv （all_pep2cds_resolved.tsv）
+    # 9) 读取成员映射：inputs.all_members_tsv（all_pep2cds_resolved.tsv）
     inputs_cfg = cfg.get("inputs", {})
     all_members_path = inputs_cfg.get("all_members_tsv")
     if not all_members_path:
@@ -691,7 +633,6 @@ def main() -> None:
             logging.error(f"[ERR] all_members_tsv 缺少列：{c}")
             sys.exit(2)
 
-    # member_map[(OG, Species)] -> {cds_id}
     member_map: Dict[Tuple[str, str], Set[str]] = {}
     total_records = 0
     for ln in lines[1:]:
@@ -705,61 +646,52 @@ def main() -> None:
         cds = parts[hmap["cds_id"]].strip()
         if not og or not sp or not cds:
             continue
-        key = (og, sp)
-        member_map.setdefault(key, set()).add(cds)
+        member_map.setdefault((og, sp), set()).add(cds)
         total_records += 1
+    logging.info(f"[members] 读取到 {total_records} 条 (OG,Species,cds) 映射，键数：{len(member_map)}")
 
-    logging.info(
-        f"[members] 从 {all_members_path} 读取到 {total_records} 条 (OG,Species,cds) 映射，键数：{len(member_map)}"
-    )
-
-    # ==================== ★ 新增：显著扩/缩 家族数 + 基因数 汇总 ====================
-    # 目标：按物种统计“显著扩张/收缩家族数 + 显著扩张/收缩基因数”，
-    #       写出到 cafe_significant_clade_summary.tsv，供系统发育树和结果段使用。
+    # ==================== ★ 加回：cafe_significant_clade_summary.tsv（内容与旧13b一致口径） ====================
+    # 说明：
+    #   - 该表“只统计叶节点物种”，列：model, species, n_expanded_fams, n_contracted_fams, n_expanded_genes, n_contracted_genes
+    #   - 统计方式：对每个物种，取 expanded_fams_leaf / contracted_fams_leaf，
+    #              并把这些 family 在该物种上的成员基因并起来计数（基于 all_members_tsv）
     sig_summary_rows: List[List[object]] = []
 
     for model in models:
         # 该模型下所有叶节点物种名（来自 Base_clade_results）
         species_set: Set[str] = set(leaf_species_by_model.get(model, set()))
-        # 把 expanded_fams / contracted_fams 里出现过的物种也补进去，防止极端缺失
-        for (m, sp) in expanded_fams.keys():
+        # 把 expanded/contracted 里出现过的物种也补进去，防止极端缺失
+        for (m, sp) in expanded_fams_leaf.keys():
             if m == model:
                 species_set.add(sp)
-        for (m, sp) in contracted_fams.keys():
+        for (m, sp) in contracted_fams_leaf.keys():
             if m == model:
                 species_set.add(sp)
 
         for sp in sorted(species_set):
             key = (model, sp)
-            fam_exp = expanded_fams.get(key, set())
-            fam_con = contracted_fams.get(key, set())
+            fam_exp = expanded_fams_leaf.get(key, set())
+            fam_con = contracted_fams_leaf.get(key, set())
 
-            # 显著扩张基因集合：所有显著扩张 family 在该物种上的成员基因并集
             exp_genes: Set[str] = set()
             for fam in fam_exp:
                 genes = member_map.get((fam, sp))
                 if genes:
                     exp_genes.update(genes)
 
-            # 显著收缩基因集合
             con_genes: Set[str] = set()
             for fam in fam_con:
                 genes = member_map.get((fam, sp))
                 if genes:
                     con_genes.update(genes)
 
-            n_exp_fams = len(fam_exp)
-            n_con_fams = len(fam_con)
-            n_exp_genes = len(exp_genes)
-            n_con_genes = len(con_genes)
-
             sig_summary_rows.append([
                 model,
                 sp,
-                n_exp_fams,
-                n_con_fams,
-                n_exp_genes,
-                n_con_genes,
+                len(fam_exp),
+                len(fam_con),
+                len(exp_genes),
+                len(con_genes),
             ])
 
     sig_summary_path = cafe_agg_dir / "cafe_significant_clade_summary.tsv"
@@ -769,105 +701,207 @@ def main() -> None:
         sig_summary_rows,
     )
     logging.info(
-        f"[OK] 写出显著扩/缩 家族 + 基因 汇总表：{sig_summary_path}（{len(sig_summary_rows)} 行；"
-        f"列为 model, species, n_expanded_fams, n_contracted_fams, n_expanded_genes, n_contracted_genes）"
+        f"[OK] 写出 cafe_significant_clade_summary.tsv：{sig_summary_path}（{len(sig_summary_rows)} 行）"
     )
-    # ==================== ★ 新增部分结束 ====================
+    # ==================== ★ 加回结束 ====================
 
-    # 10) species.alias_map：用于统一物种命名（对 enrich_inputs 的 tag 生效）
-    alias_map = (cfg.get("species", {}) or {}).get("alias_map", {}) or {}
+    # ==================== ★ 新增：cafe_node_significant_clade_summary.tsv（补祖先节点） ====================
+    # 说明：
+    #   - 该表统计“所有节点”（祖先+叶），但只给 family 计数（不做祖先节点基因计数）
+    #   - 列自定义，不影响旧表头约束
+    node_summary_rows: List[List[object]] = []
+    node_summary_header = [
+        "model",
+        "node_id",
+        "taxon_label",
+        "is_leaf",
+        "species",
+        "n_expanded_fams",
+        "n_contracted_fams",
+    ]
 
-    # 11) 针对每个 tag 构建 up/down/background/meta（保持原有逻辑不变）
+    for model in models:
+        node_map = node_map_by_model.get(model, {}) or {}
+        for nid in sorted(node_map.keys()):
+            info = node_map[nid]
+            key_node = (model, nid)
+            n_up = len(expanded_fams_node.get(key_node, set()))
+            n_down = len(contracted_fams_node.get(key_node, set()))
+            node_summary_rows.append([
+                model,
+                nid,
+                info.taxon_label,
+                "TRUE" if info.is_leaf else "FALSE",
+                "" if info.species_name is None else info.species_name,
+                n_up,
+                n_down,
+            ])
+
+    node_summary_path = cafe_agg_dir / "cafe_node_significant_clade_summary.tsv"
+    write_tsv(node_summary_path, node_summary_header, node_summary_rows)
+    logging.info(
+        f"[OK] 写出 cafe_node_significant_clade_summary.tsv：{node_summary_path}（{len(node_summary_rows)} 行；含祖先+叶）"
+    )
+    # ==================== ★ 新增结束 ====================
+
+    # 10) 输出根目录（脚本控制）
+    enrich_out_root = cafe_agg_dir / "enrich_inputs"
+    node_out_root = enrich_out_root / "node"
+    mkdir_p(enrich_out_root)
+    mkdir_p(node_out_root)
+    logging.info(f"[out] leaf_enrich_root = {enrich_out_root}")
+    logging.info(f"[out] node_og_root     = {node_out_root}")
+
+    # 11) 叶节点富集发布包（所有叶物种）
     model = models[0]
     fam_all = fam_all_by_model.get(model, set())
     if not fam_all:
         logging.error(f"[ERR] model={model} 在 FDR 表中无 family 记录")
         sys.exit(2)
 
-    for tag, sp_list in species_sets_cfg.items():
-        # config 中 species_sets 的值是物种列表
-        if not isinstance(sp_list, list) or len(sp_list) == 0:
-            logging.warning(f"[WARN] tag={tag} 的 species_sets 不是非空列表，跳过")
-            continue
+    leaf_species = sorted(leaf_species_by_model.get(model, set()))
+    if not leaf_species:
+        logging.error(f"[ERR] model={model} 未解析到任何叶节点物种（Base_clade_results.txt）")
+        sys.exit(2)
 
-        sp_list_resolved: List[str] = []
-        for sp in sp_list:
-            sp_norm = alias_map.get(sp, sp)
-            sp_list_resolved.append(sp_norm)
+    for sp in leaf_species:
+        prefix = species_to_leaf_pkg_prefix(sp)
+        pkg_name = f"{prefix}_cafe"  # 叶节点富集包：S_constricta_cafe
+        pkg_dir = enrich_out_root / pkg_name
+        mkdir_p(pkg_dir)
 
-        logging.info(f"[tag={tag}] 物种集合：{sp_list_resolved}")
-
-        # 背景基因：所有 fam_all × species_set 的并集
         bg_genes: Set[str] = set()
         for fam in fam_all:
-            for sp in sp_list_resolved:
-                key = (fam, sp)
-                genes = member_map.get(key)
-                if genes:
-                    bg_genes.update(genes)
+            genes = member_map.get((fam, sp))
+            if genes:
+                bg_genes.update(genes)
 
-        # 扩张 / 收缩 family：根据 per-branch 状态表汇总
-        exp_fams_tag: Set[str] = set()
-        con_fams_tag: Set[str] = set()
-        for sp in sp_list_resolved:
-            key = (model, sp)
-            exp_fams_tag.update(expanded_fams.get(key, set()))
-            con_fams_tag.update(contracted_fams.get(key, set()))
+        key_leaf = (model, sp)
+        exp_fams = expanded_fams_leaf.get(key_leaf, set())
+        con_fams = contracted_fams_leaf.get(key_leaf, set())
 
-        # 扩张基因集合
         up_genes: Set[str] = set()
-        for fam in exp_fams_tag:
-            for sp in sp_list_resolved:
-                key = (fam, sp)
-                genes = member_map.get(key)
-                if genes:
-                    up_genes.update(genes)
+        for fam in exp_fams:
+            genes = member_map.get((fam, sp))
+            if genes:
+                up_genes.update(genes)
 
-        # 收缩基因集合
         down_genes: Set[str] = set()
-        for fam in con_fams_tag:
-            for sp in sp_list_resolved:
-                key = (fam, sp)
-                genes = member_map.get(key)
-                if genes:
-                    down_genes.update(genes)
+        for fam in con_fams:
+            genes = member_map.get((fam, sp))
+            if genes:
+                down_genes.update(genes)
 
-        logging.info(
-            f"[tag={tag}] 背景 OG={len(fam_all)}, 背景基因={len(bg_genes)}, "
-            f"扩张 OG={len(exp_fams_tag)}, 扩张基因={len(up_genes)}, "
-            f"收缩 OG={len(con_fams_tag)}, 收缩基因={len(down_genes)}"
-        )
+        write_list_plain(pkg_dir / "background.list", bg_genes)
+        write_list_plain(pkg_dir / "up.list", up_genes)
+        write_list_plain(pkg_dir / "down.list", down_genes)
 
-        tag_dir = enrich_out_root / tag
-        mkdir_p(tag_dir)
-
-        def write_list(path: Path, genes: Set[str]) -> None:
-            with path.open("w", encoding="utf-8") as f:
-                for g in sorted(genes):
-                    f.write(g + "\n")
-
-        write_list(tag_dir / "background.list", bg_genes)
-        write_list(tag_dir / "up.list", up_genes)
-        write_list(tag_dir / "down.list", down_genes)
-
-        # meta.tsv：按 vNext 约定
-        meta_path = tag_dir / "meta.tsv"
+        meta_path = pkg_dir / "meta.tsv"
         n_detectable = len(bg_genes)
         universe_size = n_detectable
         with meta_path.open("w", encoding="utf-8") as f:
             f.write("label\tn_detectable\tn_annot_mapped\tuniverse_size\tdetectable_rule\tsamples_used\n")
             f.write(
                 "\t".join([
-                    tag,
+                    pkg_name,
                     str(n_detectable),
                     "NA",
                     str(universe_size),
                     "CAFE_evaluable_gene_members_of_OGs_in_species_set",
-                    ";".join(sp_list_resolved),
+                    sp,
                 ]) + "\n"
             )
 
-        logging.info(f"[tag={tag}] 写出 up/down/background/meta 到：{tag_dir}")
+        logging.info(
+            f"[leaf_enrich:{sp}] bg_genes={len(bg_genes)} up_genes={len(up_genes)} down_genes={len(down_genes)} -> {pkg_dir}"
+        )
+
+    # 12) 全节点OG发布包（祖先+叶节点）
+    node_map = node_map_by_model.get(model, {})
+    if not node_map:
+        logging.error(f"[ERR] model={model} 未获取到 node_map")
+        sys.exit(2)
+
+    def node_pkg_name(info: NodeInfo) -> str:
+        if info.is_leaf and info.species_name:
+            prefix2 = species_to_leaf_pkg_prefix(info.species_name)
+            return f"{prefix2}_node_cafe"  # 叶节点OG包：S_constricta_node_cafe
+        return f"{info.node_id}node_cafe"  # 祖先节点OG包：40node_cafe
+
+    og_bg_header = ["model", "node_id", "taxon_label", "is_leaf", "species", "family"]
+    og_updown_header = ["model", "node_id", "taxon_label", "is_leaf", "species", "family", "Q_family", "p_branch_rule", "delta_rule"]
+    node_meta_header = ["model", "node_id", "taxon_label", "is_leaf", "species", "pkg_name", "n_bg_og", "n_up_og", "n_down_og"]
+
+    for nid in sorted(node_map.keys()):
+        info = node_map[nid]
+        pkg = node_pkg_name(info)
+        pkg_dir = node_out_root / pkg
+        mkdir_p(pkg_dir)
+
+        key_node = (model, nid)
+        up_ogs = expanded_fams_node.get(key_node, set())
+        down_ogs = contracted_fams_node.get(key_node, set())
+
+        bg_rows = []
+        for fam in sorted(fam_all):
+            bg_rows.append([
+                model,
+                nid,
+                info.taxon_label,
+                "TRUE" if info.is_leaf else "FALSE",
+                "" if info.species_name is None else info.species_name,
+                fam,
+            ])
+        write_tsv(pkg_dir / "og_background.tsv", og_bg_header, bg_rows)
+
+        up_rows = []
+        for fam in sorted(up_ogs):
+            q = fam2q.get((model, fam))
+            up_rows.append([
+                model,
+                nid,
+                info.taxon_label,
+                "TRUE" if info.is_leaf else "FALSE",
+                "" if info.species_name is None else info.species_name,
+                fam,
+                "" if q is None else f"{q:.6g}",
+                f"p_branch<= {branch_p_alpha} (or NA if no file)",
+                "delta>0 & delta!=0",
+            ])
+        write_tsv(pkg_dir / "og_up.tsv", og_updown_header, up_rows)
+
+        down_rows = []
+        for fam in sorted(down_ogs):
+            q = fam2q.get((model, fam))
+            down_rows.append([
+                model,
+                nid,
+                info.taxon_label,
+                "TRUE" if info.is_leaf else "FALSE",
+                "" if info.species_name is None else info.species_name,
+                fam,
+                "" if q is None else f"{q:.6g}",
+                f"p_branch<= {branch_p_alpha} (or NA if no file)",
+                "delta<0 & delta!=0",
+            ])
+        write_tsv(pkg_dir / "og_down.tsv", og_updown_header, down_rows)
+
+        meta_rows = [[
+            model,
+            nid,
+            info.taxon_label,
+            "TRUE" if info.is_leaf else "FALSE",
+            "" if info.species_name is None else info.species_name,
+            pkg,
+            len(fam_all),
+            len(up_ogs),
+            len(down_ogs),
+        ]]
+        write_tsv(pkg_dir / "meta.tsv", node_meta_header, meta_rows)
+
+        logging.info(
+            f"[node_og:{info.taxon_label}] bg_og={len(fam_all)} up_og={len(up_ogs)} down_og={len(down_ogs)} -> {pkg_dir}"
+        )
 
     logging.info("========== APhylo 13b — 完成 ==========")
 

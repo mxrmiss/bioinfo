@@ -555,6 +555,83 @@ def main():
     rows_genes: List[List[str]] = []
     rows_sites: List[List[str]] = []
 
+    # ========== 新增：为两张输出表补充 foreground_gene_ids（cds_id 列表） ==========
+    fg_gene_ids_map: Dict[Tuple[str, str], str] = {}
+
+    codeml_dir = Path(paths["codeml_dir"])
+    sets_dir = codeml_dir / "sets"
+    bt_dir = Path(paths["bt_dir"])
+    order_dir = bt_dir / "order"
+
+    fg_tips_cache: Dict[str, set] = {}
+    og_order_cache: Dict[str, List[Tuple[str, str]]] = {}
+
+    warn_missing_sets = False
+    warn_missing_order = False
+
+    def get_fg_tips(fg: str) -> set:
+        nonlocal warn_missing_sets
+        if fg in fg_tips_cache:
+            return fg_tips_cache[fg]
+        if not sets_dir.is_dir():
+            if not warn_missing_sets:
+                log.warning(f"[WARN] 缺少 sets 目录：{sets_dir}，foreground_gene_ids 将输出为空。")
+                warn_missing_sets = True
+            fg_tips_cache[fg] = set()
+            return fg_tips_cache[fg]
+        fp = sets_dir / f"{fg}.list"
+        if not fp.is_file():
+            log.warning(f"[WARN] 找不到前景 {fg} 的物种列表文件：{fp}，foreground_gene_ids 将输出为空。")
+            fg_tips_cache[fg] = set()
+            return fg_tips_cache[fg]
+        tips = [ln.strip() for ln in fp.read_text(encoding="utf-8").splitlines() if ln.strip()]
+        fg_tips_cache[fg] = set(tips)
+        return fg_tips_cache[fg]
+
+    def get_og_order_rows(og: str) -> List[Tuple[str, str]]:
+        nonlocal warn_missing_order
+        if og in og_order_cache:
+            return og_order_cache[og]
+        if not order_dir.is_dir():
+            if not warn_missing_order:
+                log.warning(f"[WARN] 缺少 order 目录：{order_dir}，foreground_gene_ids 将输出为空。")
+                warn_missing_order = True
+            og_order_cache[og] = []
+            return og_order_cache[og]
+        tsv = order_dir / f"{og}.order.tsv"
+        if not tsv.is_file():
+            log.warning(f"[WARN] 找不到 OG={og} 的 order.tsv：{tsv}，foreground_gene_ids 将输出为空。")
+            og_order_cache[og] = []
+            return og_order_cache[og]
+
+        rows: List[Tuple[str, str]] = []
+        for raw in tsv.read_text(encoding="utf-8").splitlines():
+            line = raw.strip()
+            if not line:
+                continue
+            parts = line.split("\t")
+            # 只在首列是“字面上的表头 OG”时跳过
+            if parts[0] == "OG":
+                continue
+            if len(parts) < 4:
+                continue
+            species = parts[1]
+            cds_id  = parts[3]
+            rows.append((species, cds_id))
+
+        og_order_cache[og] = rows
+        return og_order_cache[og]
+
+    def build_foreground_gene_ids(og: str, fg: str) -> str:
+        tips = get_fg_tips(fg)
+        if not tips:
+            return ""
+        rows = get_og_order_rows(og)
+        if not rows:
+            return ""
+        cds = sorted({cds_id for species, cds_id in rows if species in tips})
+        return ";".join(cds) if cds else ""
+
     # 遍历 OG / FG 组合，解析 lnL，计算 LRT / P
     for og_dir in sorted(raw_root.glob("OG*")):
         og = og_dir.name
@@ -577,18 +654,24 @@ def main():
             pval = chi2_mix_half_df1_sf(lrt)
             rows_genes.append([og, fg, f"{lrt:.6f}", f"{pval:.6g}"])
 
+            # 记录该 (OG, FG) 的前景 cds_id 列表（用于两张输出表新增列）
+            key = (og, fg)
+            if key not in fg_gene_ids_map:
+                fg_gene_ids_map[key] = build_foreground_gene_ids(og, fg)
+
             # 解析 BEB 位点（只保留 post ≥ 0.95）
             for site, aa, post in parse_beb_lines(alt_txt, cutoff=0.95):
                 rows_sites.append([og, fg, str(site), aa, f"{post:.3f}"])
 
     # 写基因层 PSG 表 + FDR
-    head_g = "OG\tforeground\tLRT\tP\tQ\n"
+    head_g = "OG\tforeground\tLRT\tP\tQ\tforeground_gene_ids\n"
     if rows_genes:
         pvals = [float(r[3]) for r in rows_genes]
         qvals = bh_fdr(pvals)
         lines_g = []
         for r, q in zip(rows_genes, qvals):
-            lines_g.append("\t".join([r[0], r[1], r[2], r[3], f"{q:.6g}"]))
+            fg_gene_ids = fg_gene_ids_map.get((r[0], r[1]), "")
+            lines_g.append("\t".join([r[0], r[1], r[2], r[3], f"{q:.6g}", fg_gene_ids]))
         (out_dir / "D_fdr_genes.tsv").write_text(head_g + "\n".join(lines_g) + "\n", encoding="utf-8")
 
         # 基于聚合结果构建 PSG cds 富集输入（可选，取决于 config.psg.enable）
@@ -597,10 +680,10 @@ def main():
         (out_dir / "D_fdr_genes.tsv").write_text(head_g, encoding="utf-8")
 
     # 写 BEB 位点表
-    head_s = "OG\tforeground\tsite\taa\tpost\n"
+    head_s = "OG\tforeground\tsite\taa\tpost\tforeground_gene_ids\n"
     if rows_sites:
         (out_dir / "D_beb_sites.tsv").write_text(
-            head_s + "\n".join("\t".join(x) for x in rows_sites) + "\n",
+            head_s + "\n".join("\t".join(x + [fg_gene_ids_map.get((x[0], x[1]), "")]) for x in rows_sites) + "\n",
             encoding="utf-8"
         )
     else:

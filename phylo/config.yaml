@@ -55,17 +55,17 @@ species_tree:
       alrt: 1000
       extra: "-bnni"
     min_align_len: 150
-    min_taxa_per_locus: 15
+    min_taxa_per_locus: 27
     top_n_partitions: 1000
 
 positive_selection:
   output_dir: "results/publish/aphylo_ready"
   species_subset:
-    - Sinonovacula_constricta
-    - Tegillarca_granosa
-    - Crassostrea_gigas
-    - Crassostrea_ariakensis
-    - Cyclina_sinensis
+    #- Sinonovacula_constricta
+    #- Tegillarca_granosa
+    #- Crassostrea_gigas
+    #- Crassostrea_ariakensis
+    #- Cyclina_sinensis
 
 binaries:
   python: python
@@ -75,6 +75,6 @@ binaries:
   iqtree: iqtree3
 
 publish:
-  include_ultrametric_tree: false
+  include_ultrametric_tree: true
   # 10脚本没有的前缀可以在下面设置
-  # db_prefix_allowlist: ["ab"]
+  db_prefix_allowlist: ["MAR"]

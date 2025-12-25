@@ -150,7 +150,7 @@ enrich:
   add_go_sig_tables: true
   output_sig_sorted: true
   write_universe_meta: true
-  use_pvalue_cutoff_1: false
+  use_pvalue_cutoff_1: false        # 是否不过滤p值进行富集
 
 # ------------------------------ 发布与装订（09 使用） ------------------------------
 publish:

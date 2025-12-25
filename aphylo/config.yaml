@@ -39,7 +39,7 @@ species:
 
 codon:
   threads: 30
-  min_taxa: 17
+  min_taxa: 27
   min_codon_len: 120
   max_gap_frac: 0.4
   stopcodon_action: "fail"   # fail | mask(NNN)
@@ -55,8 +55,8 @@ codeml:
   foreground_sets:
     - name: "Hugefoot"
       tips: ["Sinonovacula_constricta"]         # 强斧足
-    - name: "set_Hugefoot"
-      tips: ["Sinonovacula_constricta","Sinonovacula_rivularis","Novaculina_chinensis"]
+#   - name: "set_Hugefoot"
+#     tips: ["Sinonovacula_constricta","Sinonovacula_rivularis","Novaculina_chinensis"]
 
 psg:
   enable: true               # 打开 07 内置的 PSG cds 富集输入工厂
@@ -72,7 +72,7 @@ cafe5:
   max_autofix_rounds: 3                                # primary 阶段极端 OG 自动修正最多轮数
 
   two_stage_large:                                     # 第二阶段：large 家族（≥ copy_threshold）
-    enable: true                                       # true 启用；false 不跑 large
+    enable: false                                       # true 启用；false 不跑 large
     copy_threshold: 100                                # 任一物种计数 ≥ 此值划入 large
 
   error_model:                                         # 误差模型（-e）
@@ -104,12 +104,15 @@ cafe5:
 
   # ================== 新增：13c 节点外包配置 ==================
   node_bridge:
-    enable: true
+    enable: false
     outputs_dir: "results/07_cafeagg/enrich_inputs_nodes"
     # 一组“节点外包任务”：key 是 tag 名（会成为目录名），下面指定 node_id 和代表物种
     sets:
       bamboo_foot:
         node_id: 30
+        represent_species: "Sinonovacula_constricta"
+      s_r_foot:
+        node_id: 29
         represent_species: "Sinonovacula_constricta"
       # 以后想加别的节点，就照抄：
       # some_other_node:
