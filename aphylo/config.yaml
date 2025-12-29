@@ -42,7 +42,7 @@ codon:
   threads: 30
   min_taxa: 27
   min_codon_len: 120
-  max_gap_frac: 0.4
+  max_gap_frac: 0.5
   stopcodon_action: "fail"   # fail | mask(NNN)
 
 codeml:

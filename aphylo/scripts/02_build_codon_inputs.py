@@ -1,326 +1,414 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-02_build_codon_inputs.py —— 构建回译（codon）所需的输入文件（最终版）
+03_pal2nal_only.py —— 仅使用 PAL2NAL 生成 codon MSA（geneID 直接匹配版）
 
-核心职责（不做对齐，仅做“准备材料”）：
-  1) 读取发布包中的严格 SCO 蛋白质比对（AA-MSA），按“表头物种顺序”生成该 OG 的
-     CDS 输入（ordered_cds.fna），用于后续 03 步 pal2nal-like 回译；
-  2) 使用发布包中的 pep→cds 解析表（pep2cds_resolved.tsv），按 (OG, Species) 唯一映射到 cds_id；
-  3) 从固定的 CDS 仓库（inputs.cds_dir/*.fna）提取序列，严格一对一写入；
-  4) 生成对照表（order.tsv），便于后续审计与排错；
-  5) 屏幕与日志双写，可复查每一步；写入 .inputs.done 哨兵。
+核心约定（皇上当前版本）：
+  1) 蛋白 MSA（OGxxxx.raw.fa）的 FASTA header 为 geneID（与 CDS header 一致）
+  2) 每个 OG 的 CDS FASTA（OGxxxx.ordered_cds.fna）的 FASTA header 也为 geneID
+  3) 因此 PAL2NAL 使用 ID_MATCH：pep 与 nuc 通过相同 ID 自动配对（顺序无关）
 
-关键修复与加固：
-  - 【必修复】OG 解析：从文件名“^OG\\d+”提取（而非 Path.stem），彻底规避“.trim.faa”等双后缀误判；
-  - 映射口径与 10 发布脚本完全一致：严格按 (OG, Species) 取唯一记录；
-  - 全量清洗：统一 strip 空白、去 CR、物种按 alias_map 规范；
-  - 映射健全性：同一 (OG, Species) 多条/缺失都会明确报错，并给出 5 条示例；
-  - I/O 稳健：CDS FASTA 按物种仅索引一次（缓存），大幅减少磁盘开销。
+重要修复（皇上本次定位到的真实根因）：
+  - 部分基因ID存在同义写法差异（例如 gnl|WGS_XXXX| vs gnl|WGS:XXXX|）
+  - 本脚本会在喂给 PAL2NAL 前对 header 做一致化归一（最小且安全）：
+      将 '^gnl|WGS[_:]' 统一为 'gnl|WGS:'
+    这样 AA 与 CDS 即便原始写法不同，也能通过同一 ID 匹配。
 
-仅依赖：PyYAML（yaml）
+运行行为（皇上要求）：
+  - 每次运行都删除旧结果产物并重新生成，不做备份：
+      * out_codon_dir（results/03_codon/codon_msa）
+      * tmp_dir（results/03_codon/_tmp_pal2nal）
+      * og_log_dir（logs/03_pal2nal）
+      * sentinel（results/03_codon/.pal2nal.done）
+    总日志 total_log 覆盖写（不追加、不备份）。
+
+输出（按皇上“少屏幕输出”规格）：
+  - 屏幕仅打印：banner + 进度（每 50 OG）+ DONE 汇总
+  - 细节全部写入：total_log 与每 OG log
+
+依赖：
+  - perl
+  - pal2nal.pl（放在 aphylo/scripts/ 下）
 """
 
 from __future__ import annotations
-import sys, io, re, logging
+
+import io
+import re
+import sys
+import shutil
+import subprocess
 from pathlib import Path
-from typing import Dict, Any, List, Tuple, Iterable, Optional
-import yaml
+from typing import List, Tuple, Set
 
-DEFAULT_CONFIG = "config.yaml"
 
-# ====================== 基础工具：配置、日志、文件保障 ======================
+# =============================================================
+# 参数区（不从命令行读；皇上需要改就改这里）
+# =============================================================
+APHYLO_DIR = Path(__file__).resolve().parent.parent
 
-def _expand_publish_placeholders(obj, publish_dir: str):
-    """把对象中出现的 <publish_dir> 占位符替换为真路径。"""
-    if isinstance(obj, str):
-        return obj.replace("<publish_dir>", publish_dir)
-    if isinstance(obj, list):
-        return [_expand_publish_placeholders(x, publish_dir) for x in obj]
-    if isinstance(obj, dict):
-        return {k: _expand_publish_placeholders(v, publish_dir) for k, v in obj.items()}
-    return obj
+# 输入：蛋白对齐（geneID header）
+MSA_DIR = APHYLO_DIR.parent / "phylo" / "results" / "publish" / "aphylo_ready" / "strict_sco_msa"
+MSA_SUFFIX = ".raw.fa"
 
-def load_config(config_path: str = DEFAULT_CONFIG) -> Dict[str, Any]:
-    p = Path(config_path)
-    if not p.exists():
-        raise FileNotFoundError(f"[ERR] 未找到配置文件：{p}")
-    cfg = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
-    pub = cfg.get("publish_dir")
-    if pub:
-        cfg["inputs"] = _expand_publish_placeholders(cfg.get("inputs", {}), str(pub))
-    return cfg
+# 输入：每个 OG 的 CDS FASTA（geneID header）
+CDS_DIR = APHYLO_DIR / "results" / "02_bt" / "tmp"
+CDS_SUFFIX = ".ordered_cds.fna"
 
-def ensure_dir(p: Path) -> Path:
-    p.mkdir(parents=True, exist_ok=True); return p
+# 输出：codon MSA
+OUT_CODON_DIR = APHYLO_DIR / "results" / "03_codon" / "codon_msa"
 
-def need_dir(p: Path, what: str) -> Path:
-    p = Path(p)
-    if not p.is_dir():
-        raise FileNotFoundError(f"[ERR] 缺少目录：{what} -> {p}")
-    return p
+# 临时目录：写入“归一化后的 AA / 归一化且去末端 stop 的 CDS”
+TMP_DIR = APHYLO_DIR / "results" / "03_codon" / "_tmp_pal2nal"
 
-def need_file(p: Path, what: str) -> Path:
-    p = Path(p)
-    if not p.is_file():
-        raise FileNotFoundError(f"[ERR] 缺少文件：{what} -> {p}")
-    return p
+# 日志
+LOGS_DIR = APHYLO_DIR / "logs"
+TOTAL_LOG = LOGS_DIR / "03_pal2nal.log"
+OG_LOG_DIR = LOGS_DIR / "03_pal2nal"
 
-def get_logger(name: str, logfile: Path, level: int = logging.INFO) -> logging.Logger:
-    """日志写文件 + 同步屏幕；并保持 stdout/stderr 实时刷新。"""
-    ensure_dir(logfile.parent)
-    lg = logging.getLogger(name); lg.setLevel(level); lg.handlers.clear()
-    fmt = logging.Formatter("[%(asctime)s] %(levelname)s - %(message)s", "%Y-%m-%d %H:%M:%S")
-    fh = logging.FileHandler(logfile, encoding="utf-8"); fh.setFormatter(fmt); fh.setLevel(level)
-    sh = logging.StreamHandler(stream=sys.stdout);     sh.setFormatter(fmt); sh.setLevel(level)
-    lg.addHandler(fh); lg.addHandler(sh)
+# sentinel
+SENTINEL = APHYLO_DIR / "results" / "03_codon" / ".pal2nal.done"
 
+# pal2nal
+PAL2NAL_PL = APHYLO_DIR / "scripts" / "pal2nal.pl"
+PERL = "perl"
+
+# PAL2NAL 参数
+CODON_TABLE = 1
+OUTPUT_FMT = "fasta"
+USE_NOGAP = False
+USE_NOMISMATCH = False
+
+# 末端 stop 处理（只剪最后一个终止密码子，不做其它修剪）
+TRIM_TERMINAL_STOP = True
+
+# 每次运行删除旧产物（皇上要求）
+CLEAN_RUN = True
+
+# 屏幕输出频率
+PROGRESS_EVERY = 50
+
+
+# =============================================================
+# 工具函数
+# =============================================================
+def _flushify_std():
     class _Flush(io.TextIOBase):
         def __init__(self, s): self.s = s
-        def write(self, x): self.s.write(x); self.s.flush(); return len(x)
-    sys.stdout = _Flush(sys.stdout); sys.stderr = _Flush(sys.stderr)
-    return lg
+        def write(self, x):
+            self.s.write(x)
+            self.s.flush()
+            return len(x)
+    sys.stdout = _Flush(sys.stdout)
+    sys.stderr = _Flush(sys.stderr)
 
-def banner(logger: logging.Logger, text: str):
-    bar = "=" * max(10, len(text) + 2)
-    logger.info(bar); logger.info(f" {text} "); logger.info(bar)
 
-def write_done(path: Path):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    Path(path).touch()
+def ensure_dir(p: Path):
+    p.mkdir(parents=True, exist_ok=True)
 
-# ====================== 专用工具：FASTA/OG/物种名 ======================
 
-def og_id_from_filename(name: str) -> str:
+def rm_any(p: Path):
+    if not p.exists():
+        return
+    if p.is_dir():
+        shutil.rmtree(p)
+    else:
+        p.unlink()
+
+
+def list_ogs(msa_dir: Path, suffix: str) -> List[Tuple[str, Path]]:
+    files = sorted(msa_dir.glob(f"OG*{suffix}"))
+    pat = re.compile(r"^(OG\d+)")
+    out = []
+    for p in files:
+        m = pat.match(p.name)
+        if m:
+            out.append((m.group(1), p))
+    return out
+
+
+def normalize_id(s: str) -> str:
     """
-    从文件名中提取 OG 基础名（严格 ^OG\\d+），例如：
-      OG0006410.trim.faa -> OG0006410
-      OG0006410.faa      -> OG0006410
+    仅做最小且安全的归一化：
+      - 把 gnl|WGS_XXXX| 与 gnl|WGS:XXXX| 统一为 gnl|WGS:XXXX|
+    其他 ID 不动。
     """
-    m = re.match(r"^(OG\d+)", name)
-    if not m:
-        raise RuntimeError(f"[ERR] 无法从文件名解析 OG：{name}")
-    return m.group(1)
+    return re.sub(r"^gnl\|WGS[_:]", "gnl|WGS:", s)
 
-def read_fasta_headers(path: Path) -> List[str]:
-    """读取 FASTA 的表头（去掉 '>'），按出现顺序返回。"""
-    heads: List[str] = []
-    with open(path, "r", encoding="utf-8") as f:
-        for line in f:
-            if line.startswith(">"):
-                heads.append(line[1:].strip().replace("\r", ""))
-    return heads
 
-def fasta_index_by_id(path: Path) -> Dict[str, str]:
-    """
-    将给定 FASTA 文件构建为字典：{header_id -> seq}。
-    要求 header_id = '>' 后的整行（不含空白和描述），与发布包 cds_id 一致。
-    """
-    idx: Dict[str, str] = {}
-    name: Optional[str] = None
-    seq_parts: List[str] = []
-    with open(path, "r", encoding="utf-8") as f:
-        for raw in f:
-            line = raw.rstrip("\n").replace("\r", "")
-            if not line:
-                continue
-            if line.startswith(">"):
-                # 收尾上一个
-                if name is not None:
-                    idx[name] = "".join(seq_parts).upper()
-                name = line[1:].strip()
-                seq_parts = []
-            else:
-                seq_parts.append(line.strip())
-        if name is not None:
-            idx[name] = "".join(seq_parts).upper()
-    if not idx:
-        raise RuntimeError(f"[ERR] 空的 CDS FASTA：{path}")
-    return idx
-
-def canon_species(sp: str, alias_map: Dict[str, str]) -> str:
-    """按 alias_map 统一物种名；未命中则原样返回。"""
-    s = sp.strip().replace("\r", "")
-    return alias_map.get(s, s)
-
-# ====================== 读取发布包映射：pep2cds_resolved.tsv ======================
-
-def load_pep2cds_resolved(path: Path, alias_map: Dict[str, str]) -> Dict[Tuple[str, str], Tuple[str, str]]:
-    """
-    读取发布包的 pep2cds_resolved.tsv：
-      列：OG, Species, protein_id, cds_id
-    返回：{(OG, Species) -> (protein_id, cds_id)}；若同键多条则报错。
-    """
-    mp: Dict[Tuple[str, str], Tuple[str, str]] = {}
-    dups: List[Tuple[str, str, str, str]] = []
-
-    with open(path, "r", encoding="utf-8") as f:
-        header = f.readline()
-        cols = [c.strip().lower() for c in header.strip().split("\t")]
-        try:
-            i_og = cols.index("og")
-            i_sp = cols.index("species")
-            i_pid = cols.index("protein_id")
-            i_cds = cols.index("cds_id")
-        except ValueError:
-            raise RuntimeError(f"[ERR] {path} 缺少列（需含 OG/Species/protein_id/cds_id）")
-
-        for line in f:
-            if not line.strip():
-                continue
-            parts = [x.strip().replace("\r", "") for x in line.rstrip("\n").split("\t")]
-            if len(parts) < max(i_og, i_sp, i_pid, i_cds) + 1:
-                continue
-            og = parts[i_og]
-            sp = canon_species(parts[i_sp], alias_map)
-            pid = parts[i_pid]
-            cds = parts[i_cds]
-            key = (og, sp)
-            if key in mp and mp[key] != (pid, cds):
-                dups.append((og, sp, pid, cds))
-            else:
-                mp[key] = (pid, cds)
-
-    if dups:
-        ex = "\n".join(f"  - {a}\t{b}\t{c}\t{d}" for a,b,c,d in dups[:5])
-        raise RuntimeError(f"[ERR] pep2cds_resolved.tsv 存在同一 (OG,Species) 多条记录（应唯一）：\n{ex}\n... 共 {len(dups)} 条冲突")
-    if not mp:
-        raise RuntimeError(f"[ERR] pep2cds_resolved.tsv 读取为空：{path}")
-    return mp
-
-# ====================== 主流程 ======================
-
-def main():
-    cfg = load_config()
-    I, P = cfg["inputs"], cfg["paths"]
-    alias_map = (cfg.get("species", {}) or {}).get("alias_map", {}) or {}
-
-    logs_dir = Path(P["logs_dir"])
-    LOG_FILE = logs_dir / "02_build_codon_inputs.log"
-    log = get_logger("aphylo.02_build_codon_inputs", LOG_FILE)
-
-    banner(log, "APhylo 02 — 构建 codon 输入")
-
-    # 固定输入契约（零猜测）
-    msa_dir     = need_dir(Path(I["sco_msa_dir"]),       "严格 SCO 对齐目录")
-    msa_suffix  = I["sco_msa_suffix"]
-    colmask_ok  = bool(I.get("colmask_dir"))  # 本步不读取 colmask，仅提示
-    pep2cds_tsv = need_file(Path(I["pep2cds_map"]),      "pep→cds 解析表（发布生成）")
-    cds_root    = need_dir(Path(I["cds_dir"]),           "CDS 仓库根目录")
-    cds_suffix  = I.get("cds_suffix", ".fna")
-
-    bt_dir   = ensure_dir(Path(P["bt_dir"]))
-    tmp_dir  = ensure_dir(bt_dir / "tmp")
-    order_dir= ensure_dir(bt_dir / "order")
-
-    # 列举 OG MSA
-    og_msa_files: List[Path] = sorted(msa_dir.glob(f"OG*{msa_suffix}"))
-    if not og_msa_files:
-        raise RuntimeError(f"[ERR] 未在 {msa_dir} 找到任何 OG*{msa_suffix} 文件")
-
-    # 读取 pep2cds 解析（与 10 脚本口径一致）
-    map_og_sp_to_ids = load_pep2cds_resolved(pep2cds_tsv, alias_map)
-    log.info(f"映射条目数：{len(map_og_sp_to_ids)}（(OG,Species) → (protein_id, cds_id)）")
-    if colmask_ok:
-        log.info("检测到 colmask：后续 03 将按列掩码 ×3 同步回译。")
-
-    # 物种 → CDS fasta 路径缓存；物种 → (id→seq) 索引缓存
-    sp_to_cds_fa: Dict[str, Path] = {}
-    sp_to_index: Dict[str, Dict[str, str]] = {}
-
-    def cds_index_for(sp: str) -> Dict[str, str]:
-        """为给定物种建立/返回 CDS 索引。"""
-        sp_std = canon_species(sp, alias_map)
-        if sp_std in sp_to_index:
-            return sp_to_index[sp_std]
-        fa = sp_to_cds_fa.get(sp_std)
-        if fa is None:
-            fa = cds_root / f"{sp_std}{cds_suffix}"
-            need_file(fa, f"CDS FASTA 缺失（期望 {sp_std}{cds_suffix}）")
-            sp_to_cds_fa[sp_std] = fa
-        idx = fasta_index_by_id(fa)
-        sp_to_index[sp_std] = idx
-        return idx
-
-    # 处理每个 OG
-    n_ok = 0
-    bad_missing_map: List[str] = []
-    bad_missing_seq: List[str] = []
-
-    for msa_path in og_msa_files:
-        og = og_id_from_filename(msa_path.name)
-        heads = [canon_species(h, alias_map) for h in read_fasta_headers(msa_path)]
-        if not heads:
-            bad_missing_map.append(f"{og}\t(empty_alignment)")
+def read_fasta_records(path: Path) -> List[Tuple[str, str]]:
+    recs: List[Tuple[str, str]] = []
+    h = None
+    buf: List[str] = []
+    for line in path.read_text(encoding="utf-8", errors="ignore").splitlines():
+        line = line.strip()
+        if not line:
             continue
-
-        # 构建 (Species 顺序) → (protein_id, cds_id)
-        pair_list: List[Tuple[str, str, str]] = []  # (Species, protein_id, cds_id)
-        miss_this: List[str] = []
-        for sp in heads:
-            key = (og, sp)
-            ids = map_og_sp_to_ids.get(key)
-            if ids is None:
-                miss_this.append(sp)
-            else:
-                pid, cds = ids
-                pair_list.append((sp, pid, cds))
-
-        if miss_this:
-            # 明确报错并给出示例，便于快速修复
-            ex = ", ".join(miss_this[:5])
-            raise RuntimeError(
-                f"[ERR] pep2cds 缺映射 (OG={og})：缺少物种 {len(miss_this)} 个（示例：{ex}）。\n"
-                f"请检查发布包 pep2cds_resolved.tsv 是否包含对应 (OG,Species) 记录。"
-            )
-
-        # 拉取 CDS，并按 heads 顺序写入 ordered_cds.fna
-        out_fna = tmp_dir / f"{og}.ordered_cds.fna"
-        out_ord = order_dir / f"{og}.order.tsv"
-
-        n_written = 0
-        with open(out_fna, "w", encoding="utf-8") as w_fa, \
-             open(out_ord, "w", encoding="utf-8") as w_tab:
-            w_tab.write("OG\tSpecies\tprotein_id\tcds_id\n")
-            for sp, pid, cds_id in pair_list:
-                idx = cds_index_for(sp)
-                seq = idx.get(cds_id)
-                if seq is None:
-                    bad_missing_seq.append(f"{og}\t{sp}\t{cds_id}")
-                    # 不中断，先记账，最后统一报错（便于一次修齐）
-                    continue
-                w_fa.write(f">{cds_id}\n")
-                # 每 60 列换行（方便肉眼查看；后续脚本不依赖这个宽度）
-                for i in range(0, len(seq), 60):
-                    w_fa.write(seq[i:i+60] + "\n")
-                w_tab.write(f"{og}\t{sp}\t{pid}\t{cds_id}\n")
-                n_written += 1
-
-        if n_written != len(heads):
-            # 若有缺失的 CDS 序列，汇总后报错
-            pass
+        if line.startswith(">"):
+            if h is not None:
+                recs.append((h, "".join(buf)))
+            h = line[1:].strip().split()[0]
+            buf = []
         else:
-            n_ok += 1
+            buf.append(line)
+    if h is not None:
+        recs.append((h, "".join(buf)))
+    return recs
 
-    # 汇总与错误处理
-    if bad_missing_seq:
-        ex = "\n".join(bad_missing_seq[:5])
-        raise RuntimeError(
-            "[ERR] 在 CDS 仓库中找不到以下条目（示例最多 5 条）：\n"
-            "OG\tSpecies\tcds_id\n" + ex +
-            f"\n... 共 {len(bad_missing_seq)} 条缺失。"
-        )
 
-    write_done(bt_dir / ".inputs.done")
-    log.info(f"[DONE] 构建完成：OG={n_ok}/{len(og_msa_files)} 全部生成 ordered_cds.fna 与 order.tsv")
+def write_fasta_records(path: Path, recs: List[Tuple[str, str]]):
+    with path.open("w", encoding="utf-8") as w:
+        for h, seq in recs:
+            w.write(f">{h}\n")
+            s = "".join(seq.split()).strip()
+            for i in range(0, len(s), 80):
+                w.write(s[i:i+80] + "\n")
 
-# ====================== 入口 ======================
+
+def trim_terminal_stop_codon(nt: str) -> str:
+    s = "".join(nt.split()).upper().replace("U", "T")
+    if len(s) >= 3 and (len(s) % 3 == 0):
+        if s[-3:] in ("TAA", "TAG", "TGA"):
+            return s[:-3]
+    return s
+
+
+def tlog_write(fp, msg: str):
+    fp.write(msg + "\n")
+    fp.flush()
+
+
+def oglog_write(fp, msg: str):
+    fp.write(msg + "\n")
+    fp.flush()
+
+
+def screen(msg: str):
+    print(msg)
+
+
+def uniq_check(ids: List[str]) -> Tuple[bool, List[str]]:
+    """
+    检查是否存在重复 ID（归一化后可能出现合并冲突）
+    返回 (ok, duplicates)
+    """
+    seen = set()
+    dups = []
+    for x in ids:
+        if x in seen:
+            dups.append(x)
+        else:
+            seen.add(x)
+    return (len(dups) == 0, dups)
+
+
+# =============================================================
+# 主流程
+# =============================================================
+def main():
+    _flushify_std()
+    ensure_dir(LOGS_DIR)
+
+    if CLEAN_RUN:
+        rm_any(OUT_CODON_DIR)
+        rm_any(TMP_DIR)
+        rm_any(OG_LOG_DIR)
+        rm_any(SENTINEL)
+
+    ensure_dir(OUT_CODON_DIR)
+    ensure_dir(TMP_DIR)
+    ensure_dir(OG_LOG_DIR)
+    ensure_dir(SENTINEL.parent)
+
+    # 屏幕 banner（简短）
+    screen("========== 03 PAL2NAL ONLY ==========")
+    screen(f"msa_dir       = {MSA_DIR}")
+    screen(f"cds_dir       = {CDS_DIR}")
+    screen(f"out_codon_dir = {OUT_CODON_DIR}")
+    screen(f"total_log     = {TOTAL_LOG}")
+    screen(f"og_log_dir    = {OG_LOG_DIR}")
+
+    with TOTAL_LOG.open("w", encoding="utf-8") as TLOG:
+        # 总日志写更全，但不刷屏
+        tlog_write(TLOG, "========== 03 PAL2NAL ONLY ==========")
+        tlog_write(TLOG, f"script        = {Path(__file__).resolve()}")
+        tlog_write(TLOG, f"aphylo_dir     = {APHYLO_DIR}")
+        tlog_write(TLOG, f"msa_dir        = {MSA_DIR}")
+        tlog_write(TLOG, f"msa_suffix     = {MSA_SUFFIX}")
+        tlog_write(TLOG, f"cds_dir        = {CDS_DIR}")
+        tlog_write(TLOG, f"cds_suffix     = {CDS_SUFFIX}")
+        tlog_write(TLOG, f"out_codon_dir  = {OUT_CODON_DIR}")
+        tlog_write(TLOG, f"tmp_dir        = {TMP_DIR}")
+        tlog_write(TLOG, f"total_log      = {TOTAL_LOG}")
+        tlog_write(TLOG, f"og_log_dir     = {OG_LOG_DIR}")
+        tlog_write(TLOG, f"pal2nal.pl     = {PAL2NAL_PL}")
+        tlog_write(TLOG, f"perl           = {PERL}")
+        tlog_write(TLOG, f"codon_table    = {CODON_TABLE}")
+        tlog_write(TLOG, f"output_fmt     = {OUTPUT_FMT}")
+        tlog_write(TLOG, f"use_nogap      = {USE_NOGAP}")
+        tlog_write(TLOG, f"use_nomismatch = {USE_NOMISMATCH}")
+        tlog_write(TLOG, f"trim_terminal_stop = {TRIM_TERMINAL_STOP}")
+        tlog_write(TLOG, "=====================================")
+
+        if not MSA_DIR.is_dir():
+            raise FileNotFoundError(f"[ERR] msa_dir 不存在：{MSA_DIR}")
+        if not CDS_DIR.is_dir():
+            raise FileNotFoundError(f"[ERR] cds_dir 不存在：{CDS_DIR}")
+        if not PAL2NAL_PL.is_file():
+            raise FileNotFoundError(f"[ERR] pal2nal.pl 不存在：{PAL2NAL_PL}")
+
+        ogs = list_ogs(MSA_DIR, MSA_SUFFIX)
+        tlog_write(TLOG, f"total_ogs      = {len(ogs)}")
+        if not ogs:
+            raise RuntimeError("[ERR] 未发现任何 OG 蛋白对齐文件，请检查发布包与 msa_suffix")
+
+        ok = 0
+        fail = 0
+        skipped = 0
+
+        for idx, (og, msa_path) in enumerate(ogs, 1):
+            og_log = OG_LOG_DIR / f"pal2nal_{og}.log"
+            out_path = OUT_CODON_DIR / f"{og}.codon.fna"
+            cds_path = CDS_DIR / f"{og}{CDS_SUFFIX}"
+
+            # 每 OG 日志覆盖写（不刷屏）
+            with og_log.open("w", encoding="utf-8") as OLOG:
+                oglog_write(OLOG, f"[INFO] og={og}")
+                oglog_write(OLOG, f"[INFO] msa={msa_path}")
+                oglog_write(OLOG, f"[INFO] cds={cds_path}")
+                oglog_write(OLOG, f"[INFO] out={out_path}")
+
+                if not cds_path.is_file():
+                    oglog_write(OLOG, "[SKIP] 缺少 CDS 文件")
+                    skipped += 1
+                    continue
+
+                # 读 AA / CDS，做 header 归一化；CDS 同时做末端 stop 去除
+                try:
+                    aa_recs_raw = read_fasta_records(msa_path)
+                    cds_recs_raw = read_fasta_records(cds_path)
+                    if not aa_recs_raw:
+                        raise RuntimeError("AA MSA FASTA 为空或无 header")
+                    if not cds_recs_raw:
+                        raise RuntimeError("CDS FASTA 为空或无 header")
+
+                    aa_recs = []
+                    changed_aa = 0
+                    aa_ids_norm = []
+                    for h, seq in aa_recs_raw:
+                        hn = normalize_id(h)
+                        if hn != h:
+                            changed_aa += 1
+                        aa_recs.append((hn, seq))
+                        aa_ids_norm.append(hn)
+
+                    cds_recs = []
+                    changed_cds = 0
+                    cds_ids_norm = []
+                    for h, seq in cds_recs_raw:
+                        hn = normalize_id(h)
+                        if hn != h:
+                            changed_cds += 1
+                        nt = seq
+                        if TRIM_TERMINAL_STOP:
+                            nt = trim_terminal_stop_codon(nt)
+                        cds_recs.append((hn, nt))
+                        cds_ids_norm.append(hn)
+
+                    oglog_write(OLOG, f"[INFO] normalize_changed_aa={changed_aa} normalize_changed_cds={changed_cds}")
+
+                    ok1, dups1 = uniq_check(aa_ids_norm)
+                    ok2, dups2 = uniq_check(cds_ids_norm)
+                    if (not ok1) or (not ok2):
+                        oglog_write(OLOG, "[ERROR] 归一化后出现重复 ID（可能导致匹配歧义）")
+                        oglog_write(OLOG, f"[ERROR] aa_dups n={len(dups1)} sample={dups1[:10]}")
+                        oglog_write(OLOG, f"[ERROR] cds_dups n={len(dups2)} sample={dups2[:10]}")
+                        fail += 1
+                        continue
+
+                    set_aa: Set[str] = set(aa_ids_norm)
+                    set_cds: Set[str] = set(cds_ids_norm)
+                    miss_in_cds = sorted(set_aa - set_cds)
+                    extra_in_cds = sorted(set_cds - set_aa)
+                    if miss_in_cds or extra_in_cds:
+                        oglog_write(OLOG, "[ERROR] geneID 集合不一致（已做归一化）：PAL2NAL 将无法按 ID 匹配")
+                        oglog_write(OLOG, f"[ERROR] in_AA_not_in_CDS n={len(miss_in_cds)} sample={miss_in_cds[:10]}")
+                        oglog_write(OLOG, f"[ERROR] in_CDS_not_in_AA n={len(extra_in_cds)} sample={extra_in_cds[:10]}")
+                        fail += 1
+                        continue
+
+                    # 写临时文件（归一化后的 AA / CDS）
+                    aa_tmp = TMP_DIR / f"{og}.aa.norm.fa"
+                    cds_tmp = TMP_DIR / f"{og}.cds.clean.norm.fna"
+                    write_fasta_records(aa_tmp, aa_recs)
+                    write_fasta_records(cds_tmp, cds_recs)
+
+                except Exception as e:
+                    oglog_write(OLOG, f"[ERROR] 预处理失败：{e}")
+                    fail += 1
+                    continue
+
+                # PAL2NAL（ID_MATCH：不改 header，不重排）
+                cmd = [
+                    PERL, str(PAL2NAL_PL),
+                    str(aa_tmp),
+                    str(cds_tmp),
+                    "-output", OUTPUT_FMT,
+                    "-codontable", str(CODON_TABLE),
+                ]
+                if USE_NOGAP:
+                    cmd.append("-nogap")
+                if USE_NOMISMATCH:
+                    cmd.append("-nomismatch")
+
+                oglog_write(OLOG, f"[INFO] cmd={' '.join(cmd)}")
+
+                try:
+                    r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                except Exception as e:
+                    oglog_write(OLOG, f"[ERROR] 运行 pal2nal 失败：{e}")
+                    fail += 1
+                    continue
+
+                if r.stderr.strip():
+                    oglog_write(OLOG, "")
+                    oglog_write(OLOG, "[PAL2NAL STDERR]")
+                    oglog_write(OLOG, r.stderr.rstrip())
+
+                out_text = (r.stdout or "").strip()
+                if r.returncode != 0:
+                    oglog_write(OLOG, f"[ERROR] pal2nal returncode={r.returncode}")
+                    fail += 1
+                    continue
+                if not out_text.startswith(">"):
+                    oglog_write(OLOG, "[ERROR] pal2nal 输出不含任何 FASTA header，疑似空输出或被判不一致")
+                    fail += 1
+                    continue
+
+                out_path.write_text(r.stdout, encoding="utf-8")
+                ok += 1
+
+            if (idx % PROGRESS_EVERY == 0) or (idx == len(ogs)):
+                screen(f"[PROGRESS] {idx}/{len(ogs)} ok={ok} fail={fail} skipped={skipped}")
+                tlog_write(TLOG, f"[PROGRESS] {idx}/{len(ogs)} ok={ok} fail={fail} skipped={skipped}")
+
+        SENTINEL.touch()
+
+        screen(f"[DONE] ok={ok} fail={fail} skipped={skipped}")
+        screen(f"[DONE] sentinel={SENTINEL}")
+        screen(f"[DONE] total_log={TOTAL_LOG}")
+        screen(f"[DONE] og_log_dir={OG_LOG_DIR}")
+
+        tlog_write(TLOG, f"[DONE] ok={ok} fail={fail} skipped={skipped}")
+        tlog_write(TLOG, f"[DONE] sentinel={SENTINEL}")
+        tlog_write(TLOG, f"[DONE] total_log={TOTAL_LOG}")
+        tlog_write(TLOG, f"[DONE] og_log_dir={OG_LOG_DIR}")
+
 
 if __name__ == "__main__":
     try:
         main()
     except Exception as e:
-        # 同时写屏幕（已由 get_logger 重定向 stdout/stderr 为“实时刷新”）
         sys.stderr.write(str(e) + "\n")
         sys.exit(2)
 

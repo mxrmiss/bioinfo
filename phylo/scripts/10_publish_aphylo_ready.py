@@ -3,12 +3,11 @@
 """
 10_publish_aphylo_ready.py —— 发布到 aphylo 可直接消费的“五件套”，稳健严格版
 要点：
-  * 只接受 AA 位串掩码（长度=AA 列数），若存在但不合规则报错；不做任何“猜测或兼容”。
   * Newick 叶名稳健解析（忽略内部节点/支持值/分支长度，支持引号）。
   * SeqID 归一化：统一剥离 NCBI 数据库前缀（gb|/ref|/sp|/tr|/gnl|...），仅规范第一个 '|' 前 token 的 ':' 与 '_'。
   * 前缀白名单检测：pep2cds 与 CDS FASTA 出现未知数据库前缀时立即报错并给出示例。
   * pep2cds → 真实 FASTA 头：FASTA 索引同时使用“整行 header”与“首 token”两类键，并生成规范化/尾段候选，避免 410 类 miss。
-产物契约保持不变：strict_sco_msa/、colmask/、pep2cds_resolved.tsv、family.tsv、species_tree.nwk、清单与报告等。
+产物契约保持不变：strict_sco_msa/、pep2cds_resolved.tsv、family.tsv、species_tree.nwk、清单与报告等。
 """
 
 from __future__ import annotations
@@ -173,6 +172,57 @@ def normalize_of_msa_headers_to_species(of_msa: Path,
             f"      extra  ={extra[:5]}... ({len(extra)})"
         )
     return out
+
+
+def normalize_of_msa_headers_to_geneid(of_msa: Path,
+                                      alias_map: Dict[str,str],
+                                      leaves: Set[str]) -> "OrderedDict[str,str]":
+    """把 OrthoFinder 的原始 MSA（header 常为 Species|Gene/ProteinID）转换为：header=Gene/ProteinID。
+
+    设计目标：
+      - 让下游 PAL2NAL 可以用“真实蛋白 ID”去匹配 CDS（而不是物种名）；
+      - 同时仍然严格检验这是 strict-SCO：每个物种只能出现一次，且覆盖集合=物种树叶集合。
+
+    返回：
+      OrderedDict[gene_or_protein_id] = aligned_aa_seq
+    """
+    from collections import OrderedDict
+    recs = read_fasta_as_ordered_dict(of_msa)
+    if not recs:
+        raise RuntimeError(f"[ERR] OrthoFinder 原始 MSA 为空：{of_msa}")
+    out = OrderedDict()
+    seen_species: Set[str] = set()
+    for h, seq in recs.items():
+        tok = h.split()[0]
+        if "|" not in tok:
+            raise RuntimeError(f"[ERR] OrthoFinder 原始 MSA header 不含 '|'（无法解析 Species|ID）：{tok} —— {of_msa}")
+        sp_raw, gid = tok.split("|", 1)
+        sp = canon_species(sp_raw, alias_map)
+        if sp in seen_species:
+            raise RuntimeError(f"[ERR] strict-SCO 冲突：同一物种出现多条序列：{sp} —— {of_msa}")
+        seen_species.add(sp)
+
+        gid = _sanitize_id_contract(gid.strip())
+        if not gid:
+            raise RuntimeError(f"[ERR] Gene/ProteinID 为空：{tok} —— {of_msa}")
+        if gid in out:
+            raise RuntimeError(f"[ERR] Gene/ProteinID 重复：{gid} —— {of_msa}")
+        out[gid] = seq
+
+    # 等长性检查
+    Ls = {len(s) for s in out.values()}
+    if len(Ls) != 1:
+        raise RuntimeError(f"[ERR] OrthoFinder 原始 MSA 非等长对齐：{of_msa}")
+    if leaves and set(seen_species) != set(leaves):
+        miss = sorted(set(leaves) - set(seen_species))
+        extra = sorted(set(seen_species) - set(leaves))
+        raise RuntimeError(
+            f"[ERR] OrthoFinder 原始 MSA 物种覆盖与物种树不一致：{of_msa}\n"
+            f"      missing={miss[:5]}... ({len(miss)})\n"
+            f"      extra  ={extra[:5]}... ({len(extra)})"
+        )
+    return out
+
 
 def find_of_raw_msa_file(msa_dir: Path, ogid: str) -> Path:
     """在 OrthoFinder 的 MultipleSequenceAlignments 目录中定位 OG 的原始 AA MSA 文件（稳健查找）。"""
@@ -511,29 +561,6 @@ class FastaIndex:
                 return full
         return None
 
-# ---------- 掩码：只接受 AA 位串 ----------
-def _aa_length_from_faa(path: Path) -> int:
-    L, began = 0, False
-    with open(path, "r", encoding="utf-8", errors="ignore") as f:
-        for line in f:
-            if line.startswith(">"):
-                if began: break
-                began = True; continue
-            if began:
-                L += len(line.strip().replace(" ", "").replace("\t", ""))
-    return L
-
-def _read_mask_bits_strict(path: Path) -> str:
-    s = Path(path).read_text(encoding="utf-8", errors="ignore").strip()
-    bits = "".join(ch for ch in s if ch in "01")
-    if not bits:
-        raise RuntimeError(f"[ERR] 掩码文件不包含 0/1 位串：{path}")
-    if re.search(r"[^01\s]", s):
-        # 出现除 0/1 以外的可见字符，视为非位串
-        raise RuntimeError(f"[ERR] 掩码文件含非 0/1 字符：{path}")
-    return bits
-
-# ------------------ 主流程 ------------------
 def main():
     cfg = load_cfg()
     P = cfg.get("paths", {}) or {}
@@ -544,7 +571,6 @@ def main():
     pub = Path(P["publish_dir"]).resolve()
     reports_dir = Path(P["reports_dir"])
     species_only_dir = Path(P["species_collapse_dir"])
-    colmask_dir = Path(P.get("colmask_dir", "results/colmask"))  # 可无；存在则严格校验
     trees_dir = Path(P.get("trees_dir", "results/trees"))
     of_root = Path(P["orthofinder_results_dir"])
 
@@ -618,11 +644,11 @@ def main():
     for src in kept_files:
         shutil.copy2(src, sco_dir / src.name)
 
-    # ---------- A2) 发布 OrthoFinder 原始 AA MSA（同目录；header 归一为物种名） ----------
+    # ---------- A2) 发布 OrthoFinder 原始 AA MSA（同目录；header 归一为 Gene/ProteinID） ----------
     # 说明：
-    #   - downstream 的 aphylo 03 会使用 “raw AA + raw→trim colmask” 来回译 codon；
-    #   - 为了让 raw 与 trim 的 header 均为物种名，这里将 OrthoFinder 原始 header（常为 Species|Gene）
-    #     在发布时统一转换为规范物种名（canon_species + alias_map），并写入 strict_sco_msa/。
+    #   - downstream 的 aphylo 03b 会使用 “raw AA（Gene/ProteinID header）+ CDS” 来回译 codon；
+    #   - 为了让 raw AA 的 header 与 CDS 的 header 能 1:1 对应，这里将 OrthoFinder 原始 header（常为 Species|Gene）
+    #     在发布时统一转换为 Gene/ProteinID（即 '|' 右侧部分），并写入 strict_sco_msa/。
     #   - 产物命名固定为：OGxxxx{DEFAULT_RAW_MSA_SUFFIX}（默认 .raw.fa）
     of_msa_dir = of_results_dir / "MultipleSequenceAlignments"
     need_dir(of_msa_dir, "OrthoFinder MultipleSequenceAlignments 缺失")
@@ -631,39 +657,10 @@ def main():
     raw_published = 0
     for ogid in kept_ogs:
         of_raw = find_of_raw_msa_file(of_msa_dir, ogid)
-        raw_norm = normalize_of_msa_headers_to_species(of_raw, alias_map, leaves)
+        raw_norm = normalize_of_msa_headers_to_geneid(of_raw, alias_map, leaves)
         out_raw = sco_dir / f"{ogid}{raw_suffix}"
         write_fasta_ordered_dict(out_raw, raw_norm, linewrap=60)
         raw_published += 1
-
-
-    # ---------- B) colmask（可无；若存在必须是 AA 位串且长度=AA） ----------
-    pub_colmask = pub / "colmask"; pub_colmask.mkdir(parents=True, exist_ok=True)
-    mask_checked = 0
-    if colmask_dir.is_dir():
-        for ogid in kept_ogs:
-            aa_path = sco_dir / f"{ogid}.trim.faa"
-            mask_src = colmask_dir / f"{ogid}.colmask"
-            if not mask_src.is_file():
-                continue
-            # 新掩码契约：
-            #   - colmask 长度 = raw AA 列数（Lraw）
-            #   - colmask 中 '1' 的数量 = trim AA 列数（Ltrim）
-            aa_trim_path = aa_path
-            aa_raw_path = sco_dir / f"{ogid}{raw_suffix}"
-            if not aa_raw_path.is_file():
-                raise RuntimeError(f"[ERR] 发布包缺少 raw AA MSA：{aa_raw_path}；请检查 10 步 A2 是否成功发布 OrthoFinder 原始对齐")
-
-            Ltrim = _aa_length_from_faa(aa_trim_path)
-            Lraw  = _aa_length_from_faa(aa_raw_path)
-            bits = _read_mask_bits_strict(mask_src)
-            if len(bits) != Lraw:
-                raise RuntimeError(f"[ERR] 掩码长度 != raw AA 列数：{mask_src}（mask={len(bits)} vs raw_AA={Lraw}）")
-            ones = bits.count('1')
-            if ones != Ltrim:
-                raise RuntimeError(f"[ERR] 掩码中 '1' 的数量 != trim AA 列数：{mask_src}（ones={ones} vs trim_AA={Ltrim}）")
-            shutil.copy2(mask_src, pub_colmask / mask_src.name)
-            mask_checked += 1
 
     # ---------- C) 复制其它固定件 ----------
     shutil.copy2(ogs_selected,  pub / "ogs_selected.list")
@@ -807,7 +804,6 @@ def main():
         "filelist": str(pub / "sco_filelist.txt"),
         "ogs_selected_published": str(pub / "ogs_selected.published.list"),
         "sco_filelist_published": str(pub / "sco_filelist.published.txt"),
-        "has_colmask": (pub / "colmask").is_dir(),
         "has_matrix": (pub / "matrix.tsv").is_file(),
         "has_og_species_protein": (pub / "og_species_protein.tsv").is_file(),
         "pep2cds_resolved": str(out_resolved),
@@ -820,7 +816,6 @@ def main():
         "cds_suffix": cds_suffix,
         "strict_normalize_cds": STRICT_NORMALIZE_CDS,
         "db_prefix_allowlist": sorted(list(ALLOWED_DB_PREFIXES | allow_extra)),
-        "colmask_checked": mask_checked
     }
     with open(pub / "manifest.json", "w", encoding="utf-8") as f:
         json.dump(manifest, f, ensure_ascii=False, indent=2)
@@ -833,7 +828,6 @@ def main():
         f.write(f"[INFO] sco_filelist.txt 是否存在：{(pub / 'sco_filelist.txt').is_file()}\n")
         f.write(f"[INFO] pep2cds_resolved.tsv 行数：{n_out}\n")
         f.write(f"[INFO] all_pep2cds_resolved.tsv 行数：{n_all_out}\n")
-        f.write(f"[INFO] colmask（AA 位串）严格校验通过：{mask_checked} 个\n")
         if excluded:
             f.write(f"[WARN] 剔除 OG 数量：{len(excluded)}（详见 excluded_reason.tsv）\n")
         if n_unres > 0:
@@ -848,13 +842,11 @@ def main():
     # 哨兵
     (pub / '.done').touch()
     (pub / 'strict_sco_msa' / '.done').touch()
-    (pub / 'colmask' / '.done').touch()
 
     print(f"[DONE] 发布完成：{pub}")
     print(f"[STAT] strict_sco_msa: {len(kept_files)}；pep2cds_resolved: {n_out}；unresolved: {n_unres}；all_pep2cds_resolved: {n_all_out}")
     if excluded:
         print(f"[STAT] 剔除 OG: {len(excluded)} —— {pub/'excluded_reason.tsv'}")
-    print(f"[STAT] colmask（AA 位串）严格校验通过：{mask_checked}")
 
 if __name__ == "__main__":
     main()

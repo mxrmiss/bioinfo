@@ -5,3 +5,6 @@ perl -0777 -pe 's{\b[bB]\(\s*([0-9]+(?:\.[0-9]+)?)\s*,\s*([0-9]+(?:\.[0-9]+)?)\s
 
 # 蛋白质id列表匹配蛋白质文件，得到交集行集合文件
 seqkit grep -n -f tmp.list Sinonovacula_constricta.faa | seqkit seq -w 0 > protmp.txt
+
+# TSV 专用，保留 B 表头，按 A 第2列匹配 B 第3列，输出 B 的整行
+awk -F'\t' 'NR==FNR{k[$2]=1; next} FNR==1{print; next} ($3 in k)' A.tsv B.tsv

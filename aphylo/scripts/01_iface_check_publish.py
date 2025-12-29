@@ -198,13 +198,6 @@ def main():
     else:
         log.warning("[WARN] 未提供 inputs.ultrametric_tree；按方案A由 MCMCTree 产出，本步骤忽略。")
         ultrametric_tree = None
-    
-    use_colmask = bool(inputs.get("colmask_dir", ""))
-    if use_colmask:
-        colmask_dir    = need_dir(Path(inputs["colmask_dir"]), "列掩码目录")
-        colmask_suffix = inputs.get("colmask_suffix", ".colmask")
-    else:
-        colmask_dir = None; colmask_suffix = ""
 
     # —— 解析物种树的“叶集合”（修复点）——
     nwk_text = Path(species_tree).read_text(encoding="utf-8")
@@ -212,7 +205,7 @@ def main():
     if not leaves:
         raise ValueError("[ERR] 未能从物种树解析到叶节点标签，请检查 species_tree.nwk")
 
-    # —— 遍历 OG 并体检 —— 
+    # —— 遍历 OG 并体检 ——
     ogs = list_ogs(sco_msa_dir, sco_msa_suffix)
     if not ogs:
         raise RuntimeError("[ERR] 未发现 OG 文件，请检查发布包与后缀设定")
@@ -247,10 +240,6 @@ def main():
         w.write(f"species_tree\t{species_tree}\n")
         w.write(f"ultrametric_tree\t{ultrametric_tree if ultrametric_tree else ''}\n")
         w.write(f"family_tsv\t{family_tsv}\n")
-        w.write(f"use_colmask\t{use_colmask}\n")
-        if use_colmask:
-            w.write(f"colmask_dir\t{colmask_dir}\n")
-            w.write(f"colmask_suffix\t{colmask_suffix}\n")
         w.write(f"n_og\t{len(ogs)}\n")
         w.write(f"n_leaves\t{len(leaves)}\n")
 

@@ -30,6 +30,12 @@
   7) 软通过：
        - 若退出码 != 0 但 mlc.txt 已出现 lnL(ntime: …)，记为 SOFT_OK，不阻断流程
 
+新增（本次修复点）：
+  8) 在 06 内部完成“geneID → species”重命名（只作用于 alt/null 的 seq.codon.fna 副本）：
+       - 使用 config.yaml 的 inputs.pep2cds_map（pep2cds_resolved.tsv）
+       - 对每个 OG：把 codon MSA 的 header 从 geneID 改成物种名，以匹配 FG 树 tip
+       - 只写副本，不修改 results/03_codon/codon_msa 的源文件
+
 固定接口与路径（与 aphylo 其余脚本保持一致）：
   输入：
     results/03_qc/keep_og.list
@@ -44,13 +50,14 @@
 可由 config.yaml 覆盖的键（若不存在则使用默认值）：
   binaries.codeml         # 默认 "codeml"
   codeml.threads          # 默认 1（推荐按机器核数设置）
+  inputs.pep2cds_map      # 必须：geneID ↔ species 映射表（pep2cds_resolved.tsv）
 """
 
 from __future__ import annotations
 import os, re, io, sys, shutil, hashlib, datetime, subprocess
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Dict, List, Tuple, Any
+from typing import Dict, List, Tuple, Any, Iterable
 
 # ================= 固定路径（与 aphylo 约定一致） =================
 PROJECT_ROOT = Path(".").resolve()
@@ -210,11 +217,10 @@ _TOK_TIP = re.compile(r'(?<=\(|,)\s*([^()\s:,;]+)\s*(?=[:),;])')
 def sanitize_foreground_tree(raw_text: str) -> str:
     """最小树消毒：去方括号注释、内部标签，压缩空白，补分号"""
     s = raw_text.strip()
-    s = re.sub(r'\[.*?\]', '', s)                         # 去方括号注释
-    s = re.sub(r'(\))\s*[^():,;\s]+\s*(?=[:),;])', r'\1', s)  # 去内部标签
-    s = re.sub(r'\s+', ' ', s).strip()                    # 压缩空白
+    s = re.sub(r'\[.*?\]', '', s)
+    s = re.sub(r'(\))\s*[^():,;\s]+\s*(?=[:),;])', r'\1', s)
+    s = re.sub(r'\s+', ' ', s).strip()
     if not s.endswith(';'): s += ';'
-    # 括号数基本检查（不自动修复）
     if s.count('(') != s.count(')'):
         raise ValueError("物种树括号不匹配，无法用于 codeml")
     return s
@@ -225,13 +231,43 @@ def parse_tips(nwk_text: str) -> List[str]:
 def strip_mark(name: str) -> str:
     return name.replace("#1","")
 
-def fasta_species_list(fa: Path) -> List[str]:
+def fasta_headers(fa: Path) -> List[str]:
     out=[]
     with open(fa,"r",encoding="utf-8",errors="ignore") as f:
         for line in f:
             if line.startswith(">"):
-                out.append(line[1:].strip())
+                out.append(line[1:].strip().split()[0])
     return out
+
+def normalize_key(x: str) -> str:
+    x = (x or "").strip()
+    if not x: return ""
+    x = x.split()[0]
+    return x.split("|")[-1]
+
+def iter_fasta_records(path: Path) -> Iterable[Tuple[str, str]]:
+    h=None; s=[]
+    with open(path, "r", encoding="utf-8", errors="ignore") as f:
+        for line in f:
+            line=line.strip()
+            if not line:
+                continue
+            if line.startswith(">"):
+                if h is not None:
+                    yield h, "".join(s)
+                h=line[1:].strip().split()[0]
+                s=[]
+            else:
+                s.append(line)
+    if h is not None:
+        yield h, "".join(s)
+
+def write_fasta_records(path: Path, recs: Iterable[Tuple[str,str]]):
+    with open(path, "w", encoding="utf-8") as w:
+        for h, s in recs:
+            w.write(f">{h}\n")
+            for i in range(0, len(s), 80):
+                w.write(s[i:i+80] + "\n")
 
 # ======== 副本规范化（仅作用于 alt/null 目录内的 seq.codon.fna 副本） ========
 def normalize_fasta_inplace(fa: Path, log_path: Path):
@@ -251,9 +287,93 @@ def normalize_fasta_inplace(fa: Path, log_path: Path):
     with open(fa,"w",encoding="utf-8") as f:
         for ln in lines: f.write(ln)
         if not lines or not lines[-1].endswith("\n"): f.write("\n")
-    # 记录规范化统计
     with open(log_path, "a", encoding="utf-8") as lf:
         lf.write(f"[{ts()}] [NORM] dot_to_dash={dot2dash} lower_to_upper={lower2upper} U_to_T={utoT}\n")
+
+# ======== geneID → species 映射表读取 ========
+def load_pep2cds_map(map_path: Path) -> Dict[str, Dict[str, str]]:
+    """
+    读取 pep2cds_resolved.tsv，生成：
+      og2gid2sp[OG][geneID_key] = Species_name
+    其中 geneID_key 采用 normalize_key（取最后一个 '|' 后的 token）。
+    """
+    if not map_path.exists():
+        raise FileNotFoundError(f"缺少映射表 inputs.pep2cds_map：{map_path}")
+
+    txt = map_path.read_text(encoding="utf-8", errors="ignore").splitlines()
+    if not txt:
+        raise ValueError(f"映射表为空：{map_path}")
+
+    header = txt[0].rstrip("\n").split("\t")
+    cols = {h.strip().lower(): i for i, h in enumerate(header)}
+
+    def find_col(candidates: List[str]) -> int:
+        for c in candidates:
+            if c in cols:
+                return cols[c]
+        for k, i in cols.items():
+            for c in candidates:
+                if c in k:
+                    return i
+        return -1
+
+    i_og = find_col(["og", "orthogroup"])
+    i_sp = find_col(["species", "sp"])
+    i_pep = find_col(["protein_id", "pep_id", "peptide_id", "protein", "pep", "prot", "peptide"])
+
+    if i_og < 0 or i_sp < 0 or i_pep < 0:
+        raise ValueError(
+            "pep2cds_map 表头无法识别所需列。需要至少包含：OG / species / protein(or pep) 列。"
+        )
+
+    og2gid2sp: Dict[str, Dict[str, str]] = {}
+    for line in txt[1:]:
+        if not line.strip():
+            continue
+        parts = line.split("\t")
+        if len(parts) <= max(i_og, i_sp, i_pep):
+            continue
+        og = parts[i_og].strip()
+        sp = parts[i_sp].strip()
+        pep = parts[i_pep].strip()
+        if not og or not sp or not pep:
+            continue
+        gid = normalize_key(pep)
+        if not gid:
+            continue
+        og2gid2sp.setdefault(og, {})[gid] = sp
+
+    if not og2gid2sp:
+        raise ValueError(f"映射表解析后无有效记录：{map_path}")
+
+    return og2gid2sp
+
+def rewrite_codon_headers_geneid_to_species(seq_src: Path, dst: Path, gid2sp: Dict[str, str], og: str):
+    """
+    将 seq_src（header=geneID）改写为 dst（header=species），不修改序列本体。
+    """
+    src_heads = [normalize_key(h) for h in fasta_headers(seq_src)]
+    src_set = set(src_heads)
+
+    map_keys = set(gid2sp.keys())
+    miss = sorted(src_set - map_keys)
+    if miss:
+        raise ValueError(f"{og} 映射表缺少 geneID：n={len(miss)} sample={miss[:5]}")
+
+    # 防止一个物种被写两次（严格 SCO 理论上不会发生，但这里防御）
+    sp_seen = {}
+    out_recs = []
+    for h, s in iter_fasta_records(seq_src):
+        gid = normalize_key(h)
+        sp = gid2sp.get(gid, "")
+        if not sp:
+            raise ValueError(f"{og} geneID 无法映射到 species：{gid}")
+        if sp in sp_seen:
+            raise ValueError(f"{og} 同一物种出现多个序列：{sp} ({sp_seen[sp]} vs {gid})")
+        sp_seen[sp] = gid
+        out_recs.append((sp, s))
+
+    write_fasta_records(dst, out_recs)
 
 # ======== 路径拼装 ========
 def unit_paths(og: str, fg: str) -> Dict[str, Path]:
@@ -277,7 +397,7 @@ def unit_paths(og: str, fg: str) -> Dict[str, Path]:
     return paths
 
 # ======== 复制 + 消毒/规范化（仅对副本操作） ========
-def refresh_inputs(og: str, fg: str, clean_tree: str) -> Tuple[Path, Path]:
+def refresh_inputs(og: str, fg: str, clean_tree: str, gid2sp: Dict[str, str]) -> Tuple[Path, Path]:
     """将源输入拷贝到 alt/null，并对副本进行规范化；返回 (seq_src, tree_src)"""
     seq_src  = SEQ_DIR / f"{og}.codon.fna"
     tree_src = SETS_DIR / f"{fg}.nwk"
@@ -290,9 +410,9 @@ def refresh_inputs(og: str, fg: str, clean_tree: str) -> Tuple[Path, Path]:
     paths["alt_tree"].write_text(clean_tree, encoding="utf-8")
     paths["nul_tree"].write_text(clean_tree, encoding="utf-8")
 
-    # 拷贝序列副本
-    shutil.copy2(seq_src, paths["alt_seq"])
-    shutil.copy2(seq_src, paths["nul_seq"])
+    # 生成序列副本：geneID → species（只写到 alt/null）
+    rewrite_codon_headers_geneid_to_species(seq_src, paths["alt_seq"], gid2sp, og)
+    rewrite_codon_headers_geneid_to_species(seq_src, paths["nul_seq"], gid2sp, og)
 
     # 对副本做规范化，并在各自日志中记录统计
     ensure_dir(paths["alt_log"].parent); ensure_dir(paths["nul_log"].parent)
@@ -320,6 +440,8 @@ def need_recalc(dirpath: Path, mlc: Path, is_alt: bool, seq_src: Path, tree_src:
     return False, "reuse"
 
 # ======== 单个 ALT/NULL 子任务 ========
+OG2GID2SP: Dict[str, Dict[str, str]] = {}
+
 def run_one(og: str, fg: str, mode: str, codeml_bin: str) -> Tuple[str, str, str]:
     """
     mode: "alt" or "null"
@@ -332,37 +454,44 @@ def run_one(og: str, fg: str, mode: str, codeml_bin: str) -> Tuple[str, str, str
     mlc_path = paths["alt_mlc"] if mode=="alt" else paths["nul_mlc"]
     log_path = paths["alt_log"] if mode=="alt" else paths["nul_log"]
 
-    # 加锁（避免并发重复）
     if not acquire_lock(work_dir):
         return og, fg, f"FAIL:{mode}_locked"
 
     try:
-        # 读取并消毒树（只读一次；副本写两份）
         tree_src = SETS_DIR / f"{fg}.nwk"
         if not tree_src.exists(): return og, fg, f"FAIL:missing_tree({tree_src})"
         raw_tree = tree_src.read_text(encoding="utf-8")
         clean_tree = sanitize_foreground_tree(raw_tree)
 
-        # 集合一致性（忽略 #1）
+        tree_tips = set(strip_mark(x) for x in parse_tips(clean_tree))
+        if not tree_tips:
+            return og, fg, "FAIL:empty_tree_tips"
+
         seq_src = SEQ_DIR / f"{og}.codon.fna"
         if not seq_src.exists(): return og, fg, f"FAIL:missing_seq({seq_src})"
-        fa_species = set(fasta_species_list(seq_src))
-        tree_tips  = set(strip_mark(x) for x in parse_tips(clean_tree))
+
+        gid2sp = OG2GID2SP.get(og)
+        if not gid2sp:
+            return og, fg, "FAIL:missing_gid2sp_map_for_og"
+
+        # 用映射表得到该 OG 的物种集合，并与树 tip 集合一致性校验
+        fa_geneids = set(normalize_key(h) for h in fasta_headers(seq_src))
+        miss_gid = sorted(fa_geneids - set(gid2sp.keys()))
+        if miss_gid:
+            return og, fg, f"FAIL:map_missing_geneid(n={len(miss_gid)} sample={miss_gid[:5]})"
+
+        fa_species = set(gid2sp[gid] for gid in fa_geneids if gid in gid2sp)
         if fa_species != tree_tips:
             only_fa = sorted(fa_species - tree_tips)
             only_tr = sorted(tree_tips - fa_species)
             return og, fg, f"FAIL:set_mismatch(FA_ONLY={only_fa},TREE_ONLY={only_tr})"
 
-        # 判定是否需要重算
         recalc, why = need_recalc(work_dir, mlc_path, mode=="alt", seq_src, tree_src)
 
         if recalc:
             clean_dir(work_dir)
-            # 刷新 alt/null 两侧输入与 ctl（以便指纹对齐）
-            _seq_src, _tree_src = refresh_inputs(og, fg, clean_tree)
-            # 跑 codeml
+            _seq_src, _tree_src = refresh_inputs(og, fg, clean_tree, gid2sp)
             rc = run_streaming([codeml_bin, ctl_name], work_dir, log_path, f"{og}|{fg}|{mode.upper()}")
-            # 写入指纹（来源是“源输入”而非副本）
             write_fingerprint(work_dir, _seq_src, _tree_src)
             if rc != 0 and mlc_has_lnl(mlc_path):
                 return og, fg, "SOFT_OK"
@@ -414,6 +543,16 @@ def main()->int:
         print(f"[ERR] 未找到可执行文件：{codeml_bin}")
         return 2
 
+    # 读取映射表（必须）
+    inputs = cfg.get("inputs") or {}
+    pep2cds_map = inputs.get("pep2cds_map", "")
+    if not pep2cds_map:
+        print("[ERR] config.yaml 缺少 inputs.pep2cds_map（pep2cds_resolved.tsv）")
+        return 3
+    map_path = Path(str(pep2cds_map)).expanduser()
+    global OG2GID2SP
+    OG2GID2SP = load_pep2cds_map(map_path)
+
     keep_list = QC_DIR / "keep_og.list"
     if not keep_list.exists():
         print(f"[ERR] 缺少 OG 列表：{keep_list}")
@@ -425,6 +564,12 @@ def main()->int:
     fgs = sorted([p.stem for p in SETS_DIR.glob("*.nwk")])
     if not fgs:
         print("[ERR] 未发现前景树：results/04_codeml/sets/*.nwk，请先运行 05_define_foregrounds.py")
+        return 3
+
+    # 映射表覆盖性预检（只检查 keep_og.list 里出现的 OG）
+    missing_map_og = [og for og in ogs if og not in OG2GID2SP]
+    if missing_map_og:
+        print(f"[ERR] pep2cds_map 中缺少 OG 的映射：n={len(missing_map_og)} sample={missing_map_og[:10]}")
         return 3
 
     ensure_dir(RAW_ROOT); ensure_dir(LOG_ROOT)
@@ -439,9 +584,7 @@ def main()->int:
     }
 
     for fg in fgs:
-        # Pass A: ALT
         run_pass(fg, "alt", ogs, threads, codeml_bin, totals)
-        # Pass B: NULL
         run_pass(fg, "null", ogs, threads, codeml_bin, totals)
 
     print("\n[SUMMARY]")
@@ -455,3 +598,4 @@ if __name__ == "__main__":
         sys.exit(main())
     except KeyboardInterrupt:
         print("\n[INTERRUPTED] 用户中断"); sys.exit(130)
+
