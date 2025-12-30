@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-03_pal2nal_only.py —— Codon MSA（方案B最终版：抽蛋白→MAFFT→trimAl(automated1)+backtrans→codon alignment）
+03_codon_msa.py —— Codon MSA（方案B最终版：抽蛋白→MAFFT→trimAl(automated1)+backtrans→codon alignment）
 
 核心策略（皇上最终确认）：
 1) 不使用 OrthoFinder 的 MSA 作为输入；仅用其 strict_sco_msa 目录的 OG 文件来枚举 OG 列表；
@@ -16,12 +16,12 @@
 - Proteome：phylo/data/proteomes/*.fa|*.faa|*.fasta
 
 输出：
-- aphylo/results/03_codon/codon_msa/OGxxxx.codon.fna          # 给 codeml 的 codon alignment（已修剪）
-- aphylo/results/03_codon/pep_trimal/OGxxxx.pep.trimal.fa      # 修剪后的蛋白对齐（用于位点→蛋白坐标映射）
-- aphylo/results/03_codon/colnumbering/OGxxxx.colnumbering.txt # 修剪后列→修剪前列映射
-- aphylo/results/03_codon/.pal2nal.done                        # 哨兵文件（名称沿用旧习惯）
-- aphylo/logs/03_pal2nal.log                                   # 总日志（覆盖）
-- aphylo/logs/03_pal2nal/pal2nal_OGxxxx.log                    # 每 OG 日志（逐次覆盖）
+- aphylo/results/03_codon/codon_msa/OGxxxx.codon.fna           # 给 codeml 的 codon alignment（已修剪）
+- aphylo/results/03_codon/pep_trimal/OGxxxx.pep.trimal.fa       # 修剪后的蛋白对齐（用于位点→蛋白坐标映射）
+- aphylo/results/03_codon/colnumbering/OGxxxx.colnumbering.txt  # 修剪后列→修剪前列映射
+- aphylo/results/03_codon/.codon_msa.done                       # 哨兵文件
+- aphylo/logs/03_codon_msa.log                                  # 总日志（覆盖）
+- aphylo/logs/03_codon_msa/codon_msa_OGxxxx.log                 # 每 OG 日志（逐次覆盖）
 
 依赖：
 - mafft
@@ -42,27 +42,27 @@ from typing import Dict, List, Set, Tuple
 # 皇上在这里改参数（不走命令行）
 # ==========================
 
-MSA_DIR = Path("~/project/phylo/results/publish/aphylo_ready/strict_sco_msa").expanduser()
+MSA_DIR = Path("../phylo/results/publish/aphylo_ready/strict_sco_msa")
 MSA_SUFFIX = ".raw.fa"
 
-CDS_DIR = Path("~/project/aphylo/results/02_bt/tmp").expanduser()
+CDS_DIR = Path("results/02_bt/tmp")
 CDS_SUFFIX = ".ordered_cds.fna"
 
-PROTEOME_DIR = Path("~/project/phylo/data/proteomes").expanduser()
+PROTEOME_DIR = Path("../phylo/data/proteomes")
 PROTEOME_SUFFIXES = (".fa", ".faa", ".fasta")
 
-OUT_CODON_DIR = Path("~/project/aphylo/results/03_codon/codon_msa").expanduser()
-OUT_PEP_TRIM_DIR = Path("~/project/aphylo/results/03_codon/pep_trimal").expanduser()
-OUT_COLNUM_DIR = Path("~/project/aphylo/results/03_codon/colnumbering").expanduser()
+OUT_CODON_DIR = Path("results/03_codon/codon_msa")
+OUT_PEP_TRIM_DIR = Path("results/03_codon/pep_trimal")
+OUT_COLNUM_DIR = Path("results/03_codon/colnumbering")
 
-TMP_DIR = Path("~/project/aphylo/results/03_codon/_tmp_pal2nal").expanduser()
-SENTINEL = Path("~/project/aphylo/results/03_codon/.pal2nal.done").expanduser()
+TMP_DIR = Path("results/03_codon/_tmp_codon_msa")
+SENTINEL = Path("results/03_codon/.codon_msa.done")
 
-LOG_TOTAL = Path("~/project/aphylo/logs/03_pal2nal.log").expanduser()
-LOG_OG_DIR = Path("~/project/aphylo/logs/03_pal2nal").expanduser()
+LOG_TOTAL = Path("logs/03_codon_msa.log")
+LOG_OG_DIR = Path("logs/03_codon_msa")
 
 MAFFT = "mafft"
-MAFFT_THREADS = 20
+MAFFT_THREADS = 30
 
 TRIMAL = "trimal"
 TRIMAL_MODE = "automated1"
@@ -295,7 +295,7 @@ def main() -> int:
     skipped = 0
 
     for i, og in enumerate(ogs, start=1):
-        og_log = LOG_OG_DIR / f"pal2nal_{og}.log"
+        og_log = LOG_OG_DIR / f"codon_msa_{og}.log"
         with og_log.open("w", encoding="utf-8") as w:
             def olog(msg: str) -> None:
                 w.write(msg.rstrip("\n") + "\n")

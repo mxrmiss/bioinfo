@@ -8,7 +8,7 @@
 2) 映射到：
    - results/03_codon/pep_trimal/OGxxxx.pep.trimal.fa（修剪后蛋白对齐）
    - results/03_codon/colnumbering/OGxxxx.colnumbering.txt（修剪后列 -> MAFFT 列映射）
-   - results/03_codon/_tmp_pal2nal/OGxxxx.pep.mafft.fa（修剪前 MAFFT 蛋白对齐）
+   - results/03_codon/_tmp_codon_msa/OGxxxx.pep.mafft.fa（修剪前 MAFFT 蛋白对齐）
    - phylo/data/proteomes/*（原始蛋白，用于核对 raw_aa）
 3) 输出两张表（覆盖写）：
    A) results/05_cmlagg/D_beb_sites_mapped.tsv
@@ -43,7 +43,7 @@ INPUT_TSV = APHYLO_ROOT / "results/05_cmlagg/D_beb_sites.tsv"
 # —— 03 输出：修剪后蛋白对齐、列映射、修剪前 MAFFT 蛋白对齐
 PEP_TRIMAL_DIR = APHYLO_ROOT / "results/03_codon/pep_trimal"
 COLNUM_DIR = APHYLO_ROOT / "results/03_codon/colnumbering"
-MAFFT_DIR = APHYLO_ROOT / "results/03_codon/_tmp_pal2nal"  # 里面应有 OGxxxx.pep.mafft.fa
+MAFFT_DIR = APHYLO_ROOT / "results/03_codon/_tmp_codon_msa"  # 里面应有 OGxxxx.pep.mafft.fa
 
 # —— 输出：映射后的长表（覆盖）
 OUTPUT_MAPPED_TSV = APHYLO_ROOT / "results/05_cmlagg/D_beb_sites_mapped.tsv"
