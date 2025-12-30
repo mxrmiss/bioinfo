@@ -228,11 +228,88 @@ def main():
         per_og: dict[str, dict[str,str]] = {}
         union_species = set()
 
+        pep2cds_path = None
+        try:
+            I = (cfg.get("inputs") or {})
+            pep2cds_raw = I.get("pep2cds_map")
+            if isinstance(pep2cds_raw, str):
+                publish_dir = cfg.get("publish_dir")
+                if isinstance(publish_dir, str) and "<publish_dir>" in pep2cds_raw:
+                    pep2cds_raw = pep2cds_raw.replace("<publish_dir>", publish_dir)
+                pep2cds_path = Path(pep2cds_raw)
+        except Exception:
+            pep2cds_path = None
+
+        og2gid2sp = None
+
+        def _norm_id(x: str) -> str:
+            x = (x or "").strip().split()[0]
+            if "|" in x:
+                x = x.split("|")[-1]
+            return x
+
+        def _load_og2gid2sp(map_path: Path) -> dict[str, dict[str, str]]:
+            import csv
+            with map_path.open("r", encoding="utf-8") as f:
+                r = csv.reader(f, delimiter="\t")
+                header = next(r, None)
+                if not header:
+                    raise SystemExit(f"[ERR] pep2cds_resolved.tsv 为空：{map_path}")
+                h = [c.strip().lower() for c in header]
+
+                def _idx(cands):
+                    for c in cands:
+                        if c in h:
+                            return h.index(c)
+                    return None
+
+                i_og  = _idx(["og","orthogroup","family"])
+                i_sp  = _idx(["species","taxon","sp"])
+                i_pep = _idx(["protein_id","pep_id","protein","pep"])
+                if i_og is None or i_sp is None or i_pep is None:
+                    raise SystemExit("[ERR] pep2cds_resolved.tsv 缺少必要列（OG/species/protein_id）")
+
+                out: dict[str, dict[str, str]] = {}
+                for row in r:
+                    if (not row) or (len(row) <= max(i_og, i_sp, i_pep)):
+                        continue
+                    og = row[i_og].strip()
+                    sp = row[i_sp].strip()
+                    pep = _norm_id(row[i_pep])
+                    if not og or not sp or not pep:
+                        continue
+                    d = out.setdefault(og, {})
+                    if pep in d and d[pep] != sp:
+                        raise SystemExit(f"[ERR] pep2cds_resolved.tsv 冲突：OG={og} {pep} -> {d[pep]} vs {sp}")
+                    d[pep] = sp
+            return out
+
         # 读取并挑选“全覆盖”的 OG
         for p in files:
             msa = read_fasta(p)
             if not msa:
                 continue
+
+            if not species_set.issubset(msa.keys()):
+                if pep2cds_path is None or (not pep2cds_path.exists()):
+                    raise SystemExit("[ERR] codon MSA 表头不是物种名，但 inputs.pep2cds_map 未指向有效的 pep2cds_resolved.tsv")
+                if og2gid2sp is None:
+                    og2gid2sp = _load_og2gid2sp(pep2cds_path)
+                ogid_tmp = p.stem.split(".")[0]
+                gid2sp = og2gid2sp.get(ogid_tmp) or {}
+                if not gid2sp:
+                    raise SystemExit(f"[ERR] pep2cds_resolved.tsv 中找不到该 OG：{ogid_tmp}")
+                msa2: dict[str, str] = {}
+                for h, seq in msa.items():
+                    k = _norm_id(h)
+                    sp = gid2sp.get(k)
+                    if not sp:
+                        raise SystemExit(f"[ERR] OG={ogid_tmp} FASTA header 无法映射到 species：{h}")
+                    if sp in msa2:
+                        raise SystemExit(f"[ERR] OG={ogid_tmp} 映射后同一 species 出现多条序列：{sp}")
+                    msa2[sp] = seq
+                msa = msa2
+
             union_species.update(msa.keys())
             if species_set.issubset(msa.keys()):
                 ogid = p.stem.split(".")[0]
