@@ -44,6 +44,7 @@ STRIP_ID_PREFIXES = True
 ID_PREFIX_REGEX   = r'^(rna\-|mrna\-|transcript:|cds:)'
 
 PROT_MIN_LEN_AA   = 50                 # 蛋白最短长度（aa）
+PROT_MAX_LEN_AA   = 5000               # 蛋白最长长度（aa）；设为 0 表示不启用
 CDS_MIN_LEN_NT    = 150                # CDS 最短长度（nt，且需3的倍数）
 
 # ========================== 并行参数 ==========================
@@ -227,8 +228,9 @@ def translate_cds_to_protein(final_cds: Path, out_pep: Path) -> int:
       t2=seq; gsub(/\*/,"",t2); sc=length(seq)-length(t2);
       if (sc>0) next;                           # 内部 '*' → 丢弃（理论上不会，因为前面已筛）
       if (length(seq)>0 && length(seq)<%MINLEN%) next;
+      if (%MAXLEN%>0 && length(seq)>%MAXLEN%) next;
       print ">" id "\n" seq
-    }""".replace("%MINLEN%", str(PROT_MIN_LEN_AA))
+    }""".replace("%MINLEN%", str(PROT_MIN_LEN_AA)).replace("%MAXLEN%", str(PROT_MAX_LEN_AA))
 
     pep_qc = Path(str(out_pep) + ".qc.tmp")
     run(f"seqkit fx2tab -i -s '{pep_raw}' | awk '{awk_script}' | seqkit seq -w 0 > '{pep_qc}'", "PROT:POST_QC")

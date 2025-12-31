@@ -55,8 +55,8 @@ species_tree:
       alrt: 1000
       extra: "-bnni"
     min_align_len: 150
-    min_taxa_per_locus: 27
-    top_n_partitions: 1000
+    min_taxa_per_locus: 18
+    top_n_partitions: 2000
 
 positive_selection:
   output_dir: "results/publish/aphylo_ready"
