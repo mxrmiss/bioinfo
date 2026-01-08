@@ -173,7 +173,7 @@ def build_tx2gene_from_gtf(gtf: Path, log: logging.Logger) -> Dict[str, str]:
             attrs = parse_attributes(attr)
 
             # GTF 优先路径
-            if "transcript_id" in attrs:
+            if "transcript_id" in attrs and "gene_id" in attrs:
                 tid = attrs.get("transcript_id", "").strip()
                 gid = attrs.get("gene_id", "").strip()
                 if not tid or not gid:
