@@ -30,7 +30,7 @@ output/synteny_03_order_seqids/
 PROJECT_ROOT = None
 CLEAN_OUTPUT = True
 
-REFERENCE_SPECIES_ID = "Sinonovacula_constricta"
+REFERENCE_SPECIES_ID = "Pecten_maximus"
 
 META_TSV_REL = "raw_data/synteny_species_meta.tsv"
 STEP01_DIR_REL = "output/synteny_01_mcscan_catalog"

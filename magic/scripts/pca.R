@@ -39,7 +39,7 @@ SHOW_ARROWS     <- FALSE       # Draw variable arrows?
 TOP_N_LOADINGS  <- 5          # How many top genes to show
 
 # --- Label Control ---
-SHOW_SAMPLE_LABELS <- TRUE    # Show sample names?
+SHOW_SAMPLE_LABELS <- FALSE    # Show sample names?
 
 # --- Aesthetics ---
 SHOW_HULL       <- TRUE       # [RESTORED] Draw Convex Hulls?
@@ -91,9 +91,11 @@ if (!dir.exists(OUT_DIR)) dir.create(OUT_DIR, recursive = TRUE)
 generate_smart_palette <- function(groups) {
   n <- length(unique(groups))
   base_colors <- c(
-    "#E41A1C", "#377EB8", "#4DAF4A", "#984EA3", "#FF7F00", "#FFFF33", "#A65628", "#F781BF", 
-    "#1B9E77", "#D95F02", "#7570B3", "#E7298A", "#66A61E", "#E6AB02", "#A6761D", "#666666"
-  )
+  "#F79D93", "#95C8F2", "#F6CD96", "#9FD5CB", "#F6C6E7",
+  "#A99BEF", "#F5B07E", "#A7D9F7", "#F3A6C9", "#B6E0B6",
+  "#FBE3A8", "#8FE3F2", "#F4B1A8", "#8FB1F2", "#F0D07A",
+  "#7FD3C8", "#F7B6D2", "#C3A3F5", "#D6E7B5", "#9E90E6"
+)
   if (n <= length(base_colors)) return(base_colors[1:n])
   else return(hcl.colors(n, palette = "Spectral"))
 }

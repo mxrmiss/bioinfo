@@ -185,9 +185,9 @@ p_final <- ggtree(tree_final, layout="rectangular", linewidth=0.5) +
   
   # [图层5: 气泡列标题] 粗斜体，位置悬空
   annotate("text", x=x_expansion, y=length(phy$tip.label)+1.5, label="Expansion", 
-           color=color_expansion, fontface="bold.italic", size=4, angle=30) +
+           color=color_expansion, fontface="bold.italic", size=4, angle=0) +
   annotate("text", x=x_contraction, y=length(phy$tip.label)+1.5, label="Contraction", 
-           color=color_contraction, fontface="bold.italic", size=4, angle=30) +
+           color=color_contraction, fontface="bold.italic", size=4, angle=0) +
 
   # [图层6: 手绘坐标轴]
   # 6.1 轴线: 黑色实线，从树根(0)画到树梢(line_x_end)

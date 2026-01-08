@@ -41,16 +41,16 @@ CLEAN_OUTPUT = True
 
 JCVI_PYTHON = "python"
 FONT_FAMILY = "Arial"
-OUT_PDF = "karyotype.pdf"
+OUT_PDF = "karyotype2.pdf"
 
-FIGURE_WIDTH_INCH = 16.0
-FIGURE_HEIGHT_INCH = None
+FIGURE_WIDTH_INCH = 12.0
+FIGURE_HEIGHT_INCH = 10
 
 # 物种名字号（若当前 jcvi 版本支持 --labelsize，则自动生效；不支持则忽略以保证稳定）
 SPECIES_LABEL_SIZE_PT = 12
 
-TRACK_XSTART = 0.10
-TRACK_XEND = 0.92
+TRACK_XSTART = 0.15
+TRACK_XEND = 0.95
 LABEL_VA = "top"
 
 NO_CIRCLES = True

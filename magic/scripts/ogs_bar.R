@@ -58,14 +58,14 @@ CONFIG <- list(
   FONT_SIZE_LEGEND  = 9
 )
 
-# 统一配色方案 (保证两张图中同名分类颜色一致)
+# 统一配色方案（皇家马卡龙配色版；保留 CC 透明度）
 COLOR_MAP <- c(
-  "Single-copy orthologs"    = "#4DBBD5CC", # 蓝
-  "Multiple-copy orthologs"  = "#E64B35CC", # 红
-  "Unique paralogs"          = "#00A087CC", # 绿
-  "Other orthologs"          = "#3C5488CC", # 深蓝/紫
-  "Absent"                   = "#E1E1E1CC", # 浅灰 (仅图1)
-  "Unclustered genes"        = "#B09C85CC"  # 土黄/灰 (仅图2)
+  "Single-copy orthologs"    = "#95C8F2CC", # Royal SkyBlue
+  "Multiple-copy orthologs"  = "#F79D93CC", # Royal Coral
+  "Unique paralogs"          = "#9FD5CBCC", # Royal Mint
+  "Other orthologs"          = "#A99BEFCC", # Royal Lavender
+  "Absent"                   = "#FBE3A8CC", # Royal Cream (原本灰色→改为温柔浅黄)
+  "Unclustered genes"        = "#F6CD96CC"  # Royal Light Orange
 )
 
 # --- B. 环境加载 & 路径解析 ---

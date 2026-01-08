@@ -10,5 +10,29 @@ chr_synteny.R	染色体共线性圆圈图
 stats_plot.R    染色体共线性热图和弦图
 - 输入：mcscanx_synteny.py的产物synteny_summary.tsv，脚本自动识别
 
-enrichment_bar.R	富集柱状图
-- 输入：可直接使用
+enrichment_bar.R & enrichment_bubble.R     富集柱状&气泡图
+- 输入：rna-seq/results/08_enrich/<label>/*.tsv
+
+ogs_bar.R     家族数柱状图,（来自 phylo）
+- 输入：phylo/results/orthofinder/Results_*/Orthogroups/{Orthogroups.GeneCount.tsv,Orthogroups_UnassignedGenes.tsv}
+- 输出：两张柱状图
+
+phylo_tree.R     进化树图
+- 输入：aphylo/results/06_cafe/mcmctree/FigTree.tre
+		aphylo/results/07_cafeagg/cafe_significant_clade_summary.tsv
+
+pca.R
+- 输入：rna-seq/results/05_matrix/tpms/gene_tpm.tsv
+		rna-seq/data/samples.tsv
+
+volcano.R	火山图
+- 输入：rna-seq/results/06_deg/<contrast>/DEG_all.tsv
+		
+
+global_heatmap.R	全局基因热图
+- 输入：rna-seq/results/05_matrix/tpms/gene_tpm.tsv
+
+plot_top_heatmap.py		手动选择的基因热图
+- 输入：rna-seq/results/05_matrix/tpms/gene_tpm.tsv
+		top selected genes list file
+		gene_tpm.tsv  samples.tsv  top_gene_heatmap.tsv

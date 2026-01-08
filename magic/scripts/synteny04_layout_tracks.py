@@ -25,7 +25,7 @@ output/synteny_04_layout_tracks/
 PROJECT_ROOT = None
 CLEAN_OUTPUT = True
 
-REFERENCE_SPECIES_ID = "Sinonovacula_constricta"
+REFERENCE_SPECIES_ID = "   "
 
 TRACK_HEIGHT = 0.040
 TRACK_SPACING = 0.018

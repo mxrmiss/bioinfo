@@ -8,6 +8,68 @@
 #   - [Visual] Pastel colors, Borderless, Clean style.
 # ==============================================================================
 
+# ==============================================================================
+# Script: venn.R
+# Purpose:
+#   - 从多个差异表达（DEG）结果表中提取“显著基因集合”，绘制交集图：
+#       * 当集合数 <= 4：绘制 Venn Diagram（ggvenn）
+#       * 当集合数  > 4：绘制 UpSet Plot（ComplexHeatmap）
+#   - 同时导出交集与各集合特异（unique）基因列表，便于后续功能富集、候选基因筛选等分析。
+#
+# Inputs (输入原材料):
+#   1) DEG tables (TSV) placed under IN_DIR (default: "input/")
+#      - 文件格式：制表符分隔 .tsv
+#      - 关键表头（必须一模一样）：gene_id, log2fc, p_adjust
+#      - 语义要求：
+#          * gene_id   : 基因 ID（建议为 gene-level ID，且不同文件必须同一套 ID 体系）
+#          * log2fc    : log2 fold change（可正可负）
+#          * p_adjust  : 多重校正后的 P 值（FDR / padj；支持科学计数法）
+#
+#   2) File selection mode (两种输入文件选择方式):
+#      - Manual mode: 在 TARGET_FILES 填入需要处理的文件名（相对 input/ 目录）
+#          * 例如：TARGET_FILES <- c("foot_vs_mantle_DEG_all.tsv", "foot_vs_gill_DEG_all.tsv")
+#      - Auto-scan mode: TARGET_FILES 为空时，自动扫描 input/ 下所有 .tsv
+#          * 注意：会自动跳过文件名包含 tpm|count|sample|meta|template 的 .tsv
+#
+# Parameters (阈值与显示控制):
+#   - FC_CUTOFF : |log2fc| 的阈值（默认 1.0）
+#   - P_CUTOFF  : p_adjust 的阈值（默认 0.05）
+#   - SHOW_PLOT_TITLE / CUSTOM_PLOT_TITLE : 控制标题显示与自定义标题
+#   - SHOW_CAPTION : 是否在图底部显示阈值说明（caption）
+#   - SET_COLORS : 集合填充色（最多支持 4 组 Venn，超过则用 UpSet）
+#
+# Outputs (输出产物):
+#   输出目录：OUT_DIR（默认 output/venn/）
+#   1) 图文件：
+#      - 当集合数 <= 4：
+#          * Venn_*.pdf
+#          * Venn_*.png
+#      - 当集合数  > 4：
+#          * UpSet_Combined_Sets.pdf
+#          * UpSet_Combined_Sets.png
+#   2) 基因列表：
+#      - Genes_Intersection_ALL.txt
+#          * 所有集合共同交集（core genes）
+#      - Genes_Unique_<SetName>.txt
+#          * 每个集合的特异基因（相对于其它所有集合的 setdiff）
+#
+# Interpretation Notes (结果解读注意事项):
+#   - 本脚本默认用 abs(log2fc) > FC_CUTOFF，因此“上调/下调”会混在同一个集合里做交集。
+#     若要分别做“共同上调”或“共同下调”的交集：
+#       * 建议输入文件层面就分开（例如使用 DEG_up.tsv / DEG_down.tsv），或在筛选逻辑中改条件。
+#   - 交集分析的前提是各文件 gene_id 可比且一致：
+#       * 不要混用 transcript_id 与 gene_id
+#       * 不要混用不同物种的原始基因 ID（除非你已经做了同源映射/统一 ID）
+#   - 当输入集合 > 4 时需要安装 ComplexHeatmap（否则会报错并停止）。
+#
+# Practical Tips (实用建议):
+#   - 为了更稳定/更“生物学一致”的交集，建议输入使用统一标准产生的 DEG 结果表
+#     （例如同一个 DE 流程、同一版本注释、同一过滤策略）。
+#   - 文件命名会影响集合名称：脚本会自动从文件名中去掉 "_DEG_all" 与 "_vs_D0"；
+#     若你希望图例更清晰，建议在文件名里体现 contrast 信息但尽量简短。
+# ==============================================================================
+
+
 suppressPackageStartupMessages({
   library(ggplot2)
   library(dplyr)
@@ -40,7 +102,7 @@ SHOW_CAPTION      <- TRUE       # Toggle Bottom Threshold Info
 CUSTOM_PLOT_TITLE <- ""         # Override title string
 
 # --- Aesthetics ---
-FONT_FAMILY  <- "sans"
+FONT_FAMILY  <- "Arial"
 EDGE_SIZE    <- 0.3             
 # Fresh Pastel Palette
 SET_COLORS   <- c("#8DD3C7", "#FB8072", "#BEBADA", "#80B1D3") 

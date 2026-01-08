@@ -207,10 +207,22 @@ def main() -> None:
 
         bed_dst = d_inputs / f"{sid}.bed"
         pep_dst = d_inputs / f"{sid}.pep"
-        for src, dst in ((bed_src, bed_dst), (pep_src, pep_dst)):
+        for src, dst in ((bed_src, bed_dst),):
             if dst.exists() or dst.is_symlink():
                 dst.unlink()
             dst.symlink_to(src)
+
+        if pep_dst.exists() or pep_dst.is_symlink():
+            pep_dst.unlink()
+        with open_text_auto(pep_src) as fr, pep_dst.open("w", encoding="utf-8", newline="\n") as fw:
+            for line in fr:
+                if line.startswith(">"):
+                    token = line[1:].strip().split()[0]
+                    if "|" in token:
+                        token = token.rsplit("|", 1)[-1]
+                    fw.write(f">{token}\n")
+                else:
+                    fw.write(line)
 
     sum_rows: List[List[str]] = []
     sum_header = ["pair_id", "a_species", "b_species", "anchors_simple_lines", "runtime_sec"]
