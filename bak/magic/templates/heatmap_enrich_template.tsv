@@ -1,0 +1,3 @@
+term_name	p_adjust	gene_ids
+Cell cycle	1e-5	GeneA;GeneB
+DNA replication	1e-4	GeneC;GeneA

@@ -1,0 +1,228 @@
+# -*- coding: utf-8 -*-
+# =============================================================
+# Snakefile —— 工具优先 · 零猜测 · 哨兵式依赖 · 屏幕+日志双写
+# =============================================================
+
+import os
+configfile: "config.yaml"
+
+P = config["paths"]
+BIN = config.get("binaries", {})
+LOG_DIR = "logs"
+SCRIPTS = "scripts"
+
+# 哨兵与关键文件
+PROT_DONE   = os.path.join("data/proteomes", ".from_gff.done")
+HEADERS_DONE = os.path.join("data/proteomes", ".headers_norm.done") 
+OF_DONE     = os.path.join(P["orthofinder_results_dir"], ".OF_DONE")
+SCO_LIST    = os.path.join(P["reports_dir"], "ogs_selected.list")
+SCO_DONE    = os.path.join(P["reports_dir"], ".ogs_selected.done")
+TRIM_DONE   = os.path.join(P["msa_trim_dir"], ".done")
+NORM_DONE   = os.path.join(P["normalize_dir"], ".norm.done")
+COLL_DONE   = os.path.join(P["collapse_dir"], ".done")
+SPC_DONE    = os.path.join(P["species_collapse_dir"], ".done")
+SCOLIST     = os.path.join(P["reports_dir"], "sco_filelist.txt")
+SCOL_DONE   = os.path.join(P["reports_dir"], ".sco_filelist.done")
+SUPER_FASTA = os.path.join(P["supermatrix_dir"], "supermatrix.faa")
+SUPER_DONE  = os.path.join(P["supermatrix_dir"], ".supermatrix.done")
+TREE_NWK    = os.path.join(P["trees_dir"], "species_tree.nwk")
+IQ_DONE     = os.path.join(P["trees_dir"], ".iqtree.done")
+MATRIX_TSV  = os.path.join(P["reports_dir"], "matrix.tsv")
+MATRIX_DONE = os.path.join(P["reports_dir"], ".matrix.done")
+PUB_DONE    = os.path.join(P["publish_dir"], ".publish.done")
+
+rule all:
+    input:
+        PUB_DONE,
+        MATRIX_DONE,
+        IQ_DONE,
+        SUPER_DONE,
+
+# 若想重跑此步，需要删除/data/proteomes/下的隐藏文件夹.from_gff.done
+rule build_proteomes_from_gff:
+    output: sentinel=PROT_DONE
+    log: f"{LOG_DIR}/build_proteomes_from_gff.log"
+    params:
+        py = BIN.get("python","python"),
+        proteome_dir = config["input"]["proteome_dir"],
+        cds_dir = config["input"]["cds_dir"],
+        script = f"{SCRIPTS}/extract_longest_from_gff.py"
+    shell:
+        r'''set -euo pipefail
+        mkdir -p "$(dirname {log})" "{params.proteome_dir}" "{params.cds_dir}"
+        {params.py} {params.script} 2>&1 | tee -a {log}
+        touch {output.sentinel}
+        '''
+
+rule rename_proteome_headers:
+    # 将 data/proteomes/*.fa* 表头统一为 `Species|SeqID`（仅改头，不改序列）
+    input: PROT_DONE
+    output: sentinel=HEADERS_DONE
+    log: f"{LOG_DIR}/rename_proteome_headers.log"
+    params:
+        py = BIN.get("python","python"),
+        script = f"{SCRIPTS}/rename_proteome_headers.py"
+    shell:
+        r'''set -euo pipefail
+        mkdir -p "$(dirname {log})"
+        {params.py} {params.script} 2>&1 | tee -a {log}
+        touch {output.sentinel}
+        '''
+
+rule orthofinder_run:
+    input: HEADERS_DONE
+    output: sentinel=OF_DONE
+    log: f"{LOG_DIR}/orthofinder.log"
+    params:
+        py = BIN.get("python","python"),
+        script = f"{SCRIPTS}/00_of_run.py"
+    shell:
+        r'''set -euo pipefail
+        mkdir -p "$(dirname {log})"
+        {params.py} {params.script} 2>&1 | tee -a {log}
+        touch {output.sentinel}
+        '''
+
+rule build_sco_keep_list:
+    input: OF_DONE
+    output: SCO_LIST, SCO_DONE
+    log: f"{LOG_DIR}/build_sco_keep_list.log"
+    params:
+        py = BIN.get("python","python"),
+        script = f"{SCRIPTS}/01_build_sco_keep_list.py",
+        reports_dir = P["reports_dir"]
+    shell:
+        r'''set -euo pipefail
+        mkdir -p "$(dirname {log})" "{params.reports_dir}"
+        {params.py} {params.script} 2>&1 | tee -a {log}
+        '''
+
+rule prepare_trimmed_alignment:
+    input: SCO_DONE
+    output: TRIM_DONE
+    log: f"{LOG_DIR}/prepare_trimmed_alignment.log"
+    params:
+        py = BIN.get("python","python"),
+        script = f"{SCRIPTS}/02_prepare_trimmed_alignment.py",
+        outdir = P["msa_trim_dir"]
+    shell:
+        r'''set -euo pipefail
+        mkdir -p "$(dirname {log})" "{params.outdir}"
+        {params.py} {params.script} 2>&1 | tee -a {log}
+        '''
+
+rule normalize_all_msas:
+    input: TRIM_DONE
+    output: NORM_DONE, os.path.join(P["reports_dir"], "header_map.tsv")
+    log: f"{LOG_DIR}/normalize_msas.log"
+    params:
+        py = BIN.get("python","python"),
+        script = f"{SCRIPTS}/03_normalize_msas.py",
+        outdir = P["normalize_dir"],
+        reports_dir = P["reports_dir"]
+    shell:
+        r'''set -euo pipefail
+        mkdir -p "$(dirname {log})" "{params.outdir}" "{params.reports_dir}"
+        {params.py} {params.script} 2>&1 | tee -a {log}
+        '''
+
+rule collapse_isoforms:
+    input: NORM_DONE
+    output: COLL_DONE, os.path.join(P["reports_dir"], "og_species_protein.tsv")
+    log: f"{LOG_DIR}/collapse_isoforms.log"
+    params:
+        py = BIN.get("python","python"),
+        script = f"{SCRIPTS}/04_collapse_isoforms.py",
+        outdir = P["collapse_dir"],
+        reports_dir = P["reports_dir"]
+    shell:
+        r'''set -euo pipefail
+        mkdir -p "$(dirname {log})" "{params.outdir}" "{params.reports_dir}"
+        {params.py} {params.script} 2>&1 | tee -a {log}
+        '''
+
+rule collapse_headers_to_species:
+    input: COLL_DONE
+    output: SPC_DONE
+    log: f"{LOG_DIR}/collapse_headers_to_species.log"
+    params:
+        py = BIN.get("python","python"),
+        script = f"{SCRIPTS}/05_collapse_headers_to_species.py",
+        outdir = P["species_collapse_dir"]
+    shell:
+        r'''set -euo pipefail
+        mkdir -p "$(dirname {log})" "{params.outdir}"
+        {params.py} {params.script} 2>&1 | tee -a {log}
+        '''
+
+rule filter_alignments_by_sco:
+    input: SPC_DONE, SCO_DONE
+    output: SCOLIST, SCOL_DONE
+    log: f"{LOG_DIR}/filter_alignments_by_sco.log"
+    params:
+        py = BIN.get("python","python"),
+        script = f"{SCRIPTS}/06_filter_alignments_by_sco.py",
+        reports_dir = P["reports_dir"]
+    shell:
+        r'''set -euo pipefail
+        mkdir -p "$(dirname {log})" "{params.reports_dir}"
+        {params.py} {params.script} 2>&1 | tee -a {log}
+        '''
+
+rule concat_supermatrix:
+    input: SCOL_DONE
+    output: SUPER_FASTA, SUPER_DONE
+    log: f"{LOG_DIR}/concat_supermatrix.log"
+    params:
+        py = BIN.get("python","python"),
+        script = f"{SCRIPTS}/07_concat_supermatrix.py",
+        outdir = P["supermatrix_dir"]
+    shell:
+        r'''set -euo pipefail
+        mkdir -p "$(dirname {log})" "{params.outdir}"
+        {params.py} {params.script} 2>&1 | tee -a {log}
+        '''
+
+rule iqtree_concat_tree:
+    input: SUPER_DONE
+    output: TREE_NWK, IQ_DONE
+    log: f"{LOG_DIR}/iqtree_concat_tree.log"
+    params:
+        py = BIN.get("python","python"),
+        script = f"{SCRIPTS}/08_iqtree_concat.py",
+        outdir = P["trees_dir"]
+    shell:
+        r'''set -euo pipefail
+        mkdir -p "$(dirname {log})" "{params.outdir}"
+        {params.py} {params.script} 2>&1 | tee -a {log}
+        '''
+
+rule report_matrix:
+    input: IQ_DONE
+    output: MATRIX_TSV, MATRIX_DONE
+    log: f"{LOG_DIR}/report_matrix.log"
+    params:
+        py = BIN.get("python","python"),
+        script = f"{SCRIPTS}/09_report_matrix.py",
+        outdir = P["reports_dir"]
+    shell:
+        r'''set -euo pipefail
+        mkdir -p "$(dirname {log})" "{params.outdir}"
+        {params.py} {params.script} 2>&1 | tee -a {log}
+        '''
+
+rule publish_aphylo_ready:
+    input: MATRIX_DONE
+    output: PUB_DONE
+    log: f"{LOG_DIR}/publish_aphylo_ready.log"
+    params:
+        py = BIN.get("python","python"),
+        script = f"{SCRIPTS}/10_publish_aphylo_ready.py",
+        outdir = P["publish_dir"]
+    shell:
+        r'''set -euo pipefail
+        mkdir -p "$(dirname {log})" "{params.outdir}"
+        {params.py} {params.script} 2>&1 | tee -a {log}
+        touch {output}
+        '''
+

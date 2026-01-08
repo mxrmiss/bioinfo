@@ -66,62 +66,6 @@ def write_done(path: Path):
     path.parent.mkdir(parents=True, exist_ok=True)
     Path(path).touch()
 
-# ============== 进一步清洗物种树（迁移自 06 的“树清洗”职责） ==============
-def sanitize_species_tree_text(raw_text: str, logger: logging.Logger) -> str:
-    """
-    对输入物种树进行“最小但必要”的清洗，使其更稳定地喂给 gotree 与 CODEML：
-    - 支持可选 PHYLIP 头（如首行 "18 1"）：自动跳过头，读取后续 Newick（允许多行）
-    - 去掉方括号注释：[...]（Newick comment）
-    - 去掉内部节点标签/支持度（如 )100/100, )87/85, )'B(...)' 等），但不触碰拓扑
-    - 压缩空白，确保以单个 ';' 结尾
-    - 检查括号是否配对
-    注意：此处只做“清洗”，不打标 #1（打标仍由 terminals-only 逻辑完成）
-    """
-    if raw_text is None:
-        raise ValueError("[ERR] 读取到的物种树内容为空（None）")
-
-    txt = raw_text.replace("\r\n", "\n").replace("\r", "\n")
-
-    # 去掉空行
-    lines = [ln.strip() for ln in txt.split("\n") if ln.strip() != ""]
-    if not lines:
-        raise ValueError("[ERR] 物种树文件为空或全是空白行")
-
-    # 可选 PHYLIP 头：首行是 "N 1"
-    # 若存在，则跳过首行，剩余行拼接为 Newick（允许 Newick 被换行拆开）
-    if re.fullmatch(r"\d+\s+\d+", lines[0]):
-        logger.info(f"[Info] 检测到树文件包含 PHYLIP 头：{lines[0]}（将自动跳过该行读取 Newick）")
-        if len(lines) < 2:
-            raise ValueError("[ERR] 树文件仅有 PHYLIP 头，但缺少后续 Newick 内容")
-        nwk_raw = "".join(lines[1:])
-    else:
-        nwk_raw = "".join(lines)
-
-    # 去掉方括号注释（Newick comment）
-    nwk_raw = re.sub(r"\[[^\]]*\]", "", nwk_raw)
-
-    # 压缩空白（Newick 中空白通常无意义；本流水线物种名无空格）
-    nwk_raw = re.sub(r"\s+", "", nwk_raw)
-
-    # 先保证分号存在（清洗 internal label 前后都可，但这里先统一格式）
-    nwk_raw = nwk_raw.strip()
-    if not nwk_raw.endswith(";"):
-        nwk_raw = nwk_raw.rstrip(";") + ";"
-    else:
-        # 防止多个分号
-        nwk_raw = nwk_raw.rstrip(";") + ";"
-
-    # 去掉内部节点标签/支持度：')' 后面若紧跟的不是 ':', ',', ')', ';'，则认为是内部标签并移除
-    # 例如：)100/100:0.1 -> ):0.1；)87/85 -> )；)'B(77.0,220.0)' -> )
-    # 注意：此时还没打 #1，因此不会误删 '#1'
-    nwk_raw = re.sub(r"\)(?=[^,:);])[^,:);]+", ")", nwk_raw)
-
-    # 括号配对检查（与 06 的要求一致：不配对就直接拒绝）
-    if nwk_raw.count("(") != nwk_raw.count(")"):
-        raise ValueError(f"[ERR] 物种树括号不配对：'('={nwk_raw.count('(')}  ')'={nwk_raw.count(')')}")
-
-    return nwk_raw
-
 # ============== 利用 gotree 去除分支长度（供 CODEML 使用） ==============
 def clear_branch_lengths_with_gotree(nwk: str, logger: logging.Logger) -> str:
     """
@@ -225,11 +169,8 @@ def main():
 
     # 基准物种树（未打标）
     tree_path = need_file(Path(inputs["species_tree"]), "物种树 species_tree.nwk")
-    raw_text = tree_path.read_text(encoding="utf-8")
-
-    # 进一步清洗物种树（去注释/去内部标签/兼容可选 PHYLIP 头）
-    log.info("[Info] 进一步清洗物种树（去注释、去内部标签、兼容可选 PHYLIP 头），然后再进行分支长度清除与 terminals-only 打标")
-    raw_nwk = sanitize_species_tree_text(raw_text, log)
+    raw_nwk = tree_path.read_text(encoding="utf-8").strip()
+    raw_nwk = raw_nwk.rstrip(";") + ";"  # 保证只有一个分号结尾
 
     # 使用 gotree 去除分支长度，仅保留拓扑（更贴合 CODEML 教程做法）
     log.info("[Info] 使用 gotree brlen clear 去除物种树分支长度，仅保留拓扑供 CODEML 使用")

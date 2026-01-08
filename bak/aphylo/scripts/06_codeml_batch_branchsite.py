@@ -1,25 +1,56 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-06_codeml_batch_branchsite.py
+06_codeml_batch_branchsite.py —— 分支位点模型批跑（两段式：先全 ALT 后全 NULL）
+稳定策略（与 aphylo 流水线完全对齐）：
+  1) 不改写 ctl，仅复制模板：
+       templates/branch_site_alt.ctl
+       templates/branch_site_null.ctl
+     模板中固定文件名：
+       seqfile = seq.codon.fna
+       treefile = species_tree.nwk
+       outfile = mlc.txt
+  2) 输入“副本规范化”（仅作用于 alt/null 目录中的拷贝，不碰上游源文件）：
+       - 将 '.' 统一替换为 '-' 以消除 difcodonNG 的报警
+       - 全部大写；U->T（核酸）
+       - 确保末尾换行
+  3) “最小树消毒”与集合一致性判定（忽略 #1）：
+       - 去方括号注释与内部标签，仅保留叶名与 #1
+       - 校验 FASTA 物种集合 == 树叶集合（忽略 #1），否则直接报错列出差集
+  4) 两段式并发：
+       - 对每个前景 FG：先把所有 OG 的 ALT 全部并发跑完；随后再把 NULL 全部并发跑完
+       - NULL 不再以 ALT 成败作为前置条件
+  5) 指纹跳过 + 清洁重算（根治 “but mlc.txt has lnL()”）：
+       - 对源输入(OG.codon.fna, FG.nwk)计算 size+sha1，写入 inputs.sha1
+       - 若 mlc.txt 缺失 / 指纹变更 / 结果无 lnL → 清洁后重算；否则跳过
+  6) 子进程稳定：
+       - OMP/BLAS 线程强制为 1
+       - 流式同时写屏与写入 logs/06_branchsite/OG/FG/{alt|null}.log
+       - 末行强制打印 [EXIT] code=…
+  7) 软通过：
+       - 若退出码 != 0 但 mlc.txt 已出现 lnL(ntime: …)，记为 SOFT_OK，不阻断流程
 
-功能：
-  - 批量运行 PAML/codeml 分支位点模型（两段式：先全 ALT 后全 NULL）
-  - 对每个 OG × FG 组合，在 results/04_codeml/raw/OG/FG/{alt|null}/ 下准备输入并运行 codeml
-  - 不改写 ctl，仅复制 templates/branch_site_{alt|null}.ctl（模板内固定 seqfile/treefile/outfile）
+新增（本次修复点）：
+  8) 在 06 内部完成“geneID → species”重命名（只作用于 alt/null 的 seq.codon.fna 副本）：
+       - 使用 config.yaml 的 inputs.pep2cds_map（pep2cds_resolved.tsv）
+       - 对每个 OG：把 codon MSA 的 header 从 geneID 改成物种名，以匹配 FG 树 tip
+       - 只写副本，不修改 results/03_codon/codon_msa 的源文件
 
-用法：
-  - 先运行 05_define_foregrounds.py 生成前景集合与前景树：
-      results/04_codeml/sets/{FG}.list
-      results/04_codeml/sets/{FG}.nwk
-  - 再运行本脚本：
-      ./scripts/06_codeml_batch_branchsite.py
+固定接口与路径（与 aphylo 其余脚本保持一致）：
+  输入：
+    results/03_qc/keep_og.list
+    results/03_codon/codon_msa/OG*.codon.fna
+    results/04_codeml/sets/<FG>.nwk        # 05_define_foregrounds.py 产物
+    templates/branch_site_alt.ctl
+    templates/branch_site_null.ctl
+  输出（逐 OG×FG）：
+    results/04_codeml/raw/OG/FG/alt/{seq.codon.fna,species_tree.nwk,branch_site_alt.ctl,mlc.txt,...}
+    results/04_codeml/raw/OG/FG/null/{seq.codon.fna,species_tree.nwk,branch_site_null.ctl,mlc.txt,...}
 
-注意事项：
-  - 本脚本不再对树进行任何清洗/改写：只读取并原样复制 05 的 {FG}.nwk 到 alt/null 目录
-  - 仅对 alt/null 目录中的 seq.codon.fna 副本做规范化（不修改上游 results/03_codon/codon_msa）
-  - 会做一致性校验：序列（geneID→species 映射后）的物种集合必须与树 tip 集合一致（忽略 #1）
-  - 依赖 inputs.pep2cds_map（pep2cds_resolved.tsv）用于 OG 内 geneID→species 的确定性映射
+可由 config.yaml 覆盖的键（若不存在则使用默认值）：
+  binaries.codeml         # 默认 "codeml"
+  codeml.threads          # 默认 1（推荐按机器核数设置）
+  inputs.pep2cds_map      # 必须：geneID ↔ species 映射表（pep2cds_resolved.tsv）
 """
 
 from __future__ import annotations
@@ -54,7 +85,7 @@ CLEAN_PATTERNS = [
 
 # ======== 配置加载 ========
 def _expand_publish_placeholders(obj, publish_dir: str):
-    if isinstance(obj, str): return obj.replace("<publish_dir>", publish_dir)
+    if isinstance(obj, str):  return obj.replace("<publish_dir>", publish_dir)
     if isinstance(obj, list): return [_expand_publish_placeholders(x, publish_dir) for x in obj]
     if isinstance(obj, dict): return {k:_expand_publish_placeholders(v, publish_dir) for k,v in obj.items()}
     return obj
@@ -181,7 +212,18 @@ def mlc_has_lnl(mlc: Path)->bool:
     return False
 
 # ======== 树 & FASTA 处理 ========
-_TOK_TIP = re.compile(r'(?<=\(|,)\s*([^()\s:,]+)\s*(?=[:),])')
+_TOK_TIP = re.compile(r'(?<=\(|,)\s*([^()\s:,;]+)\s*(?=[:),;])')
+
+def sanitize_foreground_tree(raw_text: str) -> str:
+    """最小树消毒：去方括号注释、内部标签，压缩空白，补分号"""
+    s = raw_text.strip()
+    s = re.sub(r'\[.*?\]', '', s)
+    s = re.sub(r'(\))\s*[^():,;\s]+\s*(?=[:),;])', r'\1', s)
+    s = re.sub(r'\s+', ' ', s).strip()
+    if not s.endswith(';'): s += ';'
+    if s.count('(') != s.count(')'):
+        raise ValueError("物种树括号不匹配，无法用于 codeml")
+    return s
 
 def parse_tips(nwk_text: str) -> List[str]:
     return _TOK_TIP.findall(nwk_text)
@@ -354,7 +396,7 @@ def unit_paths(og: str, fg: str) -> Dict[str, Path]:
     )
     return paths
 
-# ======== 复制 + 规范化（仅对副本操作） ========
+# ======== 复制 + 消毒/规范化（仅对副本操作） ========
 def refresh_inputs(og: str, fg: str, clean_tree: str, gid2sp: Dict[str, str]) -> Tuple[Path, Path]:
     """将源输入拷贝到 alt/null，并对副本进行规范化；返回 (seq_src, tree_src)"""
     seq_src  = SEQ_DIR / f"{og}.codon.fna"
@@ -364,7 +406,7 @@ def refresh_inputs(og: str, fg: str, clean_tree: str, gid2sp: Dict[str, str]) ->
 
     paths = unit_paths(og, fg)
 
-    # 写入树副本（原样复制 05 产物）
+    # 写入树副本（已经过消毒）
     paths["alt_tree"].write_text(clean_tree, encoding="utf-8")
     paths["nul_tree"].write_text(clean_tree, encoding="utf-8")
 
@@ -419,7 +461,7 @@ def run_one(og: str, fg: str, mode: str, codeml_bin: str) -> Tuple[str, str, str
         tree_src = SETS_DIR / f"{fg}.nwk"
         if not tree_src.exists(): return og, fg, f"FAIL:missing_tree({tree_src})"
         raw_tree = tree_src.read_text(encoding="utf-8")
-        clean_tree = raw_tree
+        clean_tree = sanitize_foreground_tree(raw_tree)
 
         tree_tips = set(strip_mark(x) for x in parse_tips(clean_tree))
         if not tree_tips:

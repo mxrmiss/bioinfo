@@ -1,0 +1,177 @@
+# =============================================================================
+# config.yaml —— RNA-seq 自用·顶刊口径版（不产图，集中参数）
+# 约定：所有脚本只从本文件读取参数；不在命令行传参。
+# =============================================================================
+
+project:
+  name: "rnaseq_selfuse"
+  species: "Sinonovacula_constricta"    # 仅用于方法学/日志展示
+
+# ------------------------------ 数据清单 ------------------------------
+data:
+  samples_tsv: "data/samples.tsv"       # 列：sample, group, fastq1, fastq2（可选 batch/strandedness）
+  contrasts_tsv: "data/contrasts.tsv"   # 列：contrast, case, control
+
+# ------------------------------ 参考与注释 ------------------------------
+reference:
+  ref_fasta: "ref/Sinonovacula_constricta_genome.fa"
+  ref_gtf:   "ref/Sinonovacula_constricta_genome.gff3"
+  # eggNOG/本地注释（07 使用）：确保 gene_id 与全流程一致
+  emapper:   "ref/annotations/Sinonovacula_constricta_annotations.tsv"
+
+  # Salmon 索引/decoys（02 使用）；若 index_dir 不存在，将由 02 构建
+  salmon:
+    index_dir:   "ref/salmon_index"
+    kmer_len:    31
+    decoy_list:  "ref/decoys.txt"     # 可为空字符串，02 将自动生成
+    gentrome_fa: "ref/gentrome.fa"    # 可为空字符串，02 将自动生成
+    rebuild:     "if_missing"         # always / if_missing / never
+
+# ------------------------------ 运行资源 ------------------------------
+resources:
+  threads:
+    qc:      30
+    salmon:  30
+    tximport: 30
+    deg:     30
+    enrich:  30
+  memory_gb:
+    qc:      90
+    salmon:  90
+    tximport: 90
+    deg:     90
+    enrich:  90
+
+# ------------------------------ 工具二进制路径 ------------------------------
+binaries:
+  fastp:   "fastp"
+  cutadapt: "cutadapt"
+  salmon:  "salmon"
+  gffread: "gffread"
+  Rscript: "Rscript"
+
+# ------------------------------ 质控（01 使用） ------------------------------
+qc:
+  thresholds:
+    min_retention_rate: 0.50
+    min_raw_reads: 5000000
+    min_mean_read_len: 40
+  outlier_rules:
+    max_adapter_percent: 30
+    max_dup_percent: 60
+  fastp_opts:
+    trim_poly_g: true
+    detect_adapter: true
+    qualified_quality_phred: 15
+    unqualified_percent_limit: 40
+  write_clean_fastq: true
+
+# ------------------------------ quant（04 使用） ------------------------------
+quant:
+  prefer_clean_fastq: true
+  require_clean_fastq: false
+  overwrite: false
+  salmon_opts:
+    validate_mappings: true
+    gc_bias: false
+    seq_bias: false
+    libtype: "A"   # -l A 自动推断文库型
+    extra: ""
+
+# ------------------------------ tximport 聚合（05 使用） ------------------------------
+tximport:
+  counts_from_abundance: "no"        # no/scaling/scaling_scaled/lengthScaledTPM
+  matrix_stats:
+    report_libsize_quantiles: [0.25, 0.5, 0.75]
+
+# ------------------------------ 差异分析（06 使用） ------------------------------
+deg:
+  lfc: 1.0
+  fdr: 0.05
+  use_apeglm: true
+  independent_filter: true
+  allow_batch: true
+  min_samples_per_group: 3
+  diagnostics:
+    varTopN: 100
+    rle_summary: true
+
+# ------------------------------ 注释与 ID 清理（02/03/07 共用） ----------------------
+annotations:
+  allow_gene_space_match: true
+  # 统一 ID 清理开关：模式 A=全关（默认），模式 B=按前/后缀统一修剪
+  id_cleanup:
+    strip_prefix: true     # 是否去前缀
+    prefix: ["Sinonovacula_constricta|"]              # 要剥掉的前缀列表（完全匹配）
+    strip_suffix: false     # 是否去后缀
+    suffix: []              # 要剥掉的后缀列表（完全匹配，如 ".t1"）
+    order: ["prefix","suffix"]   # 应用顺序，通常保持默认即可
+
+# ------------------------------ 背景集合（08 使用 · 关键） --------------------------
+background:
+  rule: "per_contrast_detectable_AND_annotated"
+  detectable: "TPM>0_or_count>0_in>=1_sample"
+  ora_inputs_dir: "results/08_enrich/inputs"
+
+# ------------------------------ GO 富集（08 使用） ------------------------------
+go:
+  minGS: 2
+  maxGS: 500
+  p_adjust_method: "BH"
+  obsolete_policy: "replace_or_consider"
+  ontologies: ["bp", "cc", "mf"]
+  dict:
+    gene2go:      "results/07_annot/gene2go.tsv"
+    term2name:    "results/07_annot/go/term2name.tsv"
+    obsolete_map: "results/07_annot/go/obsolete_map.tsv"
+
+# ------------------------------ KEGG 富集（08 使用）--------------------------------
+kegg:
+  count_mode: "by_gene"     # 或 "by_ko"，项目内固定一种
+  p_adjust_method: "BH"
+  dict:
+    term2gene: "results/07_annot/kegg/term2gene.tsv"
+    term2name: "results/07_annot/kegg/term2name.tsv"
+
+# ------------------------------ GSEA 富集（08使用） --------------------------------
+gsea:
+  enable: false            # 是否启用 GSEA 通道
+  score_from: "stat"      # 使用 DESeq2 的哪一列作为排名：stat 或 log2fc
+  minGS: 10               # 基因集最小大小（与 GO ORA 保持一致即可）
+  maxGS: 500              # 基因集最大大小（一般不用改）
+  p_adjust_method: "BH"   # GSEA 中 p.adjust 的方法
+  fdr: 0.25               # GSEA 的 FDR 阈值（常规 0.25）
+  ontologies: ["BP"]      # GSEA-GO 只看哪些本体：BP/CC/MF 的组合
+
+
+# ------------------------------ 富集通用设置（08 使用） ------------------------------
+enrich:
+  fdr: 0.05
+  add_go_sig_tables: true
+  output_sig_sorted: true
+  write_universe_meta: true
+  use_pvalue_cutoff_1: false        # 是否不过滤p值进行富集
+
+# ------------------------------ 发布与装订（09 使用） ------------------------------
+publish:
+  source_data_dir: "results/09_publish/source_data"
+  methods_readme:   "results/09_publish/source_data/METHODS_README.txt"
+  xlsx: false
+
+# ------------------------------ 目录 ------------------------------
+dirs:
+  qc:      "results/01_qc"
+  refprep: "results/02_ref"
+  maps:    "results/03_maps"
+  quant:   "results/04_quant"
+  matrix:  "results/05_matrix"
+  deg:     "results/06_deg"
+  annot:   "results/07_annot"
+  enrich:  "results/08_enrich"
+  publish: "results/09_publish"
+
+# ------------------------------ 日志 ------------------------------
+logging:
+  level: "INFO"
+  timestamp: true
+  file: ""

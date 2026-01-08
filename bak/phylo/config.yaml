@@ -1,0 +1,80 @@
+# =============================================================
+# Phylo（对齐版）—— 零猜测 · 脚本独立 · 目录命名与旧版一致
+#   - 不扫目录/不猜后缀/不猜物种，所有参数来自本文件
+#   - 仅保留本流程实际需要的键；其余删除以免混乱
+# =============================================================
+
+input:
+  proteome_dir: data/proteomes      # 供 OrthoFinder 使用
+  cds_dir: data/cds                 # 由 extract_longest_from_gff.py 生成（脚本本身不改）
+  # OrthoFinder MSA 输出的单基因后缀（仅认这一个，避免猜测）
+  # 常见为 ".fa"；若你确认是 ".faa"，请改成 ".faa"
+  of_msa_suffix: ".fa"
+
+paths:
+  orthofinder_results_dir: results/orthofinder
+  # 与旧版一致：裁剪后和规范化 MSA 都在 trim_norm 下；规范化会在原地写回
+  msa_trim_dir: results/trim_norm
+  normalize_dir: results/trim_norm
+  # 折叠到单物种最长 isoform
+  collapse_dir: results/trim_norm_collapse
+  # 仅保留物种名的 MSA（aphylo 常用）：
+  species_collapse_dir: results/trim_norm_collapse_sco
+  # 可选列掩码（若未使用可忽略）
+  colmask_dir: results/colmask
+  supermatrix_dir: results/supermatrix
+  trees_dir: results/trees
+  reports_dir: results/reports
+  publish_dir: results/publish/aphylo_ready
+  ultrametric_tree: data/mcmctree/species_names_clean.nwk
+
+orthofinder:
+  threads: 30
+  analysis_threads: 28
+  search_engine: diamond
+  msa_and_trees: true
+  gene_tree_engine: null
+
+trimming:
+  save_colmask: true    
+  
+species:
+  # 若你的 MSA 表头已经是 Species|SeqID，就无需映射；
+  # 如需把别名统一成标准物种名，可提供 TSV 或在 alias_map 写字典
+  alias_tsv: null
+  alias_map: {}
+
+species_tree:
+  concat:
+    enabled: true
+    use_strict_sco: true
+    iqtree_threads: 30
+    iqtree_params:
+      model: "MFP+MERGE"
+      bootstrap: 1000
+      alrt: 1000
+      extra: "-bnni"
+    min_align_len: 150
+    min_taxa_per_locus: 18
+    top_n_partitions: 2000
+
+positive_selection:
+  output_dir: "results/publish/aphylo_ready"
+  species_subset:
+    #- Sinonovacula_constricta
+    #- Tegillarca_granosa
+    #- Crassostrea_gigas
+    #- Crassostrea_ariakensis
+    #- Cyclina_sinensis
+
+binaries:
+  python: python
+  trimal: trimal
+  orthofinder: orthofinder
+  # 若为 null，则在 08_iqtree_concat.py 内按 PATH 探测 iqtree2→iqtree
+  iqtree: iqtree3
+
+publish:
+  include_ultrametric_tree: true
+  # 10脚本没有的前缀可以在下面设置
+  db_prefix_allowlist: ["MAR"]

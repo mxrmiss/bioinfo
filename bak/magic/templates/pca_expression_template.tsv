@@ -1,0 +1,5 @@
+gene_id	Control_1	Control_2	Treat_1	Treat_2
+GeneA	10	11	2	3
+GeneB	0	0	100	95
+GeneC	500	480	10	12
+GeneD	20	22	50	45

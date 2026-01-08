@@ -1,0 +1,158 @@
+# =============================================================
+# aphylo 配置（模板）—— 与 phylo 发布包对接
+# 所有路径固定；不扫描、不猜测
+# =============================================================
+
+# 上游发布包根目录（来自 phylo 的 10_publish_aphylo_ready.py）
+publish_dir: "../phylo/results/publish/aphylo_ready"
+
+inputs:
+  sco_msa_dir: "<publish_dir>/strict_sco_msa"
+  sco_msa_suffix: ".trim.faa"                     # 严格使用固定后缀
+  colmask_dir: "<publish_dir>/colmask"            # 可选：不提供则跳过列同步
+  colmask_suffix: ".colmask"
+  raw_msa_suffix: ".raw.fa"
+  pep2cds_map: "<publish_dir>/pep2cds_resolved.tsv"       # 严格单拷贝
+  all_members_tsv: "<publish_dir>/all_pep2cds_resolved.tsv"   # 全家族成员（多拷贝）
+  species_tree: "<publish_dir>/species_tree.nwk"
+  # ultrametric_tree:   "<publish_dir>/species_tree_ultrametric.nwk"   # 若由phylo的10脚本发布，则使用这个
+  ultrametric_tree: "results/06_cafe/mcmctree/utree_for_cafe.nwk"
+  family_tsv: "<publish_dir>/family.tsv"
+  cds_dir: "../phylo/data/cds"               # 由 extract_longest_from_gff.py 生成
+  cds_suffix: ".fna"                         # 固定后缀；避免猜测
+
+paths:
+  iface_dir: "results/01_iface"
+  bt_dir: "results/02_bt"
+  codon_qc_dir: "results/03_qc"
+  codeml_raw_dir: "results/04_codeml/raw"
+  codeml_dir: "results/04_codeml"
+  codeml_agg_dir: "results/05_cmlagg"
+  cafe_run_dir: "results/06_cafe"
+  cafe_agg_dir: "results/07_cafeagg"
+  joint_dir: "results/08_joint"
+  logs_dir: "logs"
+
+# 物种命名保障：防止历史别名/拼写差异造成前景或树节点不匹配（可按需增删）
+species:
+  alias_map:
+    Sinonovacula_constricta: "Sinonovacula_constricta"
+
+codon:
+  threads: 30
+  min_taxa: 18
+  min_codon_len: 120
+  max_gap_frac: 0.5
+  stopcodon_action: "fail"   # fail | mask(NNN)
+
+codeml:
+  threads: 30                                   # 并行请用 `snakemake -j` 控制；脚本逐任务运行更稳
+  alt_template: "templates/branch_site_alt.ctl"
+  null_template: "templates/branch_site_null.ctl"
+  ctl_template: "templates/branch_site.ctl"    # 固定模板文件（保留不影响）
+  add_phylip_header: true
+
+  # —— 前景集合的唯一权威来源（保留） ——
+  foreground_sets:
+    - name: "Hugefoot"
+      tips: ["Sinonovacula_constricta"]         # 强斧足
+#   - name: "set_Hugefoot"
+#     tips: ["Sinonovacula_constricta","Sinonovacula_rivularis","Novaculina_chinensis"]
+
+psg:
+  enable: true               # 打开 07 内置的 PSG cds 富集输入工厂
+  fdr_alpha: 0.05            # PSG 判定用的 Q 阈值（优先级高于 report.fdr_alpha）
+  p_alpha: 0.05              # PSG 判定用的 P 阈值
+  cds_inputs_dir: "psg_cds_inputs"   # 输出到 results/05_cmlagg/psg_cds_inputs/
+
+cafe5:
+  threads: 30                                          # -c
+  k_cycles:                                           # -k
+  p_alpha: 0.05                                        # -P
+  models: ["global"]                                   # 目前只用 global
+  max_autofix_rounds: 3                                # primary 阶段极端 OG 自动修正最多轮数
+
+  two_stage_large:                                     # 第二阶段：large 家族（≥ copy_threshold）
+    enable: false                                       # true 启用；false 不跑 large
+    copy_threshold: 100                                # 任一物种计数 ≥ 此值划入 large
+
+  error_model:                                         # 误差模型（-e）
+    enable: true                                       # 必须显式 true；否则脚本显示 off
+    mode: "estimate"                                   # off | estimate | use
+    file: null                                         # mode=use 时指定外部文件；其余保持 null
+    apply_to: "primary"                                # primary | both（只应用 primary，或 primary+large）
+
+  archive_on_start: false                              # true：开跑前把旧 models/ 归档到 models_archive_时间戳
+
+  enrich_bridge:                                       # ← 新增块：13b 使用
+    enable: true                                       # false 则 13b 什么都不做直接退出
+    outputs_dir: "results/07_cafeagg/enrich_inputs"    # ORA 输入统一写到这里
+
+    # 为 CAFE 定义的一组“外部 tag”：
+    # key = tag 名（会变成 enrich_inputs/<tag>/），value = 物种列表（与 species.alias_map 里的规范名一致）
+    species_sets:
+      cafe_sc:
+        - "Sinonovacula_constricta"
+    # 可以设置两个物种的集合，看他们的基因家族扩张和收缩富集情况
+    # cafe_sc_sr:                           
+    #   - "Sinonovacula_constricta"
+    #   - "Solen_grandis"
+
+    # 可选：若不想 aphylo 去读 rnaseq 的注释，就先留 null（13b 会把 n_annot_mapped 写成 NA）
+    annotations:
+      gene2go: null                                    # 例： "../rna-seq/results/07_annot/gene2go.tsv"
+      gene2pathway: null                               # 例： "../rna-seq/results/07_annot/gene2pathway.tsv"  
+
+  # ================== 新增：13c 节点外包配置 ==================
+  node_bridge:
+    enable: false
+    outputs_dir: "results/07_cafeagg/enrich_inputs_nodes"
+    # 一组“节点外包任务”：key 是 tag 名（会成为目录名），下面指定 node_id 和代表物种
+    sets:
+      bamboo_foot:
+        node_id: 30
+        represent_species: "Sinonovacula_constricta"
+      s_r_foot:
+        node_id: 29
+        represent_species: "Sinonovacula_constricta"
+      # 以后想加别的节点，就照抄：
+      # some_other_node:
+      #   node_id: 22
+      #   represent_species: "Meretrix_meretrix"
+  # ============================================================
+
+report:
+  fdr_alpha: 0.05
+  selected_cafe_model: "global"   # 严格版 11 必填；与 06/09 运行生成的 raw/<目录名> 对应
+
+binaries:
+  python: "python"
+  codeml: "codeml"
+  cafe5: "cafe5"
+  mcmctree: "mcmctree"
+
+mcmctree:
+  # -------- 上游（08/09）需要的引用，保持原样 --------
+  unrooted_tree: "../phylo/results/publish/aphylo_ready/species_tree.nwk"
+  rooted_tree: "../phylo/results/publish/aphylo_ready/species_tree_rooted.nwk"
+  source_tree: "results/06_cafe/mcmctree/species_calib.trees"   # 08 产出：有分支长度
+  tree:        "results/06_cafe/mcmctree/species_calib.nobl.trees"   # 同上（与部分脚本兼容）
+  outgroups:   ["Lottia_gigantea"]
+
+  # -------- 工作目录与关键输入（10 步在该目录内就地运行）--------
+  outdir:   "results/06_cafe/mcmctree"
+
+  # 由 09 产出、供 10 使用的序列文件（PHYLIP；建议仅写文件名，脚本会在 work_dir 内读取）
+  seqfile:  "concat.clean.phy"
+  # 由 08 产出、供 10 使用的两行树（第二行含 B(L,U) 校准、无分支长度；同样仅写文件名）
+  treefile: "species_calib.nobl.trees"
+
+  # -------- 模板（10 步新用法）--------
+  # 目录需放：mcmctree.ctl（usedata=3）与 mcmctree2.ctl（usedata=2）
+  templates: "templates"
+
+  # 超时树QC报告路径设置
+  work_dir: "results/06_cafe/mcmctree"                  # 首选工作目录
+  fallback_work_dirs:                   # 备选工作目录（可为空）
+    - "results/06_cafe/mcmctree"
+  qc_dirname: "qc_report"               # 质检子目录名
