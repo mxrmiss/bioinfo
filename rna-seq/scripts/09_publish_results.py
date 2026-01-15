@@ -2,28 +2,35 @@
 # -*- coding: utf-8 -*-
 
 """
-09_publish_results.py —— RNA-seq vNext 发布与装订脚本（含可选 xlsx + GO/KEGG 宽表）
+09_publish_results.py —— RNA-seq vNext 发布与装订脚本（适配 08_g_enrich.R：ORA 仅输出 up/down；可选发布 GSEA 全材料）
 
 功能定位（不做新统计，只做“装订 + 验收 + 说明 + 可选 xlsx”）：
-  1. 从 05 / 06 / 08 模块收集顶刊需要的表格，复制到：
+  1) 从 05 / 06 / 08 模块收集顶刊需要的表格，复制到：
        results/09_publish/source_data/
      目录结构：
        - matrix/
        - deg/<contrast>/
        - background/
-       - enrich/<label>/
-  2. 生成两个“验收单”：
+       - enrich/<label>/               （ORA：up/down + GO_sig_up/down）
+       - enrich/<label>/gsea/          （若开启且存在：发布 gsea 全材料：tsv/rds/params/sessionInfo/genesets/curves/*）
+  2) 生成两个“验收单”：
        - manifest.tsv      —— 所有已打包文件的清单
        - publish_check.tsv —— 各模块缺失文件情况
-  3. 生成 METHODS_README.txt 骨架：
+  3) 生成 METHODS_README.txt 骨架：
        - 填入 config.yaml 中的关键统计口径与阈值
        - 提供样本数量 / 分组情况等信息
-  4. 若 config.publish.xlsx = true，则为每个 contrast 生成一个 xlsx：
+  4) 若 config.publish.xlsx = true，则为每个 contrast 生成一个 xlsx：
        results/09_publish/<contrast>.xlsx
      xlsx 仅从 source_data 读现有 TSV：
-       - sheet：DEG_all / GO_sig_up / GO_sig_down / KEGG_all / background_meta
-       - 宽表：GO_summary（GO all/up/down 汇总），KEGG_summary（KEGG all/up/down 汇总）
+       - sheet：DEG_all / GO_sig_up / GO_sig_down / KEGG_up / KEGG_down / background_meta / design
+       - 可选：GO_gsea / KEGG_gsea（若 source_data/enrich/<contrast>/gsea/ 下存在）
+       - 宽表：GO_summary（GO up/down 汇总），KEGG_summary（KEGG up/down 汇总）
      不改变任何统计值与 TSV 表头，严格遵守 vNext 约定。
+
+重要适配点（与 08_g_enrich.R 对齐）：
+  - 08_g_enrich.R 默认不输出 test_set=all 的 ORA 表（GO/KEGG by-term 都不写 all）
+  - 08_g_enrich.R 默认只生成 GO_sig_up / GO_sig_down（不生成 GO_sig_all）
+  - 因此本脚本也只“期待并发布” up/down（all 不再当作缺失）
 
 使用方式：
   在项目根目录运行（不接受命令行参数）：
@@ -41,7 +48,7 @@ import sys
 import shutil
 import logging
 from pathlib import Path
-from typing import Dict, List, Any
+from typing import Dict, List, Any, Iterable, Tuple
 
 import yaml
 import csv
@@ -57,6 +64,15 @@ MANIFEST_COLUMNS = ["path", "module", "label", "description"]
 # publish_check.tsv 列名
 CHECK_COLUMNS = ["module", "label", "status", "detail"]
 
+# 与 08_g_enrich.R 对齐：ORA 只发布 up/down（不发布 all）
+ORA_TEST_SETS: List[str] = ["up", "down"]
+
+# GO 三本体
+GO_ONTOLOGIES: List[str] = ["BP", "CC", "MF"]
+
+# GSEA 发布策略：若存在 enrich/<label>/gsea/ 则递归发布全部文件（含 curves/）
+PUBLISH_GSEA_ALL_FILES: bool = True
+
 # ====================================================================
 
 
@@ -71,9 +87,7 @@ def setup_logging(level: str = "INFO") -> None:
 
 
 def load_config(path: Path) -> Dict[str, Any]:
-    """
-    读取 YAML 配置文件。
-    """
+    """读取 YAML 配置文件。"""
     if not path.is_file():
         logging.error("找不到配置文件：%s", path)
         sys.exit(1)
@@ -97,9 +111,7 @@ def copy_file(
     manifest_rows: List[Dict[str, str]],
     source_data_root: Path,
 ) -> None:
-    """
-    复制单个文件，并将其记录到 manifest_rows。
-    """
+    """复制单个文件，并将其记录到 manifest_rows。"""
     ensure_dir(dst.parent)
     shutil.copy2(src, dst)
     rel_path = dst.relative_to(source_data_root)
@@ -114,10 +126,53 @@ def copy_file(
     logging.info("已复制文件：%s -> %s", src, dst)
 
 
+def iter_files_recursive(root: Path) -> Iterable[Path]:
+    """递归枚举目录下所有文件（不含目录）。"""
+    if not root.exists():
+        return []
+    for p in root.rglob("*"):
+        if p.is_file():
+            yield p
+
+
+def copy_dir_recursive(
+    src_dir: Path,
+    dst_dir: Path,
+    module: str,
+    label: str,
+    description_prefix: str,
+    manifest_rows: List[Dict[str, str]],
+    source_data_root: Path,
+) -> int:
+    """
+    递归复制目录下所有文件（保持相对路径），并逐文件写入 manifest。
+    返回复制的文件数量。
+    """
+    if not src_dir.is_dir():
+        return 0
+    ensure_dir(dst_dir)
+    n = 0
+    for f in iter_files_recursive(src_dir):
+        rel = f.relative_to(src_dir)
+        dst = dst_dir / rel
+        ensure_dir(dst.parent)
+        shutil.copy2(f, dst)
+        rel_path = dst.relative_to(source_data_root)
+        manifest_rows.append(
+            {
+                "path": str(rel_path),
+                "module": module,
+                "label": label if label else "NA",
+                "description": f"{description_prefix}: {rel.as_posix()}",
+            }
+        )
+        n += 1
+    logging.info("已递归复制目录：%s -> %s（%d files）", src_dir, dst_dir, n)
+    return n
+
+
 def write_tsv(path: Path, rows: List[Dict[str, Any]], fieldnames: List[str]) -> None:
-    """
-    写出 TSV 文件。
-    """
+    """写出 TSV 文件。"""
     ensure_dir(path.parent)
     with path.open("w", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(
@@ -134,9 +189,7 @@ def write_tsv(path: Path, rows: List[Dict[str, Any]], fieldnames: List[str]) -> 
 
 
 def read_tsv_header_and_rows(path: Path) -> List[Dict[str, str]]:
-    """
-    简单读取 TSV（带表头），全部转为字符串。
-    """
+    """简单读取 TSV（带表头），全部转为字符串。"""
     rows: List[Dict[str, str]] = []
     with path.open("r", encoding="utf-8") as f:
         reader = csv.DictReader(f, delimiter="\t")
@@ -146,9 +199,7 @@ def read_tsv_header_and_rows(path: Path) -> List[Dict[str, str]]:
 
 
 def get_contrasts_list(cfg: Dict[str, Any]) -> List[str]:
-    """
-    从 data/contrasts.tsv 读取 contrast 列，得到对比列表。
-    """
+    """从 data/contrasts.tsv 读取 contrast 列，得到对比列表。"""
     data_cfg = cfg.get("data", {})
     contrasts_path = Path(data_cfg.get("contrasts_tsv", "data/contrasts.tsv"))
     if not contrasts_path.is_file():
@@ -167,9 +218,7 @@ def get_contrasts_list(cfg: Dict[str, Any]) -> List[str]:
 
 
 def summarize_samples(cfg: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    从 data/samples.tsv 中统计样本数、分组情况，用于 Methods 文本。
-    """
+    """从 data/samples.tsv 中统计样本数、分组情况，用于 Methods 文本。"""
     data_cfg = cfg.get("data", {})
     samples_path = Path(data_cfg.get("samples_tsv", "data/samples.tsv"))
     summary = {
@@ -210,9 +259,7 @@ def build_methods_readme_text(
     samples_summary: Dict[str, Any],
     source_data_root: Path,
 ) -> str:
-    """
-    构造 METHODS_README.txt 的文本内容。
-    """
+    """构造 METHODS_README.txt 的文本内容。"""
     project_cfg = cfg.get("project", {})
     reference_cfg = cfg.get("reference", {})
     deg_cfg = cfg.get("deg", {})
@@ -310,29 +357,31 @@ def build_methods_readme_text(
     lines.append("5. Enrichment analysis (GO / KEGG ORA and optional GSEA)")
     lines.append("--------------------------------------------------------")
     lines.append("5.1 Background definition")
-    lines.append(f"- For each RNA-seq contrast, the enrichment background was defined as:")
+    lines.append("- For each RNA-seq contrast, the enrichment background was defined as:")
     lines.append(f"  * Rule: {background_rule}")
     lines.append(f"  * Detectable criteria: {background_detectable}")
-    lines.append(f"- Per-contrast background lists and metadata are provided under: {background_dir_rel}/")
-    lines.append("  * <contrast>.list (gene_id of the background universe)")
-    lines.append("  * <contrast>.meta.tsv (universe_size, coverage, and sample subset used).")
+    lines.append("- Per-contrast background lists and metadata are provided under:")
+    lines.append(f"  * {background_dir_rel}/<contrast>.list")
+    lines.append(f"  * {background_dir_rel}/<contrast>.meta.tsv")
     lines.append("")
     lines.append("5.2 GO over-representation analysis (ORA)")
     lines.append(f"- GO ORA was performed using a hypergeometric test with {go_padj_method} multiple-testing correction.")
     lines.append(f"- Minimum and maximum gene set size: minGS = {go_minGS}, maxGS = {go_maxGS}.")
     lines.append("- GO terms were tested separately for the three ontologies (BP, CC, MF).")
+    lines.append("- This vNext configuration outputs ORA by-term tables for up/down gene sets (test_set=all is not written by design).")
     lines.append("- For each label (RNA contrast or external tag), by-term tables are provided in:")
-    lines.append(f"  * {enrich_dir_rel}/<label>/GO_BP_by_term_(all|up|down).tsv")
-    lines.append(f"  * {enrich_dir_rel}/<label>/GO_CC_by_term_(all|up|down).tsv")
-    lines.append(f"  * {enrich_dir_rel}/<label>/GO_MF_by_term_(all|up|down).tsv")
-    lines.append("- For convenience, GO_sig_all.tsv, GO_sig_up.tsv, and GO_sig_down.tsv provide FDR-filtered summaries across the three ontologies for each label.")
-    lines.append(f"- Enrichment FDR cutoff for GO by-term and GO_sig_* tables: {enrich_fdr}.")
+    lines.append(f"  * {enrich_dir_rel}/<label>/GO_BP_by_term_(up|down).tsv")
+    lines.append(f"  * {enrich_dir_rel}/<label>/GO_CC_by_term_(up|down).tsv")
+    lines.append(f"  * {enrich_dir_rel}/<label>/GO_MF_by_term_(up|down).tsv")
+    lines.append("- For convenience, GO_sig_up.tsv and GO_sig_down.tsv provide FDR-filtered summaries across the three ontologies for each label.")
+    lines.append(f"- Enrichment FDR cutoff for GO tables: {enrich_fdr}.")
     lines.append("")
     lines.append("5.3 KEGG over-representation analysis (ORA)")
     lines.append(f"- KEGG ORA was performed using a hypergeometric test with {kegg_padj_method} multiple-testing correction.")
     lines.append(f"- Gene counts in KEGG terms were computed with count_mode = {kegg_count_mode}.")
+    lines.append("- This vNext configuration outputs KEGG by-term tables for up/down gene sets (test_set=all is not written by design).")
     lines.append("- For each label (RNA contrast or external tag), KEGG by-term tables are provided in:")
-    lines.append(f"  * {enrich_dir_rel}/<label>/KEGG_by_term_(all|up|down).tsv")
+    lines.append(f"  * {enrich_dir_rel}/<label>/KEGG_by_term_(up|down).tsv")
     lines.append(f"- The same enrichment FDR cutoff ({enrich_fdr}) was applied when interpreting KEGG results.")
     lines.append("")
     lines.append("5.4 Gene set enrichment analysis (GSEA) (optional)")
@@ -342,9 +391,12 @@ def build_methods_readme_text(
         lines.append(f"- GSEA gene set size range: minGS = {gsea_minGS}, maxGS = {gsea_maxGS}.")
         lines.append(f"- Multiple-testing correction: {gsea_padj_method}, with FDR threshold = {gsea_fdr}.")
         lines.append(f"- GO GSEA ontologies included: {', '.join(gsea_ontologies)}.")
-        lines.append(f"- Results are provided (when available) under: {enrich_dir_rel}/<label>/gsea/")
-        lines.append("  * GO_gsea.tsv")
-        lines.append("  * KEGG_gsea.tsv")
+        lines.append(f"- When available, full GSEA materials are provided under: {enrich_dir_rel}/<label>/gsea/")
+        lines.append("  * GO_gsea.tsv, KEGG_gsea.tsv (main result tables)")
+        lines.append("  * geneList.tsv / geneList.rds (ranking vector for reproducibility)")
+        lines.append("  * gsea_params.tsv, sessionInfo.txt (parameters and environment)")
+        lines.append("  * GO_genesets_used.tsv / KEGG_genesets_used.tsv (genesets actually used)")
+        lines.append("  * curves/* (running ES curve materials for top terms)")
     else:
         lines.append("- GSEA was not enabled in this analysis run.")
     lines.append("")
@@ -352,10 +404,10 @@ def build_methods_readme_text(
     lines.append("------------------------------------------")
     lines.append(f"- All source data are organised under: {source_data_root}")
     lines.append("- Key subdirectories and their contents:")
-    lines.append(f"  * matrix/       : gene-level counts, TPMs, and basic matrix statistics.")
-    lines.append(f"  * deg/          : per-contrast DESeq2 outputs and diagnostics.")
-    lines.append(f"  * background/   : per-contrast enrichment background lists and metadata.")
-    lines.append(f"  * enrich/       : GO/KEGG ORA outputs (and optional GSEA results) for RNA contrasts and external tags.")
+    lines.append("  * matrix/       : gene-level counts, TPMs, and basic matrix statistics.")
+    lines.append("  * deg/          : per-contrast DESeq2 outputs and diagnostics.")
+    lines.append("  * background/   : per-contrast enrichment background lists and metadata.")
+    lines.append("  * enrich/       : GO/KEGG ORA outputs (up/down) and optional GSEA materials for RNA contrasts and external tags.")
     lines.append("- A machine-readable manifest of all files is provided as manifest.tsv.")
     lines.append("- A QC-style summary of missing or incomplete outputs is provided as publish_check.tsv.")
     lines.append("")
@@ -367,12 +419,11 @@ def build_methods_readme_text(
 
     return "\n".join(lines) + "\n"
 
+
 # ========================= xlsx 相关工具函数 =========================
 
 def tsv_to_worksheet(ws, tsv_path: Path) -> None:
-    """
-    将一个 TSV 文件写入到 openpyxl 的 worksheet 中（原样长表写入）。
-    """
+    """将一个 TSV 文件写入到 openpyxl 的 worksheet 中（原样长表写入）。"""
     with tsv_path.open("r", encoding="utf-8") as f:
         reader = csv.reader(f, delimiter="\t")
         for row_idx, row in enumerate(reader, start=1):
@@ -386,26 +437,23 @@ def build_go_summary_sheet(
     source_data_root: Path,
 ) -> None:
     """
-    构建 GO_summary 宽表 sheet：
+    构建 GO_summary 宽表 sheet（适配 08_g_enrich.R：仅 up/down）：
 
     数据来源（全部从 source_data/enrich/<contrast>/ 中读取）：
-      - GO_BP_by_term_all.tsv / up.tsv / down.tsv
-      - GO_CC_by_term_all.tsv / up.tsv / down.tsv
-      - GO_MF_by_term_all.tsv / up.tsv / down.tsv
+      - GO_BP_by_term_up.tsv / down.tsv
+      - GO_CC_by_term_up.tsv / down.tsv
+      - GO_MF_by_term_up.tsv / down.tsv
 
     聚合规则：
       - 以 (term_id, ontology) 为 key，一行一个 term；
-      - 为 all/up/down 分别存 p_adjust / gene_count / gene_ids；
+      - 为 up/down 分别存 p_adjust / gene_count / gene_ids；
       - bg_size/universe_size/min_gs/max_gs 使用任一来源行（通常相同）。
-
-    不做新的统计，仅为 Excel 浏览重组宽表。
     """
     enrich_dir = source_data_root / "enrich" / contrast
-    onts = ["BP", "CC", "MF"]
-    sets = ["all", "up", "down"]
+    onts = GO_ONTOLOGIES
+    sets = ORA_TEST_SETS  # up/down
 
-    # term_key -> 聚合信息
-    summary: Dict[tuple, Dict[str, Any]] = {}
+    summary: Dict[Tuple[str, str], Dict[str, Any]] = {}
 
     for ont in onts:
         for test_set in sets:
@@ -426,29 +474,19 @@ def build_go_summary_sheet(
                         "term_id": term_id,
                         "term_name": term_name,
                         "ontology": ontology,
-                        # all/up/down：p_adjust / gene_count / gene_ids
-                        "p_adjust_all": "",
                         "p_adjust_up": "",
                         "p_adjust_down": "",
-                        "gene_count_all": "",
                         "gene_count_up": "",
                         "gene_count_down": "",
-                        "gene_ids_all": "",
                         "gene_ids_up": "",
                         "gene_ids_down": "",
-                        # 共享字段
                         "bg_size": row.get("bg_size", ""),
                         "universe_size": row.get("universe_size", ""),
                         "min_gs": row.get("min_gs", ""),
                         "max_gs": row.get("max_gs", ""),
                     }
                 dest = summary[key]
-                # 根据 test_set 写入对应字段
-                if test_set == "all":
-                    dest["p_adjust_all"] = row.get("p_adjust", "")
-                    dest["gene_count_all"] = row.get("gene_count", "")
-                    dest["gene_ids_all"] = row.get("gene_ids", "")
-                elif test_set == "up":
+                if test_set == "up":
                     dest["p_adjust_up"] = row.get("p_adjust", "")
                     dest["gene_count_up"] = row.get("gene_count", "")
                     dest["gene_ids_up"] = row.get("gene_ids", "")
@@ -456,14 +494,13 @@ def build_go_summary_sheet(
                     dest["p_adjust_down"] = row.get("p_adjust", "")
                     dest["gene_count_down"] = row.get("gene_count", "")
                     dest["gene_ids_down"] = row.get("gene_ids", "")
-                # 共享字段以最后一次为准（通常一致）
                 dest["bg_size"] = row.get("bg_size", dest["bg_size"])
                 dest["universe_size"] = row.get("universe_size", dest["universe_size"])
                 dest["min_gs"] = row.get("min_gs", dest["min_gs"])
                 dest["max_gs"] = row.get("max_gs", dest["max_gs"])
 
     if not summary:
-        logging.info("contrast=%s：未找到 GO by-term 表，跳过 GO_summary 宽表。", contrast)
+        logging.info("contrast=%s：未找到 GO by-term（up/down）表，跳过 GO_summary 宽表。", contrast)
         return
 
     ws = wb.create_sheet(title="GO_summary")
@@ -471,13 +508,10 @@ def build_go_summary_sheet(
         "term_id",
         "term_name",
         "ontology",
-        "p_adjust_all",
         "p_adjust_up",
         "p_adjust_down",
-        "gene_count_all",
         "gene_count_up",
         "gene_count_down",
-        "gene_ids_all",
         "gene_ids_up",
         "gene_ids_down",
         "bg_size",
@@ -487,20 +521,16 @@ def build_go_summary_sheet(
     ]
     ws.append(header)
 
-    # 按 ontology+term_id 排序，方便浏览
     for key in sorted(summary.keys(), key=lambda x: (x[1], x[0])):
         v = summary[key]
         row = [
             v.get("term_id", ""),
             v.get("term_name", ""),
             v.get("ontology", ""),
-            v.get("p_adjust_all", ""),
             v.get("p_adjust_up", ""),
             v.get("p_adjust_down", ""),
-            v.get("gene_count_all", ""),
             v.get("gene_count_up", ""),
             v.get("gene_count_down", ""),
-            v.get("gene_ids_all", ""),
             v.get("gene_ids_up", ""),
             v.get("gene_ids_down", ""),
             v.get("bg_size", ""),
@@ -519,20 +549,18 @@ def build_kegg_summary_sheet(
     source_data_root: Path,
 ) -> None:
     """
-    构建 KEGG_summary 宽表 sheet：
+    构建 KEGG_summary 宽表 sheet（适配 08_g_enrich.R：仅 up/down）：
 
     数据来源（全部从 source_data/enrich/<contrast>/ 中读取）：
-      - KEGG_by_term_all.tsv / up.tsv / down.tsv
+      - KEGG_by_term_up.tsv / down.tsv
 
     聚合规则：
       - 以 pathway_id 为 key，一行一个 pathway；
-      - 为 all/up/down 分别存 p_adjust / gene_count / gene_ids；
+      - 为 up/down 分别存 p_adjust / gene_count / gene_ids；
       - bg_size/universe_size/min_gs/max_gs/count_mode 使用任一来源行。
-
-    不做新的统计，仅为 Excel 浏览重组宽表。
     """
     enrich_dir = source_data_root / "enrich" / contrast
-    sets = ["all", "up", "down"]
+    sets = ORA_TEST_SETS  # up/down
 
     summary: Dict[str, Dict[str, Any]] = {}
 
@@ -551,13 +579,10 @@ def build_kegg_summary_sheet(
                 summary[pathway_id] = {
                     "pathway_id": pathway_id,
                     "term_name": term_name,
-                    "p_adjust_all": "",
                     "p_adjust_up": "",
                     "p_adjust_down": "",
-                    "gene_count_all": "",
                     "gene_count_up": "",
                     "gene_count_down": "",
-                    "gene_ids_all": "",
                     "gene_ids_up": "",
                     "gene_ids_down": "",
                     "bg_size": row.get("bg_size", ""),
@@ -567,11 +592,7 @@ def build_kegg_summary_sheet(
                     "count_mode": row.get("count_mode", ""),
                 }
             dest = summary[pathway_id]
-            if test_set == "all":
-                dest["p_adjust_all"] = row.get("p_adjust", "")
-                dest["gene_count_all"] = row.get("gene_count", "")
-                dest["gene_ids_all"] = row.get("gene_ids", "")
-            elif test_set == "up":
+            if test_set == "up":
                 dest["p_adjust_up"] = row.get("p_adjust", "")
                 dest["gene_count_up"] = row.get("gene_count", "")
                 dest["gene_ids_up"] = row.get("gene_ids", "")
@@ -587,20 +608,17 @@ def build_kegg_summary_sheet(
             dest["count_mode"] = row.get("count_mode", dest["count_mode"])
 
     if not summary:
-        logging.info("contrast=%s：未找到 KEGG by-term 表，跳过 KEGG_summary 宽表。", contrast)
+        logging.info("contrast=%s：未找到 KEGG by-term（up/down）表，跳过 KEGG_summary 宽表。", contrast)
         return
 
     ws = wb.create_sheet(title="KEGG_summary")
     header = [
         "pathway_id",
         "term_name",
-        "p_adjust_all",
         "p_adjust_up",
         "p_adjust_down",
-        "gene_count_all",
         "gene_count_up",
         "gene_count_down",
-        "gene_ids_all",
         "gene_ids_up",
         "gene_ids_down",
         "bg_size",
@@ -616,13 +634,10 @@ def build_kegg_summary_sheet(
         row = [
             v.get("pathway_id", ""),
             v.get("term_name", ""),
-            v.get("p_adjust_all", ""),
             v.get("p_adjust_up", ""),
             v.get("p_adjust_down", ""),
-            v.get("gene_count_all", ""),
             v.get("gene_count_up", ""),
             v.get("gene_count_down", ""),
-            v.get("gene_ids_all", ""),
             v.get("gene_ids_up", ""),
             v.get("gene_ids_down", ""),
             v.get("bg_size", ""),
@@ -643,18 +658,21 @@ def build_contrast_xlsx(
     manifest_rows: List[Dict[str, str]],
 ) -> None:
     """
-    为单个 contrast 生成一个 <contrast>.xlsx 文件。
+    为单个 contrast 生成一个 <contrast>.xlsx 文件（适配 08_g_enrich.R：ORA 仅 up/down）：
 
     只依赖 source_data 下的内容：
       - deg/<contrast>/DEG_all.tsv
       - enrich/<contrast>/GO_sig_up.tsv
       - enrich/<contrast>/GO_sig_down.tsv
-      - enrich/<contrast>/KEGG_by_term_all.tsv
+      - enrich/<contrast>/KEGG_by_term_up.tsv
+      - enrich/<contrast>/KEGG_by_term_down.tsv
       - background/<contrast>.meta.tsv
+      - deg/<contrast>/design.txt（可选）
+      - enrich/<contrast>/gsea/GO_gsea.tsv, KEGG_gsea.tsv（可选）
 
-    以及宽表：
-      - enrich/<contrast>/GO_*_by_term_*.tsv  -> GO_summary
-      - enrich/<contrast>/KEGG_by_term_*.tsv  -> KEGG_summary
+    宽表：
+      - enrich/<contrast>/GO_*_by_term_(up|down).tsv  -> GO_summary
+      - enrich/<contrast>/KEGG_by_term_(up|down).tsv  -> KEGG_summary
 
     任意文件缺失则跳过对应 sheet，不报错。
     """
@@ -667,19 +685,25 @@ def build_contrast_xlsx(
     deg_all_tsv = source_data_root / "deg" / contrast / "DEG_all.tsv"
     go_sig_up_tsv = source_data_root / "enrich" / contrast / "GO_sig_up.tsv"
     go_sig_down_tsv = source_data_root / "enrich" / contrast / "GO_sig_down.tsv"
-    kegg_all_tsv = source_data_root / "enrich" / contrast / "KEGG_by_term_all.tsv"
+    kegg_up_tsv = source_data_root / "enrich" / contrast / "KEGG_by_term_up.tsv"
+    kegg_down_tsv = source_data_root / "enrich" / contrast / "KEGG_by_term_down.tsv"
     bg_meta_tsv = source_data_root / "background" / f"{contrast}.meta.tsv"
     design_txt = source_data_root / "deg" / contrast / "design.txt"
-    go_sig_all_tsv = source_data_root / "enrich" / contrast / "GO_sig_all.tsv"
+
+    # 可选 GSEA（若存在就写进 xlsx 方便浏览）
+    go_gsea_tsv = source_data_root / "enrich" / contrast / "gsea" / "GO_gsea.tsv"
+    kegg_gsea_tsv = source_data_root / "enrich" / contrast / "gsea" / "KEGG_gsea.tsv"
 
     available = any([
         deg_all_tsv.is_file(),
         go_sig_up_tsv.is_file(),
         go_sig_down_tsv.is_file(),
-        kegg_all_tsv.is_file(),
+        kegg_up_tsv.is_file(),
+        kegg_down_tsv.is_file(),
         bg_meta_tsv.is_file(),
         design_txt.is_file(),
-        go_sig_all_tsv.is_file(),
+        go_gsea_tsv.is_file(),
+        kegg_gsea_tsv.is_file(),
     ])
     if not available:
         logging.info("contrast=%s 没有可用的 TSV 供生成 xlsx，跳过。", contrast)
@@ -706,16 +730,13 @@ def build_contrast_xlsx(
         ws = wb.create_sheet(title="GO_sig_down")
         tsv_to_worksheet(ws, go_sig_down_tsv)
 
-    # GO_sig_all sheet
-    if go_sig_all_tsv.is_file():
-        # 即使只有表头也照样写入，方便后续确认口径
-        ws = wb.create_sheet(title="GO_sig_all")
-        tsv_to_worksheet(ws, go_sig_all_tsv)
-
-    # KEGG_all sheet（用 KEGG_by_term_all.tsv）
-    if kegg_all_tsv.is_file():
-        ws = wb.create_sheet(title="KEGG_all")
-        tsv_to_worksheet(ws, kegg_all_tsv)
+    # KEGG_up / KEGG_down
+    if kegg_up_tsv.is_file():
+        ws = wb.create_sheet(title="KEGG_up")
+        tsv_to_worksheet(ws, kegg_up_tsv)
+    if kegg_down_tsv.is_file():
+        ws = wb.create_sheet(title="KEGG_down")
+        tsv_to_worksheet(ws, kegg_down_tsv)
 
     # background_meta sheet
     if bg_meta_tsv.is_file():
@@ -729,13 +750,20 @@ def build_contrast_xlsx(
             for row_idx, line in enumerate(f, start=1):
                 ws.cell(row=row_idx, column=1, value=line.rstrip("\n"))
 
-    # GO_summary 宽表
+    # 可选：GSEA 结果表
+    if go_gsea_tsv.is_file():
+        ws = wb.create_sheet(title="GO_gsea")
+        tsv_to_worksheet(ws, go_gsea_tsv)
+    if kegg_gsea_tsv.is_file():
+        ws = wb.create_sheet(title="KEGG_gsea")
+        tsv_to_worksheet(ws, kegg_gsea_tsv)
+
+    # GO_summary 宽表（up/down）
     build_go_summary_sheet(wb, contrast, source_data_root)
 
-    # KEGG_summary 宽表
+    # KEGG_summary 宽表（up/down）
     build_kegg_summary_sheet(wb, contrast, source_data_root)
 
-    # 若最终 workbook 中没有任何 sheet，就不写文件
     if len(wb.worksheets) == 0:
         logging.info("contrast=%s workbook 为空，未生成 xlsx。", contrast)
         return
@@ -744,11 +772,10 @@ def build_contrast_xlsx(
     wb.save(xlsx_path)
     logging.info("已生成 xlsx：%s", xlsx_path)
 
-    # 记录到 manifest（这里用相对于 publish_root 的路径看起来更直观）
+    # 记录到 manifest（xlsx 在 publish_root 下，不一定在 source_data 下）
     try:
         rel = xlsx_path.relative_to(source_data_root)
     except ValueError:
-        # xlsx 不在 source_data 下，用相对于 publish_root 的路径记录
         try:
             rel = xlsx_path.relative_to(publish_root)
         except ValueError:
@@ -759,7 +786,7 @@ def build_contrast_xlsx(
             "path": str(rel),
             "module": "xlsx",
             "label": contrast,
-            "description": "Excel workbook summarising key tables and wide GO/KEGG summaries for this contrast",
+            "description": "Excel workbook summarising key tables and wide GO/KEGG summaries (up/down) for this contrast",
         }
     )
 
@@ -791,7 +818,7 @@ def main() -> None:
     manifest_rows: List[Dict[str, str]] = []
     check_rows: List[Dict[str, str]] = []
 
-# ========== 1) matrix 模块 ==========
+    # ========== 1) matrix 模块 ==========
     logging.info("===== 1) 打包 matrix 模块 =====")
     src_counts = matrix_dir / "counts" / "gene_counts.tsv"
     src_tpm = matrix_dir / "tpms" / "gene_tpm.tsv"
@@ -812,9 +839,7 @@ def main() -> None:
             source_data_root=source_data_root,
         )
     else:
-        check_rows.append(
-            {"module": "matrix", "label": "NA", "status": "missing", "detail": f"missing file: {src_counts}"}
-        )
+        check_rows.append({"module": "matrix", "label": "NA", "status": "missing", "detail": f"missing file: {src_counts}"})
         logging.warning("缺少 matrix 文件：%s", src_counts)
 
     if src_tpm.is_file():
@@ -829,9 +854,7 @@ def main() -> None:
             source_data_root=source_data_root,
         )
     else:
-        check_rows.append(
-            {"module": "matrix", "label": "NA", "status": "missing", "detail": f"missing file: {src_tpm}"}
-        )
+        check_rows.append({"module": "matrix", "label": "NA", "status": "missing", "detail": f"missing file: {src_tpm}"})
         logging.warning("缺少 matrix 文件：%s", src_tpm)
 
     if src_stats.is_file():
@@ -846,9 +869,7 @@ def main() -> None:
             source_data_root=source_data_root,
         )
     else:
-        check_rows.append(
-            {"module": "matrix", "label": "NA", "status": "missing", "detail": f"missing file: {src_stats}"}
-        )
+        check_rows.append({"module": "matrix", "label": "NA", "status": "missing", "detail": f"missing file: {src_stats}"})
         logging.warning("缺少 matrix 文件：%s", src_stats)
 
     # ========== 2) DEG 模块 ==========
@@ -863,14 +884,7 @@ def main() -> None:
     for contrast in contrasts:
         contrast_dir = deg_dir / contrast
         if not contrast_dir.is_dir():
-            check_rows.append(
-                {
-                    "module": "deg",
-                    "label": contrast,
-                    "status": "missing",
-                    "detail": f"DEG directory not found: {contrast_dir}",
-                }
-            )
+            check_rows.append({"module": "deg", "label": contrast, "status": "missing", "detail": f"DEG directory not found: {contrast_dir}"})
             logging.warning("DEG 目录缺失：%s", contrast_dir)
             continue
 
@@ -906,14 +920,7 @@ def main() -> None:
                 logging.warning("DEG 文件缺失：%s", src)
 
         if missing_list:
-            check_rows.append(
-                {
-                    "module": "deg",
-                    "label": contrast,
-                    "status": "partial",
-                    "detail": "missing files: " + ", ".join(missing_list),
-                }
-            )
+            check_rows.append({"module": "deg", "label": contrast, "status": "partial", "detail": "missing files: " + ", ".join(missing_list)})
         else:
             check_rows.append({"module": "deg", "label": contrast, "status": "ok", "detail": ""})
 
@@ -959,14 +966,7 @@ def main() -> None:
             logging.warning("背景 meta 缺失：%s", meta_in)
 
         if missing_bg:
-            check_rows.append(
-                {
-                    "module": "background",
-                    "label": contrast,
-                    "status": "partial",
-                    "detail": "missing files: " + ", ".join(missing_bg),
-                }
-            )
+            check_rows.append({"module": "background", "label": contrast, "status": "partial", "detail": "missing files: " + ", ".join(missing_bg)})
         else:
             check_rows.append({"module": "background", "label": contrast, "status": "ok", "detail": ""})
 
@@ -987,8 +987,8 @@ def main() -> None:
     enrich_labels = sorted(set(enrich_labels))
     logging.info("检测到富集 label 数量：%d（%s）", len(enrich_labels), ", ".join(enrich_labels) if enrich_labels else "无")
 
-    onts = ["BP", "CC", "MF"]
-    sets = ["all", "up", "down"]
+    onts = GO_ONTOLOGIES
+    sets = ORA_TEST_SETS  # up/down only
 
     for label in enrich_labels:
         label_in_dir = enrich_dir / label
@@ -996,8 +996,9 @@ def main() -> None:
         ensure_dir(label_out_dir)
 
         missing_enrich: List[str] = []
+        missing_gsea_notes: List[str] = []
 
-        # GO by-term
+        # GO by-term（up/down）
         for ont in onts:
             for test_set in sets:
                 fname = f"GO_{ont}_by_term_{test_set}.tsv"
@@ -1017,8 +1018,8 @@ def main() -> None:
                 else:
                     missing_enrich.append(str(src))
 
-        # GO_sig_*
-        for set_name in ["all", "up", "down"]:
+        # GO_sig_up/down（不再期待 GO_sig_all）
+        for set_name in ["up", "down"]:
             fname = f"GO_sig_{set_name}.tsv"
             src = label_in_dir / fname
             if src.is_file():
@@ -1036,7 +1037,7 @@ def main() -> None:
             else:
                 missing_enrich.append(str(src))
 
-        # KEGG by-term
+        # KEGG by-term（up/down）
         for test_set in sets:
             fname = f"KEGG_by_term_{test_set}.tsv"
             src = label_in_dir / fname
@@ -1055,41 +1056,74 @@ def main() -> None:
             else:
                 missing_enrich.append(str(src))
 
-        # GSEA 可选
+        # GSEA：若存在 gsea 目录，则发布“全材料”（含 curves）
         gsea_in_dir = label_in_dir / "gsea"
         if gsea_in_dir.is_dir():
             gsea_out_dir = label_out_dir / "gsea"
-            ensure_dir(gsea_out_dir)
-            for gsea_fname, desc in [
-                ("GO_gsea.tsv", f"GO GSEA results for label {label}"),
-                ("KEGG_gsea.tsv", f"KEGG GSEA results for label {label}"),
-            ]:
-                src = gsea_in_dir / gsea_fname
-                if src.is_file():
-                    dst = gsea_out_dir / gsea_fname
-                    copy_file(
-                        src,
-                        dst,
-                        module="enrich",
-                        label=label,
-                        description=desc,
-                        manifest_rows=manifest_rows,
-                        source_data_root=source_data_root,
-                    )
-                else:
-                    missing_enrich.append(str(src))
+            if PUBLISH_GSEA_ALL_FILES:
+                n_files = copy_dir_recursive(
+                    src_dir=gsea_in_dir,
+                    dst_dir=gsea_out_dir,
+                    module="enrich_gsea",
+                    label=label,
+                    description_prefix=f"GSEA materials for label {label}",
+                    manifest_rows=manifest_rows,
+                    source_data_root=source_data_root,
+                )
+                if n_files == 0:
+                    missing_gsea_notes.append("gsea/ directory exists but contains no files")
+            else:
+                # 仅复制两张主表（更保守）
+                for gsea_fname, desc in [
+                    ("GO_gsea.tsv", f"GO GSEA results for label {label}"),
+                    ("KEGG_gsea.tsv", f"KEGG GSEA results for label {label}"),
+                ]:
+                    src = gsea_in_dir / gsea_fname
+                    if src.is_file():
+                        dst = gsea_out_dir / gsea_fname
+                        copy_file(
+                            src,
+                            dst,
+                            module="enrich_gsea",
+                            label=label,
+                            description=desc,
+                            manifest_rows=manifest_rows,
+                            source_data_root=source_data_root,
+                        )
+                    else:
+                        missing_gsea_notes.append(f"missing gsea file: {src}")
 
+            # 轻量验收：主结果表是否存在（不强制）
+            if not (gsea_in_dir / "GO_gsea.tsv").is_file():
+                missing_gsea_notes.append("GO_gsea.tsv not found (GSEA may have been skipped or produced empty)")
+            if not (gsea_in_dir / "KEGG_gsea.tsv").is_file():
+                missing_gsea_notes.append("KEGG_gsea.tsv not found (GSEA may have been skipped or produced empty)")
+
+        # enrich 模块验收
         if missing_enrich:
-            check_rows.append(
-                {
-                    "module": "enrich",
-                    "label": label,
-                    "status": "partial_or_missing",
-                    "detail": "missing (or not generated) files: " + ", ".join(missing_enrich),
-                }
-            )
+            detail = "missing (or not generated) files: " + ", ".join(missing_enrich)
+            if missing_gsea_notes:
+                detail += " ; gsea_notes: " + " | ".join(missing_gsea_notes)
+            check_rows.append({"module": "enrich", "label": label, "status": "partial_or_missing", "detail": detail})
         else:
-            check_rows.append({"module": "enrich", "label": label, "status": "ok", "detail": ""})
+            if missing_gsea_notes:
+                check_rows.append({"module": "enrich", "label": label, "status": "ok_with_gsea_notes", "detail": "gsea_notes: " + " | ".join(missing_gsea_notes)})
+            else:
+                check_rows.append({"module": "enrich", "label": label, "status": "ok", "detail": ""})
+
+    # 可选：把 enrich 总汇总表也带走（如果存在）
+    enrich_summary_fp = enrich_dir / "summary.tsv"
+    if enrich_summary_fp.is_file():
+        dst = enrich_out_root / "summary.tsv"
+        copy_file(
+            enrich_summary_fp,
+            dst,
+            module="enrich",
+            label="NA",
+            description="Enrichment global summary across labels (results/08_enrich/summary.tsv)",
+            manifest_rows=manifest_rows,
+            source_data_root=source_data_root,
+        )
 
     # ========== 5) manifest.tsv & publish_check.tsv ==========
     logging.info("===== 5) 写出 manifest.tsv 与 publish_check.tsv =====")
@@ -1108,7 +1142,7 @@ def main() -> None:
     with methods_readme_path.open("w", encoding="utf-8") as f:
         f.write(methods_text)
 
-    # 把 METHODS_README 也加进 manifest
+    # 把 METHODS_README 也加进 manifest（然后刷新一次）
     try:
         rel_path = methods_readme_path.relative_to(source_data_root)
     except ValueError:
@@ -1118,14 +1152,14 @@ def main() -> None:
             "path": str(rel_path),
             "module": "methods",
             "label": "NA",
-            "description": "Methods README skeleton for this RNA-seq project",
+            "description": "Methods README skeleton for this RNA-seq project (aligned to 08_g_enrich.R outputs)",
         }
     )
     write_tsv(manifest_path, manifest_rows, MANIFEST_COLUMNS)
 
     # ========== 7) 可选：生成每个 contrast 的 xlsx ==========
     if enable_xlsx and contrasts:
-        logging.info("===== 7) 生成 per-contrast xlsx 工作簿（含 GO/KEGG 宽表） =====")
+        logging.info("===== 7) 生成 per-contrast xlsx 工作簿（含 GO/KEGG 宽表；可选写入 GSEA 主表） =====")
         for contrast in contrasts:
             build_contrast_xlsx(
                 contrast=contrast,
@@ -1146,3 +1180,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

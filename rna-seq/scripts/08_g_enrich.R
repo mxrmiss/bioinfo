@@ -1,21 +1,20 @@
 #!/usr/bin/env Rscript
 # -*- coding: utf-8 -*-
 
-# 08_g_enrich.R —— GO/KEGG ORA + GSEA 执行模块（vNext + GSEA + obsolete 安全版）
+# 08_g_enrich.R —— GO/KEGG ORA + GSEA 执行模块
 #
-# 职责：
+# 功能：
 #   1) 读取 config.yaml 与 results/08_enrich/tasks.tsv；
 #   2) 读取注释词典（gene2go/gene2pathway/GO term2name/obsolete_map/KEGG term2gene/term2name）；
 #   3) 对每个任务（label + test_set）执行 ORA（GO + KEGG），输出统一表头的 by-term 表；
-#   4) 生成 GO_sig_all/up/down（GO 三本体纵合 + FDR 过滤）；
+#   4) 生成 GO_sig_up / GO_sig_down（GO 三本体纵合 + FDR 过滤）；
 #   5) 若存在 gene_id → gene_name 词典，则在 ORA 结果中增加 gene_names 列；
-#   6) 若 config.gsea.enable = TRUE，则对每个 RNA label 运行 GSEA（GO + KEGG）；
+#   6) 若 config.gsea.enable = TRUE，则对每个 RNA label 运行 GSEA（GO + KEGG），并输出绘图原材料；
 #   7) 汇总所有 label 的 ORA + GSEA 显著条目数，写出 results/08_enrich/summary.tsv。
 #
-# 本版新增：对 go/obsolete_map.tsv 做更稳健处理：
-#   - 文件不存在：跳过 obsolete 替换，直接使用 gene2go；
-#   - 文件存在但为空 / 列类型非字符：打 WARNING，跳过替换；
-#   - 只有在文件存在、非空且列名完整时才尝试进行 obsolete 替换。
+# 说明：
+# - GO obsolete_map.tsv：若缺失或为空，则跳过替换，直接使用 gene2go。
+# - 本脚本不输出 test_set=all 的 ORA 文件（你流水线 tasks.tsv 仍可包含 all 任务，但不会写出对应表格）。
 
 suppressPackageStartupMessages({
   library(yaml)
@@ -149,10 +148,10 @@ format_go_sub <- function(dt_sub, ontology, test_set, universe_size,
   )
 }
 
-# ★★★ KEGG 表头完全 vNext 版 + gene_names + ontology=KEGG ★★★
+# KEGG 输出表：固定列顺序 + gene_names + ontology=KEGG
 format_kegg_res <- function(dt, test_set, universe_size,
                             minGS, maxGS, gene_name_map, count_mode) {
-  # vNext 约定核心列顺序：
+  # 列顺序约定：
   # pathway_id, term_name, test_set, count_mode,
   # gene_ids, gene_names, gene_count, bg_size, gene_ratio, bg_ratio,
   # p_value, p_adjust, universe_size, min_gs, max_gs, ontology
@@ -285,7 +284,7 @@ if (file.exists(gene_info_fp)) {
   log_msg("INFO", "未检测到 gene_info.tsv，将不输出 gene_names 列（值为 NA）。")
 }
 
-#------------------------- GO obsolete 处理 + ontology 映射 -------------------------#
+#------------------------- 参数：ORA / GSEA -------------------------#
 
 go_minGS <- cfg$go$minGS %||% 10L
 go_maxGS <- cfg$go$maxGS %||% 500L
@@ -299,7 +298,6 @@ use_pvalue_cutoff_1 <- cfg$enrich$use_pvalue_cutoff_1 %||% FALSE
 kegg_count_mode <- cfg$kegg$count_mode %||% "by_gene"
 kegg_padj_method <- cfg$kegg$p_adjust_method %||% "BH"
 
-# GSEA 配置
 gsea_cfg <- cfg$gsea %||% list()
 gsea_enable <- isTRUE(gsea_cfg$enable)
 gsea_score_from <- tolower(gsea_cfg$score_from %||% "stat")
@@ -312,7 +310,7 @@ if (is.null(gsea_ontologies)) {
   gsea_ontologies <- c("BP")
 }
 
-# ---------- 安全处理 obsolete_map.tsv，生成 gene2go_clean ---------- #
+#------------------------- GO obsolete 处理 -------------------------#
 
 if (!file.exists(go_obsolete_fp)) {
   log_msg("WARNING", "未找到 go/obsolete_map.tsv，将跳过 obsolete GO term 处理，直接使用 gene2go。")
@@ -329,7 +327,6 @@ if (!file.exists(go_obsolete_fp)) {
     obsolete_map <- copy(go_obsolete)
     setnames(obsolete_map, c("old_go_id", "action", "new_go_id"),
              c("old", "action", "new"))
-    # 将关键列强制转为字符，避免出现 logical 类型
     obsolete_map[, old := as.character(old)]
     obsolete_map[, action := as.character(action)]
     obsolete_map[, new := as.character(new)]
@@ -364,7 +361,8 @@ if (!file.exists(go_obsolete_fp)) {
   }
 }
 
-# 接下来所有 GO 分析统一使用 gene2go_clean
+#------------------------- 组装 TERM2GENE / TERM2NAME -------------------------#
+
 go_term2gene <- gene2go_clean[, .(go_id, gene_id)]
 colnames(go_term2gene) <- c("term_id", "gene_id")
 colnames(go_term2name) <- c("term_id", "term_name")
@@ -524,8 +522,10 @@ for (lb in labels_unique) {
 
     for (ont in c("BP", "CC", "MF")) {
       out_fp <- file.path(outdir, sprintf("GO_%s_by_term_%s.tsv", ont, test_set))
-      data.table::fwrite(go_res_list[[ont]], file = out_fp, sep = "\t",
-                         quote = FALSE, na = "NA")
+      if (!identical(test_set, "all")) {
+        data.table::fwrite(go_res_list[[ont]], file = out_fp, sep = "\t",
+                           quote = FALSE, na = "NA")
+      }
     }
 
     # ---- KEGG ORA ----
@@ -583,15 +583,17 @@ for (lb in labels_unique) {
     }
 
     kegg_out_fp <- file.path(outdir, sprintf("KEGG_by_term_%s.tsv", test_set))
-    data.table::fwrite(kegg_res, file = kegg_out_fp, sep = "\t",
-                       quote = FALSE, na = "NA")
+    if (!identical(test_set, "all")) {
+      data.table::fwrite(kegg_res, file = kegg_out_fp, sep = "\t",
+                         quote = FALSE, na = "NA")
+    }
   }
 
-  # -------- 生成 GO_sig_all/up/down（按 label） --------
+  # -------- 生成 GO_sig_up / GO_sig_down（按 label） --------
   outdir_label <- tasks_lb$outdir[1]
   ensure_dir(outdir_label)
 
-  for (set_name in c("all", "up", "down")) {
+  for (set_name in c("up", "down")) {
     go_files <- file.path(
       outdir_label,
       sprintf("GO_%s_by_term_%s.tsv", c("BP", "CC", "MF"), set_name)
@@ -687,6 +689,92 @@ for (lb in labels_unique) {
           geneList <- ranks_dt$score
           names(geneList) <- ranks_dt$gene_id
 
+          gsea_dir <- file.path(outdir_label, "gsea")
+          ensure_dir(gsea_dir)
+          curves_dir <- file.path(gsea_dir, "curves")
+          ensure_dir(curves_dir)
+
+          # geneList：用于复现 GSEA 曲线与命中位置
+          geneList_dt <- data.table(
+            gene_id = names(geneList),
+            score   = as.numeric(geneList)
+          )
+          data.table::fwrite(geneList_dt, file = file.path(gsea_dir, "geneList.tsv"),
+                             sep = "\t", quote = FALSE, na = "NA")
+          saveRDS(geneList, file = file.path(gsea_dir, "geneList.rds"))
+
+          # 记录关键参数与运行环境（方便复现）
+          params_dt <- data.table(
+            param = c("label", "score_from", "minGS", "maxGS", "p_adjust_method", "gsea_fdr", "ontologies"),
+            value = c(
+              as.character(lb),
+              as.character(gsea_score_from),
+              as.character(gsea_minGS),
+              as.character(gsea_maxGS),
+              as.character(gsea_padj_method),
+              as.character(gsea_fdr),
+              paste(as.character(gsea_ontologies), collapse = ",")
+            )
+          )
+          data.table::fwrite(params_dt, file = file.path(gsea_dir, "gsea_params.tsv"),
+                             sep = "\t", quote = FALSE, na = "NA")
+          suppressWarnings({
+            capture.output(sessionInfo(), file = file.path(gsea_dir, "sessionInfo.txt"))
+          })
+
+          # 文件名清洗：避免不同系统/工具链对特殊字符不兼容
+          safe_name <- function(x) {
+            x2 <- gsub("[:/\\\\\\s]+", "_", as.character(x))
+            x2 <- gsub("[^A-Za-z0-9._-]+", "_", x2)
+            x2
+          }
+
+          # 生成 running ES 曲线数据（与经典 GSEA running enrichment plot 对应）
+          build_curve_dt <- function(geneList_vec, geneset_vec, exponent = 1) {
+            N <- length(geneList_vec)
+            all_genes <- names(geneList_vec)
+            hits_flag <- all_genes %in% geneset_vec
+            Nh <- sum(hits_flag)
+            Nm <- N - Nh
+            if (Nh == 0 || Nm == 0) {
+              return(data.table(
+                rank       = seq_len(N),
+                gene_id    = all_genes,
+                score      = as.numeric(geneList_vec),
+                is_hit     = as.integer(hits_flag),
+                running_ES = rep(0, N),
+                hit_index  = as.integer(ifelse(hits_flag, cumsum(hits_flag), NA))
+              ))
+            }
+            weights <- abs(geneList_vec)^exponent
+            weights_hit <- weights * hits_flag
+            sum_hit <- sum(weights_hit)
+            if (sum_hit == 0) {
+              return(data.table(
+                rank       = seq_len(N),
+                gene_id    = all_genes,
+                score      = as.numeric(geneList_vec),
+                is_hit     = as.integer(hits_flag),
+                running_ES = rep(0, N),
+                hit_index  = as.integer(ifelse(hits_flag, cumsum(hits_flag), NA))
+              ))
+            }
+            step <- ifelse(
+              hits_flag,
+              weights_hit / sum_hit,
+              -1 / Nm
+            )
+            running_ES <- cumsum(step)
+            data.table(
+              rank       = seq_len(N),
+              gene_id    = all_genes,
+              score      = as.numeric(geneList_vec),
+              is_hit     = as.integer(hits_flag),
+              running_ES = as.numeric(running_ES),
+              hit_index  = as.integer(ifelse(hits_flag, cumsum(hits_flag), NA))
+            )
+          }
+
           # ---- GSEA-GO ----
           go_gsea_sig_n <- NA_integer_
           if (length(intersect(names(geneList), go_gene_universe)) >= gsea_minGS) {
@@ -712,7 +800,7 @@ for (lb in labels_unique) {
               dt <- dt[ontology %in% gsea_ontologies]
               if (nrow(dt) > 0L) {
                 if (!"qvalues" %in% colnames(dt)) {
-                  dt[, qvalues := p.adjust(p.adjust, method = "BH")]
+                  dt[, qvalues := stats::p.adjust(`p.adjust`, method = "BH")]
                 }
                 go_gsea_sig_n <- nrow(dt[qvalues <= gsea_fdr])
                 go_gsea_out <- data.table(
@@ -727,16 +815,40 @@ for (lb in labels_unique) {
                   core_enriched    = dt$core_enrichment,
                   size             = dt$setSize
                 )
-                gsea_dir <- file.path(outdir_label, "gsea")
-                ensure_dir(gsea_dir)
-                go_gsea_fp <- file.path(gsea_dir, "GO_gsea.tsv")
-                data.table::fwrite(go_gsea_out, file = go_gsea_fp, sep = "\t",
-                                   quote = FALSE, na = "NA")
+                data.table::fwrite(go_gsea_out, file = file.path(gsea_dir, "GO_gsea.tsv"),
+                                   sep = "\t", quote = FALSE, na = "NA")
+                saveRDS(go_gsea, file = file.path(gsea_dir, "GO_gsea.rds"))
+
+                gs_list_go <- tryCatch(go_gsea@geneSets, error = function(e) NULL)
+                if (!is.null(gs_list_go) && length(gs_list_go) > 0L) {
+                  gs_dt_go <- data.table(
+                    term_id  = names(gs_list_go),
+                    gene_ids = vapply(gs_list_go, function(x) paste(unique(x), collapse = ";"), character(1))
+                  )
+                  data.table::fwrite(gs_dt_go, file = file.path(gsea_dir, "GO_genesets_used.tsv"),
+                                     sep = "\t", quote = FALSE, na = "NA")
+
+                  dt_top_go <- copy(dt)
+                  dt_top_go[, absNES := abs(NES)]
+                  setorder(dt_top_go, qvalues, -absNES)
+                  dt_top_go[, absNES := NULL]
+                  if (nrow(dt_top_go) > 10L) dt_top_go <- dt_top_go[1:10]
+
+                  for (tid in dt_top_go$ID) {
+                    gs_vec <- gs_list_go[[as.character(tid)]]
+                    if (is.null(gs_vec) || length(gs_vec) == 0L) next
+                    curve_dt <- build_curve_dt(geneList, gs_vec, exponent = 1)
+                    out_curve_fp <- file.path(curves_dir, sprintf("GO_%s.tsv", safe_name(tid)))
+                    data.table::fwrite(curve_dt, file = out_curve_fp, sep = "\t",
+                                       quote = FALSE, na = "NA")
+                  }
+                } else {
+                  empty_gs <- data.table(term_id = character(), gene_ids = character())
+                  data.table::fwrite(empty_gs, file = file.path(gsea_dir, "GO_genesets_used.tsv"),
+                                     sep = "\t", quote = FALSE, na = "NA")
+                }
               } else {
                 go_gsea_sig_n <- 0L
-                gsea_dir <- file.path(outdir_label, "gsea")
-                ensure_dir(gsea_dir)
-                go_gsea_fp <- file.path(gsea_dir, "GO_gsea.tsv")
                 empty_dt <- data.table(
                   term_id          = character(),
                   term_name        = character(),
@@ -749,8 +861,12 @@ for (lb in labels_unique) {
                   core_enriched    = character(),
                   size             = integer()
                 )
-                data.table::fwrite(empty_dt, file = go_gsea_fp, sep = "\t",
-                                   quote = FALSE, na = "NA")
+                data.table::fwrite(empty_dt, file = file.path(gsea_dir, "GO_gsea.tsv"),
+                                   sep = "\t", quote = FALSE, na = "NA")
+                saveRDS(go_gsea, file = file.path(gsea_dir, "GO_gsea.rds"))
+                empty_gs <- data.table(term_id = character(), gene_ids = character())
+                data.table::fwrite(empty_gs, file = file.path(gsea_dir, "GO_genesets_used.tsv"),
+                                   sep = "\t", quote = FALSE, na = "NA")
               }
             }
           }
@@ -777,7 +893,7 @@ for (lb in labels_unique) {
             if (!is.null(kegg_gsea) && nrow(as.data.frame(kegg_gsea)) > 0L) {
               dtk <- as.data.table(as.data.frame(kegg_gsea))
               if (!"qvalues" %in% colnames(dtk)) {
-                dtk[, qvalues := p.adjust(p.adjust, method = "BH")]
+                dtk[, qvalues := stats::p.adjust(`p.adjust`, method = "BH")]
               }
               kegg_gsea_sig_n <- nrow(dtk[qvalues <= gsea_fdr])
               kegg_gsea_out <- data.table(
@@ -793,16 +909,40 @@ for (lb in labels_unique) {
                 size             = dtk$setSize,
                 count_mode       = kegg_count_mode
               )
-              gsea_dir <- file.path(outdir_label, "gsea")
-              ensure_dir(gsea_dir)
-              kegg_gsea_fp <- file.path(gsea_dir, "KEGG_gsea.tsv")
-              data.table::fwrite(kegg_gsea_out, file = kegg_gsea_fp, sep = "\t",
-                                 quote = FALSE, na = "NA")
+              data.table::fwrite(kegg_gsea_out, file = file.path(gsea_dir, "KEGG_gsea.tsv"),
+                                 sep = "\t", quote = FALSE, na = "NA")
+              saveRDS(kegg_gsea, file = file.path(gsea_dir, "KEGG_gsea.rds"))
+
+              gs_list_kegg <- tryCatch(kegg_gsea@geneSets, error = function(e) NULL)
+              if (!is.null(gs_list_kegg) && length(gs_list_kegg) > 0L) {
+                gs_dt_kegg <- data.table(
+                  term_id  = names(gs_list_kegg),
+                  gene_ids = vapply(gs_list_kegg, function(x) paste(unique(x), collapse = ";"), character(1))
+                )
+                data.table::fwrite(gs_dt_kegg, file = file.path(gsea_dir, "KEGG_genesets_used.tsv"),
+                                   sep = "\t", quote = FALSE, na = "NA")
+
+                dtk_top <- copy(dtk)
+                dtk_top[, absNES := abs(NES)]
+                setorder(dtk_top, qvalues, -absNES)
+                dtk_top[, absNES := NULL]
+                if (nrow(dtk_top) > 10L) dtk_top <- dtk_top[1:10]
+
+                for (tid in dtk_top$ID) {
+                  gs_vec <- gs_list_kegg[[as.character(tid)]]
+                  if (is.null(gs_vec) || length(gs_vec) == 0L) next
+                  curve_dt <- build_curve_dt(geneList, gs_vec, exponent = 1)
+                  out_curve_fp <- file.path(curves_dir, sprintf("KEGG_%s.tsv", safe_name(tid)))
+                  data.table::fwrite(curve_dt, file = out_curve_fp, sep = "\t",
+                                     quote = FALSE, na = "NA")
+                }
+              } else {
+                empty_gs <- data.table(term_id = character(), gene_ids = character())
+                data.table::fwrite(empty_gs, file = file.path(gsea_dir, "KEGG_genesets_used.tsv"),
+                                   sep = "\t", quote = FALSE, na = "NA")
+              }
             } else {
               kegg_gsea_sig_n <- 0L
-              gsea_dir <- file.path(outdir_label, "gsea")
-              ensure_dir(gsea_dir)
-              kegg_gsea_fp <- file.path(outdir_label, "gsea/KEGG_gsea.tsv")
               empty_dt <- data.table(
                 term_id          = character(),
                 term_name        = character(),
@@ -816,8 +956,12 @@ for (lb in labels_unique) {
                 size             = integer(),
                 count_mode       = character()
               )
-              data.table::fwrite(empty_dt, file = kegg_gsea_fp, sep = "\t",
-                                 quote = FALSE, na = "NA")
+              data.table::fwrite(empty_dt, file = file.path(gsea_dir, "KEGG_gsea.tsv"),
+                                 sep = "\t", quote = FALSE, na = "NA")
+              saveRDS(kegg_gsea, file = file.path(gsea_dir, "KEGG_gsea.rds"))
+              empty_gs <- data.table(term_id = character(), gene_ids = character())
+              data.table::fwrite(empty_gs, file = file.path(gsea_dir, "KEGG_genesets_used.tsv"),
+                                 sep = "\t", quote = FALSE, na = "NA")
             }
           }
 
@@ -856,4 +1000,3 @@ data.table::fwrite(summary_dt, file = summary_fp, sep = "\t",
 
 log_msg("INFO", "已写出富集汇总表：", summary_fp)
 log_msg("INFO", "===== 08_g_enrich.R 执行完成 =====")
-

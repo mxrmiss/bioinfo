@@ -1,0 +1,251 @@
+# README.txt — WGCNA compute-only outputs (Step10)
+
+本目录由脚本 `scripts/10_wgcna_modules.R` 生成，用于 RNA-seq 的 WGCNA 模块构建、模块-性状关联、以及 hub genes 导出。该脚本不生成任何图片，只导出“可复现的原材料”，便于后续在你自己的绘图脚本中安全作图与检查。
+
+----------------------------------------------------------------------
+1. 你这次运行的关键结果（快速概览）
+----------------------------------------------------------------------
+
+- Matched samples: 18
+- Low-expression filter: kept 15315 / 24734 genes (min_count=10 in >=6 samples)
+- Transform: DESeq2 VST (blind=TRUE)
+- Low-variance filter (MAD): kept 7657 genes (top 50%)
+- Chosen soft-threshold power: 9
+- Modules found: 22 (including grey)
+- Traits: 7 columns (6 个 group one-hot + target_vs_rest)
+
+建议你把这几行当作“核对清单”，未来每次换数据或换参数都要先看日志是否合理。
+
+----------------------------------------------------------------------
+2. 输出目录结构总览
+----------------------------------------------------------------------
+
+- logs/
+  运行日志，确认过滤、power、模块数量、traits、hub 输出是否完成
+
+- traits/
+  traits 原材料（从 samples.tsv 构造），用于模块-性状相关性与 hub ranking
+
+- power/
+  soft-threshold power 选择的原材料（fitIndices、sft 对象）
+
+- QC_raw/
+  只保存原材料（例如样本聚类树），不画图
+
+- modules/
+  核心 WGCNA 模块结果：MEs、模块分配、dendrogram 等
+
+- assoc/
+  module–trait association：相关系数、p 值、padj（重点用于画热图和挑模块）
+
+- lists/
+  每个模块一个基因列表（list 文件），用于富集、交集、下游筛选
+
+- hub/
+  gene-level 的 GS/kME 表，以及每个模块的 hub genes 表（用于挑候选基因）
+
+- rds/
+  一键复现对象：wgcna_objects.rds（包含 datExpr、MEs、net、traits 等）
+
+- run_params.used.yaml
+  本次实际使用的参数快照（最终覆盖后的 WGCNA 参数、样本数、基因数、chosen_power 等）
+
+----------------------------------------------------------------------
+3. 各关键文件说明与使用方式
+----------------------------------------------------------------------
+
+3.1 traits/trait_matrix.tsv
+用途：记录每个样本对应的性状矩阵（traits），用于模块-性状相关性与 hub genes 的 GS 计算。
+
+- 第一列：sample（样本名，必须与 counts 的列名一致）
+- 后续列：traits（例如 group_foot、group_gill、…、target_vs_rest）
+- 你目前 traits=7 列是正常的：6 个组织 one-hot + 1 个 target_vs_rest
+
+怎么用：
+- 画 module–trait heatmap 时，这些列就是 x 轴 traits
+- 做“关注组织 vs 其余”的二元性状分析时，优先使用 target_vs_rest（更直观）
+
+
+3.2 modules/datExpr.transformed.samples_x_genes.tsv
+用途：WGCNA 输入表达矩阵（样本 × 基因），已经完成：
+- 低表达过滤（counts 阈值）
+- VST/voom 变换
+- 低方差过滤（MAD/variance）
+
+你当前验证显示：
+- genes=15315（这是低表达过滤 + VST 后的基因数，尚未做低方差）
+- 后续低方差过滤后用于建网的基因数是 n_genes_final=7657（见 run_params.used.yaml）
+
+怎么用：
+- 复核某个 hub gene 是否在 foot 呈现特征性表达（注意这是 transform 后数据，不是原始 counts/TPM）
+- 需要做样本聚类、PCA、热图等表达相似性分析时，它比 raw counts 更稳
+
+注意：
+- 该矩阵是 “samples × genes”，很多工具默认 “genes × samples”，使用时别弄反。
+
+
+3.3 modules/gene_module_assignments.tsv
+用途：每个基因属于哪个模块（模块 label + color）。
+
+列含义：
+- gene_id
+- module_label（数字标签）
+- module_color（WGCNA 颜色模块名，如 turquoise/blue/brown/grey）
+
+怎么用：
+- 把外部基因集（DEG_up、PSG、CAFE 扩张基因等）映射到模块上，做模块富集或交集统计
+- 统计每个模块基因数、筛选模块大小合理性
+
+
+3.4 modules/module_eigengenes.tsv
+用途：每个模块的 eigengene（MEs）。
+- 每行一个样本
+- 每列一个模块 ME（例如 MEturquoise）
+
+怎么用：
+- 画“模块在不同组织中的 ME 表达分布”（boxplot/violin）时用
+- 想看某个模块是否“foot 偏高/偏低”，先看它通常最快
+
+
+3.5 assoc/module_trait_cor.tsv（重点）
+用途：模块（ME）与 traits 的相关系数矩阵，是后续挑“与 foot 最相关模块”的核心文件。
+
+推荐格式（改进后）：
+- 第一列：module（ME 名，例如 MEturquoise、MEblue）
+- 后续列：traits（group_foot … target_vs_rest）
+- 单元格：相关系数（correlation）
+
+怎么用（最常见两件事）：
+1) 挑模块：
+   - 对 target_vs_rest 这一列按 |cor| 排序，选择前几名模块作为候选
+   - 正相关代表“更像 foot”，负相关代表“更像非 foot/对立模式”
+2) 作图：
+   - module 作为 y 轴，traits 作为 x 轴，cor 作为颜色值画热图
+
+兼容性说明：
+- 如果同目录存在 `module_trait_cor.matrix_only.tsv`，它是旧格式纯数值矩阵（无 module 列），用于兼容历史下游脚本。
+
+
+3.6 assoc/module_trait_p.tsv 与 assoc/module_trait_padj.tsv
+用途：
+- p：相关性显著性 p 值
+- padj：对所有 module×trait 的 p 值进行 BH 校正后的 padj
+
+怎么用：
+- 画热图时常见做法：在显著格子上打星号（例如 padj < 0.05）
+- 报告结果时优先用 padj（更稳妥）
+
+
+3.7 lists/module_<color>.list
+用途：每个模块一个基因列表（grey 模块一般不作为重点模块）。
+
+怎么用：
+- 对某个模块做 GO/KEGG 富集：直接拿该 list 当 test set
+- 与 DEG_up/DEG_down 做交集：定位“模块驱动的差异基因子集”
+- 与 CAFE 扩张基因、PSG 基因做交集：看“进化信号是否集中到某些共表达模块”
+
+经验提示：
+- turquoise/blue 这类大模块往往富集“基础生物过程/housekeeping”
+- 叙事更常关注：与 target_vs_rest 相关性强、且模块大小适中的模块
+
+
+3.8 hub/gene_level_GS_kME.tsv（重点）
+用途：每个基因的模块信息 + GS + kME。
+
+主要字段：
+- gene_id / module_color / module_label
+- GS：Gene Significance（基因表达与 primary trait 的相关性，当前 primary trait 是 target_vs_rest）
+- GS_p：GS 的 p 值
+- kME_*：基因与每个模块 ME 的相关性（module membership）
+
+怎么用：
+- 在某个模块内挑 hub gene：看该模块对应的 kME（例如模块 turquoise -> 看 kME_MEturquoise）
+- 挑“与 foot 强相关”的候选基因：结合 GS 高 + 在关键模块内 kME 高
+
+英文写法（Methods/Results 常用）：
+- GS = gene–trait correlation
+- kME = module membership (correlation with module eigengene)
+
+
+3.9 hub/hub_genes_by_module.tsv（重点）
+用途：每个模块挑出来的 top hub genes（默认 top 50），排序规则由 config 控制（你的配置：rank_by = kME then GS）。
+
+怎么用：
+- 候选基因名单的起点
+- 与功能注释（eggNOG/InterPro）、DEG、CAFE/PSG 等交叉筛选，迅速锁定能写故事的基因
+
+注意：
+- hub 不是“差异表达”的同义词；hub 强调网络中心性/模块成员度，与 DEG 可交集也可不交集。
+
+
+3.10 rds/wgcna_objects.rds
+用途：一包全带走的复现对象（datExpr、MEs、net、traits、参数、模块颜色等）。
+
+怎么用：
+- 当 TSV 不够用、想画更复杂的图（模块 dendrogram、网络边导出、连通性等）时用它最靠谱
+- 严格复现检查（行名、顺序、对象一致性）时用它最稳
+
+
+3.11 run_params.used.yaml
+用途：本次运行的“最终参数快照”（脚本默认与 config.yaml 覆盖后的最终结果）。
+
+怎么用：
+- 写 Methods 时直接参考这里的阈值（min_count、min_samples、transform、corType、networkType、mergeCutHeight、chosen_power 等）
+- 复跑/对照实验时用它核对“是否真的同参数”
+
+----------------------------------------------------------------------
+4. 推荐的后续工作流（从产物走到结论）
+----------------------------------------------------------------------
+
+工作流 A：找与 foot 最相关模块 -> 找 hub genes（最常用）
+1) 先看 assoc/module_trait_cor.tsv 的 target_vs_rest 列
+   - 按 |cor| 排序，记录 top 正相关模块与 top 负相关模块
+   - 同时结合 assoc/module_trait_padj.tsv 确认显著性（建议 padj < 0.05）
+
+2) 针对选中的模块（例如 turquoise / blue / brown ...）：
+   - 在 hub/hub_genes_by_module.tsv 中筛该模块，得到 top hub genes
+   - 或在 hub/gene_level_GS_kME.tsv 中进一步加条件：|GS| 高 + |kME_module| 高
+
+3) 将这些候选基因与外部信息交叉：
+   - 与 DEG_up / foot-specific genes 做交集：偏“表达证据”
+   - 与 CAFE 扩张/收缩基因、PSG 基因做交集：偏“进化证据”
+   - 与功能注释（eggNOG/InterPro/GO/KEGG）：偏“机制叙事”
+
+输出（你后续写论文最常用的三样）：
+- “与 foot 最相关的模块有哪些（正/负相关）”
+- “每个关键模块的 top hub genes 列表（并带注释）”
+- “关键模块是否富集某些过程/通路（可做 enrichment）”
+
+
+工作流 B：用模块列表做富集（模块->功能）
+1) 取 lists/module_<color>.list 作为 test set
+2) 选择合适背景（建议与本项目 enrich 的 background 规则一致）
+3) 做 GO/KEGG 富集
+4) 重点解释：与 foot 相关模块的富集条目是否与“斧足功能”叙事一致（避免牵强）
+
+
+工作流 C：模块作为“中介层”整合多证据（表达+进化）
+1) 将外部基因集（DEG/PSG/CAFE）映射到 gene_module_assignments.tsv
+2) 统计这些基因是否集中于某些模块（模块层面的富集/偏倚）
+3) 对“证据集中”的模块，再回头找 hub genes 和功能富集
+4) 这样写故事更稳：不是“散点基因”，而是“模块层面的系统性变化”
+
+----------------------------------------------------------------------
+5. 常见坑位提醒（避免后面踩雷）
+----------------------------------------------------------------------
+
+- 相关性热图/表格里一定要带模块名（ME 名），否则只剩“第几行”不可追溯
+- datExpr 是 transform 后矩阵，不要当 TPM/Counts 去解释绝对表达量
+- hub gene 是网络中心性概念，不等同 DEG；可以用交集强化叙事但不强求必须交集
+- grey 模块一般视作“未归类”，通常不作为重点模块做生物学解释
+
+----------------------------------------------------------------------
+6. 你要写 Methods 的一段口径（可参考）
+----------------------------------------------------------------------
+
+- Genes were filtered by detectability (counts >= 10 in at least 6 samples), variance-stabilized transformation (DESeq2 VST, blind=TRUE), and further filtered by variability (top 50% by MAD). WGCNA was performed using a signed network with biweight midcorrelation. Soft-thresholding power was chosen by scale-free topology criterion (chosen power=9). Module eigengenes were correlated with sample traits (one-hot tissue indicators and a binary trait target_vs_rest). Hub genes were prioritized by module membership (kME) and gene significance (GS).
+
+（以上为口径参考，你可按期刊风格再精简。）
+
+# 看padi
+Rscript -e 'cor<-readRDS("results/10_wgcna/assoc/module_trait_cor.rds"); padj<-readRDS("results/10_wgcna/assoc/module_trait_padj.rds"); trait<-"target_vs_rest"; df<-data.frame(ME=rownames(cor), cor=cor[,trait], padj=padj[,trait]); df<-df[order(abs(df$cor), decreasing=TRUE),]; print(head(df,12));'

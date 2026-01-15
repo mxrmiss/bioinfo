@@ -21,6 +21,10 @@
   • 中间产物（若需生成）：ref/transcripts.fa 、ref/decoys.txt、ref/gentrome.fa
   • 只从 config 读取参数；不接受命令行参数。
   • transcript_id 如需修剪，只能走 annotations.id_cleanup 这一处开关。
+
+更新点（2026-01-xx）：
+  - ID 清理支持“连环去前缀/去后缀”（多段连续剥离），不依赖 prefix 列表顺序；
+  - 对清洗后 transcript ID 的重复/冲突进行硬检查：发现冲突直接报错退出，避免下游隐性错配。
 """
 
 from __future__ import annotations
@@ -28,7 +32,7 @@ import sys
 import subprocess
 import logging
 from pathlib import Path
-from typing import Dict, Any, List, Tuple
+from typing import Dict, Any, List, Tuple, Optional
 import datetime
 
 DEFAULT_CONFIG = "config.yaml"
@@ -107,7 +111,10 @@ def load_config(path: Path) -> Dict[str, Any]:
 def apply_id_cleanup(raw: str, policy: Dict[str, Any]) -> str:
     """
     按 annotations.id_cleanup 规则对单个 ID 进行清理。
-    仅用于 transcript_id，不应用于 gene_id。
+
+    重要设计：
+      - 支持“连环剥离”：例如 Species|transcript:XXX 可连续剥掉 Species| 与 transcript:
+      - 不依赖 prefix/suffix 列表顺序
     """
     s = raw
     order = policy.get("order") or ["prefix", "suffix"]
@@ -116,46 +123,106 @@ def apply_id_cleanup(raw: str, policy: Dict[str, Any]) -> str:
     prefixes: List[str] = policy.get("prefix") or []
     suffixes: List[str] = policy.get("suffix") or []
 
+    # 去掉空串，避免死循环风险
+    prefixes = [p for p in prefixes if p]
+    suffixes = [x for x in suffixes if x]
+
+    def strip_prefixes_once(x: str) -> Tuple[str, bool]:
+        """尝试剥离所有 prefix，返回 (新串, 是否发生变化)"""
+        changed = False
+        for p in prefixes:
+            if x.startswith(p):
+                x = x[len(p):]
+                changed = True
+        return x, changed
+
+    def strip_suffixes_once(x: str) -> Tuple[str, bool]:
+        """尝试剥离所有 suffix，返回 (新串, 是否发生变化)"""
+        changed = False
+        for suf in suffixes:
+            if x.endswith(suf):
+                x = x[:-len(suf)]
+                changed = True
+        return x, changed
+
     for step in order:
-        if step == "prefix" and strip_prefix:
-            for p in prefixes:
-                if p and s.startswith(p):
-                    s = s[len(p):]
-        if step == "suffix" and strip_suffix:
-            for suf in suffixes:
-                if suf and s.endswith(suf):
-                    s = s[:-len(suf)]
+        if step == "prefix" and strip_prefix and prefixes:
+            # 连环剥离：直到再也剥不动为止
+            while True:
+                s2, ch = strip_prefixes_once(s)
+                s = s2
+                if not ch:
+                    break
+        if step == "suffix" and strip_suffix and suffixes:
+            while True:
+                s2, ch = strip_suffixes_once(s)
+                s = s2
+                if not ch:
+                    break
+
     return s
 
 
 # ============================= FASTA 处理 =============================
 
-def rewrite_fasta_headers(fa_in: Path, fa_out: Path, policy: Dict[str, Any]) -> Tuple[int, int]:
+def rewrite_fasta_headers(
+    fa_in: Path,
+    fa_out: Path,
+    policy: Dict[str, Any],
+    log: Optional[logging.Logger] = None,
+) -> Tuple[int, int]:
     """
-    读取 FASTA，按 ID 清理规则重写头部。
+    读取 FASTA，按 ID 清理规则重写头部（只改第一个 token）。
     返回： (记录数, 被修改的 header 数量)
+
+    关键保护：
+      - 若清洗后出现 transcript ID 冲突（重复），直接报错退出；
+        否则会造成 Salmon/下游映射的隐性错配，非常危险。
     """
     changed = 0
     total = 0
+    seen_new_ids: Dict[str, str] = {}  # new_id -> old_id
+
     with fa_in.open("r", encoding="utf-8") as fin, fa_out.open("w", encoding="utf-8") as fout:
         for line in fin:
             if line.startswith(">"):
                 total += 1
                 header = line[1:].strip()
-                # 一般格式：id 后跟空格描述；我们只对第一个 token 做清理
                 if not header:
                     fout.write(line)
                     continue
+
                 parts = header.split(maxsplit=1)
                 tid = parts[0]
                 rest = parts[1] if len(parts) > 1 else ""
+
                 new_tid = apply_id_cleanup(tid, policy)
+
+                # 冲突检测：不同 tid 清洗后变成同一个 new_tid
+                if new_tid in seen_new_ids and seen_new_ids[new_tid] != tid:
+                    msg = (
+                        f"[ERR] transcript_id 清洗后发生冲突：\n"
+                        f"  new_id = {new_tid}\n"
+                        f"  old_id_1 = {seen_new_ids[new_tid]}\n"
+                        f"  old_id_2 = {tid}\n"
+                        f"请检查 config.yaml 的 annotations.id_cleanup.prefix/suffix 是否过度剥离。"
+                    )
+                    if log:
+                        log.error(msg)
+                    else:
+                        print(msg, file=sys.stderr)
+                    sys.exit(1)
+                else:
+                    seen_new_ids[new_tid] = tid
+
                 if new_tid != tid:
                     changed += 1
+
                 new_header = new_tid + ((" " + rest) if rest else "")
                 fout.write(">" + new_header + "\n")
             else:
                 fout.write(line)
+
     return total, changed
 
 
@@ -270,8 +337,8 @@ def main() -> None:
     changed_tx = 0
     if use_cleanup:
         cleaned_transcripts = Path("ref/transcripts.cleaned.fa")
-        log.info("启用 ID 清理策略，对 transcripts.fa 的 header 进行修剪")
-        total_tx, changed_tx = rewrite_fasta_headers(transcripts_fa, cleaned_transcripts, id_policy)
+        log.info("启用 ID 清理策略，对 transcripts.fa 的 header 进行修剪（支持连环剥离）")
+        total_tx, changed_tx = rewrite_fasta_headers(transcripts_fa, cleaned_transcripts, id_policy, log=log)
         log.info("transcript 记录数：%d；其中被修改 ID 数量：%d", total_tx, changed_tx)
     else:
         # 粗略统计一下转录本数量
@@ -290,7 +357,6 @@ def main() -> None:
         log.info("decoy 序列数：%d", n_decoys)
     else:
         log.info("发现已有 decoy_list，按 rebuild_mode=%s 保留", rebuild_mode)
-        # 估个数
         n_decoys = sum(1 for _ in decoy_list.open("r", encoding="utf-8"))
 
     # 4) 生成 gentrome.fa（转录本 + 基因组）
@@ -353,3 +419,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

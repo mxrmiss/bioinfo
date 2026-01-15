@@ -35,6 +35,7 @@ resources:
     tximport: 30
     deg:     30
     enrich:  30
+    wgcna: 30
   memory_gb:
     qc:      90
     salmon:  90
@@ -99,13 +100,40 @@ deg:
 # ------------------------------ 注释与 ID 清理（02/03/07 共用） ----------------------
 annotations:
   allow_gene_space_match: true
-  # 统一 ID 清理开关：模式 A=全关（默认），模式 B=按前/后缀统一修剪
   id_cleanup:
-    strip_prefix: true     # 是否去前缀
-    prefix: ["Sinonovacula_constricta|"]              # 要剥掉的前缀列表（完全匹配）
-    strip_suffix: false     # 是否去后缀
-    suffix: []              # 要剥掉的后缀列表（完全匹配，如 ".t1"）
-    order: ["prefix","suffix"]   # 应用顺序，通常保持默认即可
+    strip_prefix: true
+    prefix:
+      # 07 常见：物种前缀（按你项目里实际出现的物种逐条加）
+      - "Sinonovacula_constricta|"
+      - "Ruditapes_philippinarum|"
+
+      # ---- Ensembl / GFF3 冒号系（对象类型前缀）----
+      - "transcript:"
+      - "gene:"
+      - "mRNA:"
+      - "mrna:"
+      - "RNA:"
+      - "rna:"
+      - "CDS:"
+      - "cds:"
+      - "exon:"
+
+      # ---- NCBI/发布包 连字符系（对象类型前缀）----
+      - "transcript-"
+      - "gene-"
+      - "mRNA-"
+      - "mrna-"
+      - "RNA-"
+      - "rna-"
+      - "CDS-"
+      - "cds-"
+      - "exon-"
+      - "id-"
+
+    strip_suffix: false
+    suffix: []
+    order: ["prefix","suffix"]
+
 
 # ------------------------------ 背景集合（08 使用 · 关键） --------------------------
 background:
@@ -135,13 +163,23 @@ kegg:
 
 # ------------------------------ GSEA 富集（08使用） --------------------------------
 gsea:
-  enable: false            # 是否启用 GSEA 通道
+  enable: true            # 是否启用 GSEA 通道
   score_from: "stat"      # 使用 DESeq2 的哪一列作为排名：stat 或 log2fc
   minGS: 10               # 基因集最小大小（与 GO ORA 保持一致即可）
   maxGS: 500              # 基因集最大大小（一般不用改）
   p_adjust_method: "BH"   # GSEA 中 p.adjust 的方法
   fdr: 0.25               # GSEA 的 FDR 阈值（常规 0.25）
   ontologies: ["BP"]      # GSEA-GO 只看哪些本体：BP/CC/MF 的组合
+
+# 一个组织对多个组织（组织特异性GSEA）
+one_vs_rest:
+  enable: true
+  targets: ["foot"]          # 或 ["foot","siphon"]
+  label_suffix: "_vs_other"
+  replace_existing_label: true
+  use_block: false
+  block_column: ""           # 例如 "batch" / "individual"，不需要就留空
+  min_row_sum_counts: 10
 
 
 # ------------------------------ 富集通用设置（08 使用） ------------------------------
@@ -156,7 +194,7 @@ enrich:
 publish:
   source_data_dir: "results/09_publish/source_data"
   methods_readme:   "results/09_publish/source_data/METHODS_README.txt"
-  xlsx: false
+  xlsx: true
 
 # ------------------------------ 目录 ------------------------------
 dirs:
@@ -169,9 +207,106 @@ dirs:
   annot:   "results/07_annot"
   enrich:  "results/08_enrich"
   publish: "results/09_publish"
+  wgcna: "results/10_wgcna"
 
 # ------------------------------ 日志 ------------------------------
 logging:
   level: "INFO"
   timestamp: true
   file: ""
+    
+# ------------------------------ WGCNA（10 使用） ------------------------------
+# 说明：
+# - 本块专用于 scripts/10_wgcna_modules.R
+# - 参数优先级：config.yaml > 脚本顶部默认值
+# - traits 设计完全通用：通过 group 列构建 one-hot；binary_traits 支持任意“关注集合 vs 对照集合”
+wgcna:
+  enable: true
+
+  # 变换方法：推荐 vst（顶刊稳妥）；也支持 voom（验证/对照用）
+  method: "vst"   # vst / voom
+
+  # 输入文件（建议保持与本项目目录一致）
+  input_counts: "results/05_matrix/counts/gene_counts.tsv"
+  samples_tsv:  "data/samples.tsv"
+
+  # 输出目录：若同时设置 dirs.wgcna，则 wgcna.outdir 优先
+  outdir: "results/10_wgcna"
+
+  # 复现性
+  save_rds: true
+  random_seed: 20260108
+
+  # ---------------- 过滤：先低表达（counts），再低方差（transform 后） ----------------
+  filter:
+    min_count: 10          # counts>=10 视为“可检测”
+    min_samples: 6         # 至少在 >=6 个样本可检测（18样本 1/3；可按样本量调整）
+    var_metric: "mad"      # mad / variance
+    keep_top_fraction: 0.5 # 保留变化最大的 top 50%
+    # keep_top_n: 8000      # 可选：若设置则优先于 keep_top_fraction
+
+  # ---------------- VST 配置（method=vst 时生效） ----------------
+  vst:
+    blind: true            # 不引入分组信息（更稳妥，更好写 Methods）
+
+  # ---------------- voom 配置（method=voom 时生效） ----------------
+  voom:
+    enable_tmm: true       # edgeR::calcNormFactors (TMM)
+    plot_mean_var: false   # 是否输出 voom mean-variance 图（一般不需要）
+
+  # ---------------- 网络构建（WGCNA） ----------------
+  network:
+    networkType: "signed"            # signed / unsigned
+    TOMType: "signed"
+    corType: "bicor"                 # bicor / pearson
+    maxPOutliers: 0.05               # bicor 参数（离群点鲁棒）
+    useObs: "pairwise.complete.obs"  # 相关性缺失值处理
+
+  # ---------------- soft-threshold power 选择 ----------------
+  power:
+    candidates: [1,2,3,4,5,6,7,8,9,10,12,14,16,18,20]
+    scale_free_R2_target: 0.85
+    min_mean_connectivity: 20
+    # fixed: 12                 # 可选：固定 power，跳过自动选择
+
+  # ---------------- 模块识别 ----------------
+  modules:
+    minModuleSize: 30
+    deepSplit: 2
+    pamRespectsDendro: false
+    mergeCutHeight: 0.25
+    reassignThreshold: 0
+    numericLabels: true
+
+  # ---------------- traits：完全通用（不要写死任何组织名） ----------------
+  traits:
+    sample_column: "sample"
+    group_column:  "group"
+
+    # 自动对所有 group 做 one-hot traits（推荐开启）
+    build_onehot: true
+
+    # 可选：定义一个或多个“二元性状”
+    # - negative_groups 为空：表示“除了 positive_groups 之外的全部”
+    # - 需要你自己把 group 名字写成 samples.tsv 里真实出现过的值
+    binary_traits:
+      - name: "target_vs_rest"
+        positive_groups: ["foot"]
+        negative_groups: []
+
+    # 可选：把 samples.tsv 里的其它列也作为 traits（数值保留；字符/分类自动 one-hot）
+    extra_columns_as_traits: []
+
+  # ---------------- 输出控制 ----------------
+  export:
+    gene_module_table: true
+    module_lists: true
+
+    hub_genes:
+      enable: true
+      top_n_per_module: 50
+      rank_by: ["kME", "GS"]
+      primary_trait: "target_vs_rest"   # 可选：指定 hub genes 依据的主 trait
+      # 说明：可填 "target_vs_rest"（脚本会自动匹配 binary_ 前缀）或填 trait_matrix 里的完整列名
+
+
