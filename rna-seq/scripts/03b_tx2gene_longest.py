@@ -4,7 +4,7 @@
 """
 03b_tx2gene_longest.py —— 用 AGAT 从注释中提取“每基因最长转录本”，为 tx2gene.clean.tsv 增补第三列（适配 03a 裸ID）
 
-契约（按皇上最新要求）：
+契约（按皇上最新要求 · 已修复 XM/XR 并存导致的冲突）：
 1) 不改 03a_build_tx2gene_map.py，不覆盖 tx2gene.clean.tsv
 2) 最长转录本提取：只用 AGAT（agat_sp_keep_longest_isoform.pl），不提供任何兜底策略
    - AGAT 不存在/运行失败/输出为空 -> 直接报错退出
@@ -12,21 +12,25 @@
    - tx2gene.longest.tsv
      transcript_id  gene_id  longest_transcript_id
      *前两列逐行完全照抄 tx2gene.clean.tsv（不做任何改动、顺序不变）*
-     第三列来自注释中该 gene 的最长转录本（与 03a 同一套 id_cleanup 宇宙的“裸ID”）
+     第三列来自注释中该 gene 的“代表最长转录本”（与 03a 同一套 id_cleanup 宇宙的“裸ID”）
 4) 匹配全过程采用统一 ID 清洗策略（与 02/03a/07 共用）：
    - 对 keep_longest 注释中解析到的 Parent(gene) 与 ID(transcript) 都应用 annotations.id_cleanup（支持连环剥离）
    - tx2gene.clean.tsv 前两列原样输出；仅用于 lookup 的 gene_key 会按同一策略归一化
-5) 自检策略：
-   - 同一 gene 解析到多个不同的 longest_transcript（清洗后仍不同） -> 直接报错退出
+5) 自检策略（关键修复点）：
+   - keep_longest 里同一 gene 可能同时出现 mRNA(XM_*) 与 transcript(XR_*) 两类代表，这是注释常态
+   - 选择规则：优先选 mRNA；若该 gene 没有 mRNA 才使用 transcript
+   - 仅在“同一优先级类别”内出现多个不同候选时才视为冲突并退出：
+       * mRNA 候选 >1 -> 报错退出
+       * transcript-only 候选 >1 -> 报错退出
    - 缺失 longest 的行允许存在（第三列填空），但会在 report 中统计并给出 gene 示例
 6) 生成报告：
    - tx2gene.longest.report.tsv 记录关键统计、AGAT 命令、缺失情况、冲突情况等
 
 输入：
 - config.yaml
-  - reference.ref_gtf    注释文件路径（GTF 或 GFF3；AGAT 均可接）
-  - dirs.maps            输出目录（默认 results/03_maps）
-  - annotations.id_cleanup   统一 ID 清理策略（03a/02/07 共用）
+  - reference.ref_gtf         注释文件路径（GTF 或 GFF3；AGAT 均可接）
+  - dirs.maps                 输出目录（默认 results/03_maps）
+  - annotations.id_cleanup    统一 ID 清理策略（03a/02/07 共用）
 - results/03_maps/tx2gene.clean.tsv（03a 产物）
 
 输出（写入 dirs.maps）：
@@ -42,7 +46,7 @@ import subprocess
 import logging
 import shutil
 from pathlib import Path
-from typing import Dict, Any, List, Tuple, Set, Optional
+from typing import Dict, Any, List, Tuple, Set
 
 
 # =============================================================================
@@ -85,25 +89,34 @@ DEFAULTS: Dict[str, Any] = {
 # 基础工具函数
 # =============================================================================
 
-def need(cmd: str):
+def need(cmd: str) -> None:
     """检查依赖命令是否存在；不存在则直接退出（契约：AGAT-only）"""
     if subprocess.call(f"command -v {cmd} >/dev/null 2>&1", shell=True) != 0:
         print(f"[ERR] dependency not found: {cmd}", file=sys.stderr)
         sys.exit(1)
 
-def ensure_dir(p: Path):
+
+def ensure_dir(p: Path) -> None:
     p.mkdir(parents=True, exist_ok=True)
+
 
 def run_capture(cmd: str, label: str = "CMD") -> Tuple[int, str, str]:
     """执行 shell 命令并捕获 stdout/stderr；失败直接退出"""
     print(f"[{label}] {cmd}")
-    cp = subprocess.run(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    cp = subprocess.run(
+        cmd,
+        shell=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
     if cp.returncode != 0:
         print(f"[ERR] command failed ({label}), exit code: {cp.returncode}", file=sys.stderr)
         if cp.stderr:
             print(cp.stderr[:8000], file=sys.stderr)
         sys.exit(cp.returncode)
     return cp.returncode, (cp.stdout or ""), (cp.stderr or "")
+
 
 def safe_preview(s: str, n: int = 300) -> str:
     """报告里预览用：把换行/制表符压成空格，截断"""
@@ -150,14 +163,15 @@ def load_config(path: Path) -> Dict[str, Any]:
 # =============================================================================
 
 def _strip_spaces(raw: str) -> str:
-    """轻度清理：去两端空白、去全角空格。"""
+    """轻度清理：去两端空白、去全角空格"""
     if raw is None:
         return ""
     return raw.strip().replace("\u3000", "")
 
+
 def apply_id_cleanup(raw: str, policy: Dict[str, Any]) -> str:
     """
-    按 annotations.id_cleanup 对单个 ID 进行清理（支持连环剥离）。
+    按 annotations.id_cleanup 对单个 ID 进行清理（支持连环剥离）
     """
     s = raw
     order = policy.get("order") or ["prefix", "suffix"]
@@ -201,8 +215,9 @@ def apply_id_cleanup(raw: str, policy: Dict[str, Any]) -> str:
 
     return s
 
+
 def normalize_id(raw: str, policy: Dict[str, Any]) -> str:
-    """统一口径：先 strip 空白，再按 policy 去前/后缀。"""
+    """统一口径：先 strip 空白，再按 policy 去前/后缀"""
     return apply_id_cleanup(_strip_spaces(raw), policy)
 
 
@@ -300,21 +315,35 @@ def parse_keep_longest_gene2tx(
     keep_longest_gff: Path,
     id_cleanup_policy: Dict[str, Any],
     log: logging.Logger,
-) -> Tuple[Dict[str, str], int]:
+) -> Tuple[Dict[str, str], int, Dict[str, int]]:
     """
-    从 keep_longest 注释解析 gene_id(cleaned) -> longest_transcript_id(cleaned)
-    仅解析 mRNA/transcript 行：ID=tid, Parent=gid
+    从 keep_longest 注释解析 gene_id(cleaned) -> chosen_longest_transcript_id(cleaned)
 
-    规则：
-      - Parent 多值：只取第一个，并计数告警
-      - 若同一 gene(cleaned) 出现多个不同 tid(cleaned)：直接报错退出（防止错配）
+    关键修复：
+      - keep_longest 可能同时保留 mRNA 与 transcript 两类代表（常见 XM 与 XR 并存）
+      - 选择规则：优先 mRNA；无 mRNA 才用 transcript
+      - 冲突判定：仅在同一优先级类别内出现多个不同候选时才报错退出
+
+    仅解析两类行：
+      - ftype == mRNA
+      - ftype == transcript
+
+    期望属性（GFF3）：ID=tid ; Parent=gid
+    Parent 多值：只取第一个，并计数告警
+
     返回：
-      - gene2longest_tx
+      - gene2chosen_tx
       - multi_parent_warn_count
+      - stats（用于 report）
     """
-    gene2tx: Dict[str, str] = {}
+    gene2cands_mrna: Dict[str, Set[str]] = {}
+    gene2cands_tx: Dict[str, Set[str]] = {}
+
     multi_parent_warn = 0
-    conflict_gene = 0
+
+    # 统计用
+    n_lines_mrna = 0
+    n_lines_transcript = 0
 
     with keep_longest_gff.open("r", encoding="utf-8") as f:
         for line in f:
@@ -349,26 +378,101 @@ def parse_keep_longest_gene2tx(
             if not gid_clean or not tid_clean:
                 continue
 
-            if gid_clean in gene2tx and gene2tx[gid_clean] != tid_clean:
-                conflict_gene += 1
-                log.error(
-                    "同一 gene 解析到多个不同 longest_transcript（清洗后仍不同）：gene_id=%s ; tid1=%s ; tid2=%s",
-                    gid_clean, gene2tx[gid_clean], tid_clean
-                )
-                # 不立即退出，先把冲突数统计完，最后统一退出
+            if ftype == "mrna":
+                n_lines_mrna += 1
+                gene2cands_mrna.setdefault(gid_clean, set()).add(tid_clean)
+            else:
+                n_lines_transcript += 1
+                gene2cands_tx.setdefault(gid_clean, set()).add(tid_clean)
+
+    # 汇总 gene 集合
+    all_genes: Set[str] = set(gene2cands_mrna.keys()) | set(gene2cands_tx.keys())
+
+    if not all_genes:
+        print(f"[ERR] no gene candidates parsed from: {keep_longest_gff}", file=sys.stderr)
+        sys.exit(1)
+
+    # 选择 + 冲突检测
+    gene2chosen: Dict[str, str] = {}
+
+    conflict_mrna = 0
+    conflict_transcript_only = 0
+
+    # 为了避免日志刷屏，只预览前 N 个冲突
+    conflict_preview_limit = 30
+    conflict_preview_count = 0
+
+    genes_with_mrna = 0
+    genes_with_transcript = 0
+    genes_with_both = 0
+    genes_with_transcript_only = 0
+
+    for g in sorted(all_genes):
+        mrna_set = gene2cands_mrna.get(g, set())
+        tx_set = gene2cands_tx.get(g, set())
+
+        if mrna_set:
+            genes_with_mrna += 1
+        if tx_set:
+            genes_with_transcript += 1
+        if mrna_set and tx_set:
+            genes_with_both += 1
+        if (not mrna_set) and tx_set:
+            genes_with_transcript_only += 1
+
+        if mrna_set:
+            if len(mrna_set) > 1:
+                conflict_mrna += 1
+                if conflict_preview_count < conflict_preview_limit:
+                    log.error(
+                        "同一 gene 在 mRNA 类别出现多个候选 longest_transcript（清洗后仍不同）：gene_id=%s ; candidates=%s",
+                        g, ",".join(sorted(mrna_set))
+                    )
+                    conflict_preview_count += 1
                 continue
+            gene2chosen[g] = next(iter(mrna_set))
+            continue
 
-            gene2tx[gid_clean] = tid_clean
+        if tx_set:
+            if len(tx_set) > 1:
+                conflict_transcript_only += 1
+                if conflict_preview_count < conflict_preview_limit:
+                    log.error(
+                        "同一 gene 在 transcript 类别出现多个候选 longest_transcript（清洗后仍不同）：gene_id=%s ; candidates=%s",
+                        g, ",".join(sorted(tx_set))
+                    )
+                    conflict_preview_count += 1
+                continue
+            gene2chosen[g] = next(iter(tx_set))
+            continue
 
-    if conflict_gene > 0:
-        log.error("keep_longest 解析冲突：共 %d 个 gene 出现多个不同 longest_transcript。请检查注释/清洗规则。", conflict_gene)
+        # 理论上不会到这，因为 all_genes 来自两类 dict 的 key
+        continue
+
+    if conflict_mrna > 0 or conflict_transcript_only > 0:
+        log.error(
+            "keep_longest 解析冲突：mRNA 类冲突 gene=%d；transcript-only 类冲突 gene=%d。请检查注释或 ID 清洗规则。",
+            conflict_mrna, conflict_transcript_only
+        )
         sys.exit(1)
 
-    if not gene2tx:
-        print(f"[ERR] no gene->transcript parsed from: {keep_longest_gff}", file=sys.stderr)
+    if not gene2chosen:
+        print(f"[ERR] no chosen gene->transcript after resolving: {keep_longest_gff}", file=sys.stderr)
         sys.exit(1)
 
-    return gene2tx, multi_parent_warn
+    stats: Dict[str, int] = {
+        "keep_longest_lines_mrna": n_lines_mrna,
+        "keep_longest_lines_transcript": n_lines_transcript,
+        "keep_longest_genes_total": len(all_genes),
+        "keep_longest_genes_with_mrna": genes_with_mrna,
+        "keep_longest_genes_with_transcript": genes_with_transcript,
+        "keep_longest_genes_with_both": genes_with_both,
+        "keep_longest_genes_with_transcript_only": genes_with_transcript_only,
+        "keep_longest_conflict_mrna": conflict_mrna,
+        "keep_longest_conflict_transcript_only": conflict_transcript_only,
+    }
+
+    return gene2chosen, multi_parent_warn, stats
 
 
 # =============================================================================
@@ -418,11 +522,14 @@ def main() -> None:
     # 2) 只用 AGAT 生成 keep_longest 注释
     rc, agat_stdout, agat_stderr = run_agat_keep_longest(ref_gtf, keep_longest_gff)
 
-    # 3) 从 keep_longest 注释解析 gene(cleaned)->longest_tx(cleaned)
-    gene2longest, multi_parent_warn = parse_keep_longest_gene2tx(keep_longest_gff, id_policy, log)
-    log.info("解析 keep_longest：genes=%d, multi_parent_warn=%d", len(gene2longest), multi_parent_warn)
+    # 3) 从 keep_longest 注释解析 gene(cleaned)->chosen_longest_tx(cleaned)
+    gene2longest, multi_parent_warn, kl_stats = parse_keep_longest_gene2tx(keep_longest_gff, id_policy, log)
+    log.info(
+        "解析 keep_longest：chosen_genes=%d, parsed_genes_total=%d, multi_parent_warn=%d",
+        len(gene2longest), kl_stats.get("keep_longest_genes_total", 0), multi_parent_warn
+    )
 
-    # 4) 写 tx2gene.longest.tsv（前两列原样照抄；第三列为 longest_transcript_id(cleaned)）
+    # 4) 写 tx2gene.longest.tsv（前两列原样照抄；第三列为 chosen_longest_transcript_id(cleaned)）
     miss_rows = 0
     miss_gene_examples: List[str] = []
     hit_genes: Set[str] = set()
@@ -461,7 +568,6 @@ def main() -> None:
     agat_stderr_preview = safe_preview(agat_stderr, 500)
 
     # gene 命中率统计：以 tx2gene.clean.tsv 的 gene_id 原值为口径
-    #（注意：lookup 使用了 normalize_id；这里的 hit_genes 以 gid_raw 计数，便于你核对“原样输出”的口径）
     n_genes_total = len(genes_set_raw)
     n_genes_hit = len(hit_genes)
     hit_rate = (n_genes_hit / n_genes_total) if n_genes_total > 0 else 0.0
@@ -473,6 +579,7 @@ def main() -> None:
         rep.write(f"tx2gene_clean\t{tx2gene_clean}\n")
         rep.write(f"out_longest\t{out_longest}\n")
         rep.write("strategy\tAGAT_only\n")
+        rep.write("resolve_rule\tprefer_mRNA_else_transcript\n")
         rep.write(f"agat_exe\t{shutil.which(AGAT_KEEP_LONGEST) or ''}\n")
         rep.write(f"agat_returncode\t{rc}\n")
         rep.write(f"agat_stdout_preview\t{agat_stdout_preview}\n")
@@ -483,12 +590,25 @@ def main() -> None:
         rep.write(f"n_genes_hit_longest\t{n_genes_hit}\n")
         rep.write(f"gene_hit_rate\t{hit_rate:.6f}\n")
 
-        rep.write(f"n_genes_in_keep_longest_parsed\t{len(gene2longest)}\n")
+        rep.write(f"n_genes_in_keep_longest_chosen\t{len(gene2longest)}\n")
         rep.write(f"keep_longest_multi_parent_warn\t{multi_parent_warn}\n")
+
+        # keep_longest 结构统计
+        for k in [
+            "keep_longest_lines_mrna",
+            "keep_longest_lines_transcript",
+            "keep_longest_genes_total",
+            "keep_longest_genes_with_mrna",
+            "keep_longest_genes_with_transcript",
+            "keep_longest_genes_with_both",
+            "keep_longest_genes_with_transcript_only",
+            "keep_longest_conflict_mrna",
+            "keep_longest_conflict_transcript_only",
+        ]:
+            rep.write(f"{k}\t{kl_stats.get(k, 0)}\n")
 
         rep.write(f"missing_longest_rows\t{miss_rows}\n")
         rep.write(f"missing_longest_unique_gene_preview_count\t{len(miss_gene_examples)}\n")
-
         rep.write(f"lookup_gene_changed_by_cleanup_count\t{n_lookup_gene_changed}\n")
 
         rep.write("\n")
