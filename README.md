@@ -93,5 +93,7 @@
 
 ## License
 
-This project is licensed under the **MIT License**. See the [`LICENSE`](LICENSE) file for details.
+本项目采用 **GNU GPL v3.0** 授权，详见根目录 [`LICENSE`](LICENSE)。
+如需发布/分发修改后的版本，必须同样以 GPLv3 开源发布源码。
+
 
