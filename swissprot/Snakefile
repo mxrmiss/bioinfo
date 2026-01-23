@@ -1,0 +1,87 @@
+configfile: "config.yaml"
+
+SPECIES = config.get("species_prefixes", [])
+if not SPECIES:
+    raise ValueError("config.yaml: species_prefixes is empty")
+if len(SPECIES) != len(set(SPECIES)):
+    raise ValueError("config.yaml: species_prefixes contains duplicates")
+
+# 固定 marker 路径（Snakefile 不解析 REL）
+REL_MARK = "results/01_db/CURRENT_REL.txt"
+
+def step_mark(step, species):
+    return f"results/.snakemake_marks/{step}/{species}.done"
+
+rule all:
+    input:
+        REL_MARK,
+        "results/.snakemake_marks/99_reports/all.done",
+        expand("results/.snakemake_marks/04_annot/{species}.done", species=SPECIES)
+
+rule db:
+    output:
+        REL_MARK
+    shell:
+        r"""
+        export PYTHONUNBUFFERED=1
+        python scripts/01_db.py
+        """
+
+rule align:
+    input:
+        REL_MARK
+    output:
+        mark=step_mark("02_align", "{species}")
+    shell:
+        r"""
+        export PYTHONUNBUFFERED=1
+        export SPECIES_ID="{wildcards.species}"
+        python scripts/02_align.py
+        mkdir -p results/.snakemake_marks/02_align
+        echo OK > {output.mark}
+        """
+
+rule filter:
+    input:
+        REL_MARK,
+        prev=step_mark("02_align", "{species}")
+    output:
+        mark=step_mark("03_filter", "{species}")
+    shell:
+        r"""
+        export PYTHONUNBUFFERED=1
+        export SPECIES_ID="{wildcards.species}"
+        python scripts/03_filter.py
+        mkdir -p results/.snakemake_marks/03_filter
+        echo OK > {output.mark}
+        """
+
+rule annot:
+    input:
+        REL_MARK,
+        prev=step_mark("03_filter", "{species}")
+    output:
+        mark=step_mark("04_annot", "{species}")
+    shell:
+        r"""
+        export PYTHONUNBUFFERED=1
+        export SPECIES_ID="{wildcards.species}"
+        python scripts/04_annot.py
+        mkdir -p results/.snakemake_marks/04_annot
+        echo OK > {output.mark}
+        """
+
+rule reports:
+    input:
+        REL_MARK,
+        expand("results/.snakemake_marks/04_annot/{species}.done", species=SPECIES)
+    output:
+        mark="results/.snakemake_marks/99_reports/all.done"
+    shell:
+        r"""
+        export PYTHONUNBUFFERED=1
+        python scripts/99_reports.py
+        mkdir -p results/.snakemake_marks/99_reports
+        echo OK > {output.mark}
+        """
+

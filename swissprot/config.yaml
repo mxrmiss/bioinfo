@@ -1,0 +1,27 @@
+species_prefixes:
+  - Sinonovacula_constricta
+  - Sinonovacula_rivularis
+  # - Sinonovacula_constricta.longest
+
+threads: 25
+
+diamond:
+  sensitivity: sensitive
+  evalue: 1e-5
+  max_target_seqs: 50
+
+filter:
+  EV_MAX: 1e-5
+  MIN_BITSCORE: 50
+  MIN_ALN_LEN: 50
+  MIN_QCOV: 0.50
+  MIN_SCOV: 0.00
+
+reports:
+  enabled: true
+
+db:
+  use_metalink: true
+  metalink_select_file: 6
+  metalink_preferred_protocol: "https"
+
