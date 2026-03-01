@@ -142,7 +142,7 @@ if (cor_method == "bicor" && !has_wgcna) {
   cor_method <- "pearson"
 }
 
-base_family <- "sans"
+base_family <- "Arial"
 theme_set(theme_classic(base_size = 14, base_family = base_family))
 
 for (mc in MODULE_COLORS) {

@@ -61,6 +61,13 @@ ZERO_LINE_LWD  <- 0.6
 ZERO_LINE_LTY  <- "dashed"  # "solid" / "dashed"
 ZERO_LINE_COL  <- "black"
 
+# ---------- 新增：字体控制（你要的“脚本上方字体参数”） ----------
+FONT_FAMILY <- "Arial"   # 若系统无 Arial，可改成 "sans" / "DejaVu Sans" / "Liberation Sans"
+
+# ---------- 新增：网格线开关（你要的） ----------
+# TRUE：开启 y 方向主网格线（你给的三行代码）；FALSE：关闭网格线
+SHOW_GRID_Y <- TRUE
+
 # 清新配色（按 TISSUE_ORDER 顺序）
 PALETTE_TISSUE <- c(
   "#7FD3C8", "#95C8F2", "#F6CD96", "#F79D93", "#A99BEF", "#B6E0B6",
@@ -233,8 +240,7 @@ if (isTRUE(EXPORT_SUMMARY_TSV)) {
 }
 
 # 主题：更紧凑、更“论文感”
-base_family <- "sans"
-theme_set(theme_classic(base_size = 13, base_family = base_family))
+theme_set(theme_classic(base_size = 14, base_family = FONT_FAMILY))
 
 p <- ggplot() +
   # y=0 参考线
@@ -275,14 +281,25 @@ p <- ggplot() +
   labs(x = NULL, y = "Module eigengene (ME)") +
   theme(
     axis.text.x = element_text(angle = 45, hjust = 1),
+
+    # 半封闭轴线：只画 x 底线 + y 左线（细线）
+    axis.line.x.bottom = element_line(linewidth = 0.35, color = "black"),
+    axis.line.y.left   = element_line(linewidth = 0.35, color = "black"),
+    axis.line.x.top    = element_blank(),
+    axis.line.y.right  = element_blank(),
+
     axis.ticks  = element_blank(),
-    # 保持干净，但不要“厚重外框”
-    axis.line   = element_blank(),
+
     legend.position = if (isTRUE(SHOW_LEGEND)) "right" else "none",
 
     # strip 更轻：不画大黑框
     strip.background = element_blank(),
     strip.text = element_text(size = 12, face = "bold"),
+
+    # ---------- 网格线（按你给的代码，加开关） ----------
+    panel.grid.major.y = if (isTRUE(SHOW_GRID_Y)) element_line(linewidth = 0.35, color = "grey85") else element_blank(),
+    panel.grid.minor.y = element_blank(),
+    panel.grid.major.x = element_blank(),
 
     # 更紧凑的边距
     plot.margin = margin(6, 6, 6, 6)

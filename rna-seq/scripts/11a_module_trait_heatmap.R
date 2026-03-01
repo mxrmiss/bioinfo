@@ -181,19 +181,25 @@ if (!is.null(module_size)) {
 col_lab_raw <- colnames(cor_mat)
 col_lab <- fmt_trait_label_vec(col_lab_raw)
 
+# ✅ 仅删除图中的最后一列：Foot vs Rest（不影响按 target_vs_rest 排序）
+keep_cols <- col_lab != "Foot vs Rest"
+cor_mat_plot <- cor_mat[, keep_cols, drop = FALSE]
+fdr_mat_plot <- fdr_mat[, keep_cols, drop = FALSE]
+col_lab_plot <- col_lab[keep_cols]
+
 df_long <- expand.grid(
   module = row_lab,
-  trait  = col_lab,
+  trait  = col_lab_plot,
   stringsAsFactors = FALSE
 )
-df_long$r   <- as.vector(cor_mat)
-df_long$fdr <- as.vector(fdr_mat)
+df_long$r   <- as.vector(cor_mat_plot)
+df_long$fdr <- as.vector(fdr_mat_plot)
 df_long$label <- paste0(fmt_r_vec(df_long$r), "\n(", fmt_fdr_vec(df_long$fdr), ")")
 
 df_long$module <- factor(df_long$module, levels = row_lab)
-df_long$trait  <- factor(df_long$trait,  levels = col_lab)
+df_long$trait  <- factor(df_long$trait,  levels = col_lab_plot)
 
-base_family <- "sans"
+base_family <- "Arial"
 theme_set(theme_classic(base_size = 12, base_family = base_family))
 
 p <- ggplot(df_long, aes(x = trait, y = module, fill = r)) +

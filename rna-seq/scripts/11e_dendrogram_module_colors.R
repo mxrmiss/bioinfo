@@ -52,6 +52,8 @@ SFT_PDF_HEIGHT_IN <- 4
 # 数字标注大小（红色 power 数字）
 SFT_LABEL_CEX <- 0.9
 
+FONT_FAMILY <- "Arial"
+
 # ------------------------------------------------------------------------------
 
 need_pkg <- function(pkgs) {
@@ -155,6 +157,8 @@ plot_soft_threshold_from_tsv <- function(tsv_path, r2_target, chosen_power, labe
     cex.lab = 1.15,
     cex.main = 1.25
   )
+
+  par(family = FONT_FAMILY)
 
   # ---------------- 左图：Scale independence ----------------
   x <- fit$Power
@@ -343,6 +347,7 @@ png_out <- file.path(OUTDIR, paste0("11e_dendrogram_module_colors.", target, ".p
 pdf_out <- file.path(OUTDIR, paste0("11e_dendrogram_module_colors.", target, ".pdf"))
 
 plot_one <- function() {
+  par(family = FONT_FAMILY)
   WGCNA::plotDendroAndColors(
     dendro = dend_best,
     colors = cbind(unm_best, mer_best),

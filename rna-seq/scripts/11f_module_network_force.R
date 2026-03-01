@@ -3,18 +3,27 @@
 # 11f_module_network_force.R
 # WGCNA 模块网络图（力导向布局，证据型/可复现/论文展示版）
 #
-# 修复点（2026-01-09+）：
-# - adjacency / TOM 在少数环境可能丢 dimnames（rownames/colnames）
-# - 本版强制补齐 dimnames，规避筛边 idx 映射失败
+# 2026-02-04 最终增量改进（皇上指定口径）：
+# - ✅ 强制读取 data/samples.tsv（缺失直接停止；不提供任何兜底变量）
+# - ✅ 顶部参数可指定目标组织（TARGET_GROUP，例如 foot）
+# - ✅ 节点颜色：mean(log2(TPM+1))（在目标组织的重复样本上先 log2(TPM+1)，再取平均）
+# - ✅ 同时读取 results/10_wgcna/lists/module_<color>.list 第2列 gene_name 作为标签
+#   * 若 gene_name 缺失/为空：不显示标签（但节点仍保留，保证网络结构不被悄悄改变）
+# - ✅ 保持所有路径为相对路径
 #
-# 图形规范（2026-01-09+）：
-# - 删除横纵轴边框（axis line）
-# - 去除圆圈边框（节点无描边）
-# - 默认标题关闭
-# - 图上不显示 module / edge rule 文本
-# - 去除标签旁“黑点/短杠”（关闭 ggrepel 的 segment）
-# - 修正类似 Sco04g08230- 末尾多余字符（仅清洗 label，不改 gene_id）
-# - hub 节点更突出（无描边，靠 size boost）
+# 2026-02-04 版面改进（论文观感增强）：
+# - ✅ 布局支持 KK / DrL（更均匀，减少节点拥挤）
+# - ✅ PCA 旋转布局 + coord_equal，避免竖长条
+# - ✅ 图例标题缩短：只显示 "log2(TPM+1)"（mean 与 TARGET_GROUP 在图注说明）
+#
+# 2026-02-04 终端输出清爽化（本次按皇上要求新增）：
+# - ✅ 只加一次坐标系（避免 Coordinate system already present...）
+# - ✅ dev.off() 不回显（避免 null device 1）
+# - ✅ 小清新连续渐变配色（可在顶部一键切换）
+#
+# 2026-02-05 皇上追加改进：
+# - ✅ 字体参数移动到顶部参数区（FONT_FAMILY / BASE_FONT_SIZE）
+# - ✅ 若标签英文名重复：自动追加 -1/-2/...（只作用于显示 label，不改变 gene_id 和网络结构）
 # =============================================================================
 
 options(stringsAsFactors = FALSE)
@@ -28,6 +37,16 @@ HUB_TSV   <- "results/10_wgcna/hub/hub_genes_by_module.tsv"
 OUTDIR    <- "results/10_wgcna/figures"
 
 MODULE_COLOR <- "lightgreen"
+
+# ✅ 模块 list（第2列 gene_name 用于显示标签）
+MODULE_LIST <- paste0("results/10_wgcna/lists/module_", MODULE_COLOR, ".list")
+
+# ✅ TPM 与样本表（强制存在）
+TPM_TSV     <- "results/05_matrix/tpms/gene_tpm.tsv"
+SAMPLES_TSV <- "data/samples.tsv"
+
+# ✅ 指定目标组织（例如 foot/gill/mantle...）
+TARGET_GROUP <- "foot"
 
 # 显示基因数量
 MAX_NODES <- 80
@@ -45,8 +64,7 @@ RANDOM_SEED <- 20260109
 
 # ---------------- 标签数量开关（保留） ----------------
 LABEL_MODE  <- "dense"        # "paper" / "balanced" / "dense"
-# 显示基因id
-LABEL_TOP_N <- 50     # 若填数字（如 18），覆盖 LABEL_MODE
+LABEL_TOP_N <- 50             # 若填数字（如 18），覆盖 LABEL_MODE
 
 USE_LABEL_REPEL      <- TRUE
 MAX_LABEL_OVERLAPS   <- 50
@@ -55,7 +73,25 @@ MAX_LABEL_OVERLAPS   <- 50
 SHOW_TITLE <- FALSE
 
 # ✅ hub 视觉强调（不加描边，只加一点点 size）
-HUB_SIZE_BOOST <- 1.35   # 建议 1.2~1.6，越大 hub 越显眼
+HUB_SIZE_BOOST <- 1.35   # 建议 1.2~1.6
+
+# ✅ 版面与布局（新增）
+LAYOUT_METHOD <- "drl"   # "kk" / "drl"
+LAYOUT_KK_MAXITER <- 2000
+LAYOUT_EXPAND <- 1.35    # 节点间距整体拉开（1.0=不变，建议 1.1~1.4）
+ROTATE_LAYOUT <- TRUE    # PCA 旋转，避免竖长条
+COORD_EQUAL   <- TRUE    # 等比例坐标，避免拉伸
+PANEL_PADDING_FRAC <- 0.08  # 四周留白比例
+
+# ✅ 小清新配色方案（本次新增）
+# - mint: 蓝绿薄荷（默认推荐，清爽耐看）
+# - lavender: 青紫雾面（更高级）
+# - sunrise: 低值浅暖、高值清青（更活泼但仍克制）
+COLOR_SCHEME <- "mint"   # "mint" / "lavender" / "sunrise"
+
+# ✅ 字体放到顶部，方便皇上一键修改
+FONT_FAMILY   <- "Arial"
+BASE_FONT_SIZE <- 14
 
 PNG_WIDTH_IN  <- 7
 PNG_HEIGHT_IN <- 7
@@ -113,6 +149,12 @@ resolve_label_n <- function(mode, override_n) {
   12L
 }
 
+cap_first <- function(x) {
+  x <- as.character(x)
+  if (length(x) == 0 || is.na(x) || !nzchar(x)) return(x)
+  paste0(toupper(substr(x, 1, 1)), substr(x, 2, nchar(x)))
+}
+
 # ✅ 关键稳妥：强制补齐矩阵 dimnames
 ensure_square_dimnames <- function(mat, names_vec) {
   if (!is.matrix(mat)) mat <- as.matrix(mat)
@@ -126,18 +168,93 @@ ensure_square_dimnames <- function(mat, names_vec) {
   mat
 }
 
-# ✅ 只清洗“显示用标签”，不改真实 gene_id（避免影响匹配/导出）
+# ✅ 只清洗“显示用标签”，不改真实 gene_id（允许中间 '-'）
 clean_label_text <- function(x) {
   x <- as.character(x)
   x <- trimws(x)
-  # 去掉常见的小点/项目符号（有些字体会渲染成黑点）
   x <- gsub("[•·●◦∙]", "", x, perl = TRUE)
-  # 去掉首尾非字母数字点下划线的字符（比如末尾 '-'）
-  x <- gsub("^[^A-Za-z0-9_.]+", "", x, perl = TRUE)
-  x <- gsub("[^A-Za-z0-9_.]+$", "", x, perl = TRUE)
-  # 再保险：去掉中间的非常规字符（gene id 正常不该出现）
-  x <- gsub("[^A-Za-z0-9_.]", "", x, perl = TRUE)
+  x <- gsub("^[^A-Za-z0-9_.-]+", "", x, perl = TRUE)
+  x <- gsub("[^A-Za-z0-9_.-]+$", "", x, perl = TRUE)
+  x <- gsub("[^A-Za-z0-9_.-]", "", x, perl = TRUE)
   x
+}
+
+# ✅ 重复英文名自动追加 -1/-2/...（只作用于显示 label，不改变 gene_id）
+# 修复点：不要用 ave(df$key, ...)（字符会把结果也变成字符），改为对纯数字向量分组计数
+make_unique_labels <- function(labels, keys) {
+  labels <- as.character(labels)
+  keys <- as.character(keys)
+  out <- labels
+
+  idx <- which(nzchar(labels))
+  if (length(idx) <= 1) return(out)
+
+  df <- data.frame(
+    idx = idx,
+    label = labels[idx],
+    key = keys[idx],
+    stringsAsFactors = FALSE
+  )
+
+  # 为了可复现：同名时按 key（gene_id）排序决定谁保留原名
+  df <- df[order(df$label, df$key), , drop = FALSE]
+
+  # 关键：用纯数字向量做 ave 的输入，保证 rank_in_label 是整数
+  df$rank_in_label <- ave(seq_len(nrow(df)), df$label, FUN = seq_along)
+  df$rank_in_label <- as.integer(df$rank_in_label)
+
+  df$suffix <- ifelse(df$rank_in_label == 1L, "", paste0("-", df$rank_in_label - 1L))
+  df$label_u <- paste0(df$label, df$suffix)
+
+  out[df$idx] <- df$label_u
+  out
+}
+
+# ✅ PCA 旋转布局，让长轴更接近水平
+rotate_layout_pca <- function(xy) {
+  xy <- as.matrix(xy)
+  if (nrow(xy) < 3) return(xy)
+  xyc <- scale(xy, center = TRUE, scale = FALSE)
+  s <- svd(xyc)
+  rot <- s$v
+  xyr <- xyc %*% rot
+  xyr
+}
+
+# ✅ 计算布局：kk / drl
+compute_layout <- function(g, method = "drl", kk_maxiter = 2000) {
+  m <- tolower(as.character(method))
+  if (m == "kk") {
+    return(igraph::layout_with_kk(g, maxiter = as.integer(kk_maxiter)))
+  }
+  if (m == "drl") {
+    return(igraph::layout_with_drl(g))
+  }
+  igraph::layout_with_fr(g)
+}
+
+# ✅ 小清新连续渐变色标（本次新增）
+get_color_scale <- function(scheme, legend_title) {
+  sc <- tolower(as.character(scheme %||% "mint"))
+
+  if (sc == "lavender") {
+    return(scale_color_gradientn(
+      colours = c("#F2F0F7", "#CBC9E2", "#9E9AC8", "#6A51A3"),
+      name = legend_title
+    ))
+  }
+
+  if (sc == "sunrise") {
+    return(scale_color_gradientn(
+      colours = c("#FFF2CC", "#F7D89C", "#BFE6D0", "#66C2A4", "#2CA25F"),
+      name = legend_title
+    ))
+  }
+
+  scale_color_gradientn(
+    colours = c("#E9F7F2", "#CDEEE6", "#A7E1D8", "#7CCBD3", "#4DA9D8"),
+    name = legend_title
+  )
 }
 
 pick_edges_by_quantile <- function(tom,
@@ -242,6 +359,33 @@ names(moduleColors) <- all_genes
 module_genes <- names(moduleColors)[moduleColors == MODULE_COLOR]
 module_genes <- intersect(module_genes, all_genes)
 if (length(module_genes) < 10) stop("模块基因数太少：", length(module_genes), "（<10 不建议画网络）")
+
+# =============================================================================
+# 2.1) 读取模块 list（gene_id -> gene_name，用于标签显示）
+# =============================================================================
+
+if (!file.exists(MODULE_LIST)) stop("找不到模块 list：", MODULE_LIST)
+
+ml <- data.table::fread(MODULE_LIST, sep = "\t", header = FALSE, data.table = FALSE,
+                        fill = TRUE, quote = "", colClasses = "character")
+if (ncol(ml) < 1) stop("模块 list 为空或格式异常：", MODULE_LIST)
+
+colnames(ml)[1] <- "gene_id"
+if (ncol(ml) >= 2) {
+  colnames(ml)[2] <- "gene_name"
+} else {
+  ml$gene_name <- NA_character_
+}
+
+ml$gene_id <- trimws(as.character(ml$gene_id))
+ml$gene_name <- trimws(as.character(ml$gene_name))
+ml$gene_name[is.na(ml$gene_name)] <- ""
+
+gene_name_map <- setNames(ml$gene_name, ml$gene_id)
+
+# =============================================================================
+# 2.2) hub（可选）
+# =============================================================================
 
 hub <- NULL
 hub_genes <- character()
@@ -352,7 +496,60 @@ V(g2)$is_hub <- V(g2)$name %in% hub_genes
 V(g2)$degree <- igraph::degree(g2)
 
 # =============================================================================
-# 6) 标签
+# 5.1) 强制读取 samples.tsv 并从 TPM 中提取目标组织表达（mean(log2(TPM+1))）
+# =============================================================================
+
+if (!file.exists(SAMPLES_TSV)) stop("找不到 samples.tsv：", SAMPLES_TSV)
+if (!file.exists(TPM_TSV)) stop("找不到 TPM 矩阵：", TPM_TSV)
+
+smp <- data.table::fread(SAMPLES_TSV, sep = "\t", header = TRUE, data.table = FALSE, check.names = FALSE)
+need_cols <- c("sample", "group")
+if (!all(need_cols %in% colnames(smp))) {
+  stop("samples.tsv 必须包含列：sample, group。当前列为：", paste(colnames(smp), collapse = ", "))
+}
+
+target_samples <- smp$sample[as.character(smp$group) == as.character(TARGET_GROUP)]
+target_samples <- unique(as.character(target_samples))
+target_samples <- target_samples[nzchar(target_samples)]
+
+if (length(target_samples) == 0) {
+  stop("samples.tsv 中找不到 group == '", TARGET_GROUP, "' 的样本。请检查 TARGET_GROUP 或 samples.tsv 内容。")
+}
+
+tpm_header <- names(data.table::fread(TPM_TSV, sep = "\t", header = TRUE, nrows = 0, data.table = FALSE, check.names = FALSE))
+if (length(tpm_header) < 2) stop("TPM 表头异常（列数 < 2）：", TPM_TSV)
+if (!("gene_id" %in% tpm_header)) {
+  stop("TPM 文件必须包含列名 gene_id（第一列）。当前表头为：", paste(tpm_header, collapse = ", "))
+}
+
+target_cols <- intersect(target_samples, tpm_header)
+if (length(target_cols) == 0) {
+  stop("TPM 文件中找不到 TARGET_GROUP 对应样本列。\n",
+       "TARGET_GROUP='", TARGET_GROUP, "' samples: ", paste(target_samples, collapse = ", "), "\n",
+       "TPM header (first 30): ", paste(head(tpm_header, 30), collapse = ", "))
+}
+
+tpm_sub <- data.table::fread(TPM_TSV, sep = "\t", header = TRUE, data.table = TRUE,
+                            select = c("gene_id", target_cols), check.names = FALSE)
+
+for (cc in target_cols) {
+  suppressWarnings(tpm_sub[, (cc) := log2(as.numeric(get(cc)) + 1)])
+}
+tpm_sub[, expr_color := rowMeans(.SD, na.rm = TRUE), .SDcols = target_cols]
+
+genes_in_graph <- V(g2)$name
+tpm_sub <- tpm_sub[gene_id %in% genes_in_graph]
+
+missing_expr <- setdiff(genes_in_graph, tpm_sub$gene_id)
+if (length(missing_expr) > 0) {
+  stop("TPM 文件中缺少网络子图中的部分基因（无法严格上色）。缺失数量=",
+       length(missing_expr), "。示例：", paste(head(missing_expr, 10), collapse = ", "))
+}
+
+expr_map <- setNames(as.numeric(tpm_sub$expr_color), as.character(tpm_sub$gene_id))
+
+# =============================================================================
+# 6) 标签（仅使用 gene_name；缺失 gene_name 则不显示标签）
 # =============================================================================
 
 label_n <- resolve_label_n(LABEL_MODE, LABEL_TOP_N)
@@ -363,26 +560,39 @@ nodes_df <- data.frame(
   is_hub = V(g2)$is_hub,
   kME = V(g2)$kME,
   degree = V(g2)$degree,
+  gene_name = unname(gene_name_map[V(g2)$name] %||% ""),
   stringsAsFactors = FALSE
 )
+nodes_df$gene_name[is.na(nodes_df$gene_name)] <- ""
 nodes_df$score <- 1000 * as.numeric(nodes_df$is_hub) + abs(nodes_df$kME) + 0.05 * nodes_df$degree
 nodes_df <- nodes_df[order(nodes_df$score, decreasing = TRUE), , drop = FALSE]
-label_genes <- head(nodes_df$name, n = label_n)
+
+cand <- nodes_df[nzchar(nodes_df$gene_name), , drop = FALSE]
+if (nrow(cand) == 0) {
+  label_genes <- character()
+} else {
+  label_genes <- head(cand$name, n = min(label_n, nrow(cand)))
+}
 
 # =============================================================================
-# 7) 布局与作图（无轴线/无描边/默认无标题/不显示 module 与 edge rule）
+# 7) 布局与作图（无轴线/无描边/默认无标题）
 # =============================================================================
 
-layout_xy <- igraph::layout_with_fr(g2)
+layout_xy <- compute_layout(g2, method = LAYOUT_METHOD, kk_maxiter = LAYOUT_KK_MAXITER)
 colnames(layout_xy) <- c("x", "y")
 
-png_out <- file.path(OUTDIR, paste0("11f_network_", MODULE_COLOR, ".png"))
-pdf_out <- file.path(OUTDIR, paste0("11f_network_", MODULE_COLOR, ".pdf"))
+if (isTRUE(ROTATE_LAYOUT)) {
+  layout_xy <- rotate_layout_pca(layout_xy)
+}
+
+layout_xy <- layout_xy * as.numeric(LAYOUT_EXPAND)
+
+png_out  <- file.path(OUTDIR, paste0("11f_network_", MODULE_COLOR, ".png"))
+pdf_out  <- file.path(OUTDIR, paste0("11f_network_", MODULE_COLOR, ".pdf"))
 node_out <- file.path(OUTDIR, paste0("11f_network_", MODULE_COLOR, ".nodes.tsv"))
 edge_out <- file.path(OUTDIR, paste0("11f_network_", MODULE_COLOR, ".edges.tsv"))
 
-base_family <- "sans"
-theme_set(theme_classic(base_size = 14, base_family = base_family))
+theme_set(theme_classic(base_size = as.numeric(BASE_FONT_SIZE), base_family = as.character(FONT_FAMILY)))
 
 ed <- igraph::as_data_frame(g2, what = "edges")
 ed$weight <- E(g2)$weight
@@ -397,20 +607,33 @@ nd <- data.frame(
   stringsAsFactors = FALSE
 )
 
-# 节点基础大小：优先用 |kME|，否则用 degree
 nd$base_size <- abs(nd$kME)
 if (all(nd$base_size == 0)) nd$base_size <- nd$degree
-
-# ✅ hub size boost（不加描边）
 nd$plot_size <- nd$base_size * ifelse(nd$is_hub, as.numeric(HUB_SIZE_BOOST), 1.0)
 
-# ✅ label 文本清洗（只影响显示，不改 name）
-nd$label_raw <- ifelse(nd$name %in% label_genes, nd$name, "")
-nd$label <- ifelse(nd$label_raw != "", clean_label_text(nd$label_raw), "")
+nd$expr_color <- as.numeric(unname(expr_map[nd$name]))
+
+nd$gene_name <- unname(gene_name_map[nd$name] %||% "")
+nd$gene_name[is.na(nd$gene_name)] <- ""
+nd$label_raw <- ifelse(nd$name %in% label_genes, nd$gene_name, "")
+nd$label <- ifelse(nzchar(nd$label_raw), clean_label_text(nd$label_raw), "")
+
+# ✅ 重复英文名唯一化（只改显示 label）
+nd$label_display <- make_unique_labels(nd$label, nd$name)
 
 pos <- nd[, c("name", "x", "y")]
 ed <- merge(ed, pos, by.x = "from", by.y = "name", all.x = TRUE)
 ed <- merge(ed, pos, by.x = "to", by.y = "name", all.x = TRUE, suffixes = c(".from", ".to"))
+
+# ✅ 图例标题只显示 log2(TPM+1)（mean 与 TARGET_GROUP 放图注说明）
+legend_title <- "log2(TPM+1)"
+
+xrange <- range(nd$x, finite = TRUE)
+yrange <- range(nd$y, finite = TRUE)
+xpad <- diff(xrange) * as.numeric(PANEL_PADDING_FRAC)
+ypad <- diff(yrange) * as.numeric(PANEL_PADDING_FRAC)
+if (!is.finite(xpad) || xpad == 0) xpad <- 1
+if (!is.finite(ypad) || ypad == 0) ypad <- 1
 
 p <- ggplot() +
   geom_segment(
@@ -421,15 +644,14 @@ p <- ggplot() +
   ) +
   geom_point(
     data = nd,
-    aes(x = x, y = y, size = plot_size),
+    aes(x = x, y = y, size = plot_size, color = expr_color),
     shape = 16,
-    color = MODULE_COLOR,
-    alpha = 0.9
+    alpha = 0.95
   ) +
-  scale_linewidth(range = c(0.2, 1.4)) +
-  scale_size(range = c(2.5, 9)) +
+  scale_linewidth(range = c(0.2, 1.4), guide = "none") +
+  scale_size(range = c(2.5, 9), guide = "none") +
+  get_color_scale(COLOR_SCHEME, legend_title) +
   labs(
-    # ✅ 即使打开标题，也不出现 module/edge rule（只给一个中性标题）
     title = if (isTRUE(SHOW_TITLE)) "Co-expression network" else NULL,
     subtitle = NULL
   ) +
@@ -439,33 +661,48 @@ p <- ggplot() +
     axis.ticks = element_blank(),
     axis.line  = element_blank(),
     panel.border = element_blank(),
-    legend.position = "none",
-    plot.title = element_text(size = 14, face = "bold")
+    plot.title = element_text(size = 14, face = "bold"),
+    legend.position = "right",
+    legend.title = element_text(size = 10),
+    legend.text  = element_text(size = 9)
   )
 
-# ✅ 关键：去除 ggrepel 的 segment（黑点/短杠的主要来源）
+# ✅ 关键：只加一次坐标系（本次修复 Coordinate system 提示）
+if (isTRUE(COORD_EQUAL)) {
+  p <- p + coord_equal(
+    xlim = c(xrange[1] - xpad, xrange[2] + xpad),
+    ylim = c(yrange[1] - ypad, yrange[2] + ypad)
+  )
+} else {
+  p <- p + coord_cartesian(
+    xlim = c(xrange[1] - xpad, xrange[2] + xpad),
+    ylim = c(yrange[1] - ypad, yrange[2] + ypad)
+  )
+}
+
 if (isTRUE(USE_LABEL_REPEL) && has_repel) {
   p <- p + ggrepel::geom_text_repel(
-    data = nd[nd$label != "", , drop = FALSE],
-    aes(x = x, y = y, label = label),
+    data = nd[nzchar(nd$label_display), , drop = FALSE],
+    aes(x = x, y = y, label = label_display),
     size = 4,
-    min.segment.length = Inf,  # 强制不画 segment
-    segment.color = NA,        # 双保险：彻底关闭 segment
+    min.segment.length = Inf,
+    segment.color = NA,
     box.padding = 0.25,
     point.padding = 0.15,
     max.overlaps = MAX_LABEL_OVERLAPS
   )
 } else {
   p <- p + geom_text(
-    data = nd[nd$label != "", , drop = FALSE],
-    aes(x = x, y = y, label = label),
+    data = nd[nzchar(nd$label_display), , drop = FALSE],
+    aes(x = x, y = y, label = label_display),
     size = 3.6,
     vjust = -0.7
   )
 }
 
-open_png(png_out, PNG_WIDTH_IN, PNG_HEIGHT_IN, PNG_RES_DPI); print(p); dev.off()
-open_pdf(pdf_out, PDF_WIDTH_IN, PDF_HEIGHT_IN); print(p); dev.off()
+# ✅ dev.off 不回显（本次消灭 null device 1）
+open_png(png_out, PNG_WIDTH_IN, PNG_HEIGHT_IN, PNG_RES_DPI); print(p); invisible(dev.off())
+open_pdf(pdf_out, PDF_WIDTH_IN, PDF_HEIGHT_IN); print(p); invisible(dev.off())
 
 cat("[OK]", png_out, "\n")
 cat("[OK]", pdf_out, "\n")
@@ -478,12 +715,19 @@ if (isTRUE(EXPORT_NODE_EDGE_TSV)) {
   nd_out <- data.frame(
     node = V(g2)$name,
     module_color = MODULE_COLOR,
+    gene_name = unname(gene_name_map[V(g2)$name] %||% ""),
+    label_display = nd$label_display[match(V(g2)$name, nd$name)],
+    target_group = as.character(TARGET_GROUP),
+    expr_mean_log2_tpm1 = unname(expr_map[V(g2)$name]),
     kME = V(g2)$kME,
     degree = V(g2)$degree,
     is_hub = V(g2)$is_hub,
     is_labeled = V(g2)$name %in% label_genes,
     stringsAsFactors = FALSE
   )
+  nd_out$gene_name[is.na(nd_out$gene_name)] <- ""
+  nd_out$label_display[is.na(nd_out$label_display)] <- ""
+  nd_out$expr_mean_log2_tpm1 <- as.numeric(nd_out$expr_mean_log2_tpm1)
 
   ed_out <- igraph::as_data_frame(g2, what = "edges")
   ed_out$weight <- E(g2)$weight
