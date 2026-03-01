@@ -43,11 +43,11 @@ bubble_col_gap <- 30
 time_text_vjust <- 1.2
 
 # [样式] 字体与颜色配置
-opt_font_family <- "sans"          # 无衬线字体
+opt_font_family <- "Arial"          # 无衬线字体
 color_expansion <- "#E41A1C"       # 红色 (扩张)
 color_contraction <- "#4DAF4A"     # 绿色 (收缩)
 color_time_text <- "#1F78B4"       # 蓝色 (时间文字)
-abbreviate_species_names <- TRUE   # 开启属名缩写 (如 Sinonovacula -> S.)
+abbreviate_species_names <- FALSE   # 开启属名缩写 (如 Sinonovacula -> S.)
 
 # ==============================================================================
 
@@ -212,7 +212,7 @@ p_final <- ggtree(tree_final, layout="rectangular", linewidth=0.5) +
   scale_y_continuous(limits=c(-2, length(phy$tip.label) + 2)) +
   
   # [图层8: 主题清理] 去掉所有默认背景和坐标轴
-  theme_void() +
+  theme_void(base_family = opt_font_family) +
   theme(plot.margin = margin(t=20, b=20, l=10, r=10))
 
 # 6. 保存结果
