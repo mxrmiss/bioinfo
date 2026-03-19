@@ -8,3 +8,6 @@ seqkit grep -n -f tmp.list Sinonovacula_constricta.faa | seqkit seq -w 0 > protm
 
 # TSV 专用，保留 B 表头，按 A 第2列匹配 B 第3列，输出 B 的整行
 awk -F'\t' 'NR==FNR{k[$2]=1; next} FNR==1{print; next} ($3 in k)' A.tsv B.tsv
+
+19gene_heatmap.R	果冻感的方块热图
+

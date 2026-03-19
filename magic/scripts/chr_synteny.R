@@ -129,14 +129,19 @@ for (sp in raw_species) {
 # 按物种 + 染色体名排序，并在每个物种内部重新编号 01,02,... 作为标签编号
 df_chr <- df_chr %>%
   group_by(species) %>%
-  arrange(chr, .by_group = TRUE) %>%
+  arrange(as.integer(str_extract(as.character(chr), "\\d+$")), chr, .by_group = TRUE) %>%
   mutate(chr_index = row_number()) %>%
   ungroup()
 
-df_chr$label <- mapply(function(idx, sp) {
-  num <- sprintf("%02d", idx)
+df_chr$label <- mapply(function(idx, sp, chrname) {
+  num <- str_extract(chrname, "\\d+$")
+  if (is.na(num) || num == "") {
+    num <- sprintf("%02d", idx)
+  } else {
+    num <- sprintf("%02d", as.integer(num))
+  }
   paste0(sp_map[[sp]], num)
-}, df_chr$chr_index, df_chr$species)
+}, df_chr$chr_index, df_chr$species, as.character(df_chr$chr))
 
 df_chr$chr <- factor(df_chr$chr, levels = df_chr$chr)
 

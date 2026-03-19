@@ -12,13 +12,13 @@
   - tissue：按组织聚合成 6 列（median/mean 可选）——主图推荐
   - sample：保留 18 个样本列——补图推荐
 - 支持 log2(TPM+1) + 行 z-score
-- y轴只用 GeneSymbol，提供大小写统一开关
-- 支持 2 套配色方案（来自皇上给的图片）开关 + 反转开关
+- y轴标签可选 GeneID 或 GeneSymbol（新增开关）
+- 支持 3 套配色方案开关 + 反转开关
 - 输出 PNG + PDF，并可选导出用于作图的矩阵 TSV
 
 特别修改（皇上最新要求）：
-- 当 AGG_MODE="sample" 时：横轴标签不再重复显示 foot/gill/...，
-  而是显示 foot-1, foot-2, foot-3（其他组织同理），编号按列出现顺序递增。
+- 当 AGG_MODE="sample" 时：横轴标签显示 foot-1, foot-2, foot-3（其他组织同理），编号按列出现顺序递增。
+- 热图去掉横纵轴黑框（隐藏 spines）
 """
 
 import os
@@ -66,7 +66,12 @@ THEME_ORDER = [
     "ECM/Adhesion/Remodeling",
 ]
 
-# 7) GeneSymbol 大小写统一开关（y轴只用 symbol）
+# 7) y轴基因标识使用哪一列（新增开关）
+# - "GeneID"     ：用 top_gene_heatmap.tsv 第一列 GeneID（如 Sco02g03420.1）
+# - "GeneSymbol" ：用第二列 GeneSymbol（默认；会走大小写规范化与重复消歧）
+Y_LABEL_SOURCE = "GeneID"   # "GeneID" / "GeneSymbol"
+
+# GeneSymbol 大小写统一开关（仅当 Y_LABEL_SOURCE="GeneSymbol" 时生效）
 # - "keep": 原样
 # - "upper": 尽量全大写（-like 后缀保持小写）
 # - "title": 首字母大写（全大写符号保持不变；-like 保持小写）
@@ -84,18 +89,19 @@ DO_ROW_ZSCORE = True         # True: 每行 z-score（突出组织特异性）
 CLIP_ZSCORE = True
 Z_CLIP = 3.0                 # 常用 2~4；3.0 很稳
 
-# 9) 配色方案开关（来自皇上给的两张图片）
-# - "scheme1": 绿 ↔ 粉 发散（非常适合 z-score）
+# 9) 配色方案开关
+# - "scheme1": 梦幻清新发散（薄荷绿 ↔ 白 ↔ 粉紫系；适合 z-score）
 # - "scheme2": 薄荷绿 → 蓝 递进（更“清新脱俗”）
-PALETTE_SCHEME = "scheme1"   # "scheme1" / "scheme2"
+# - "scheme3": Mint(#7FD3C8) → White → Peach(#F79D93)（皇上截图指定）
+PALETTE_SCHEME = "scheme3"   # "scheme1" / "scheme2" / "scheme3"
 PALETTE_REVERSE = False      # True: 反转颜色顺序（低↔高对调）
 
 # 10) 作图尺寸
 SHOW_GENE_LABELS = True
 FIG_WIDTH = 7.5
 ROW_HEIGHT = 0.18
-FONT_SIZE_Y = 7
-FONT_SIZE_X = 9
+FONT_SIZE_Y = 9
+FONT_SIZE_X = 11
 
 # 11) 可选：导出用于作图的矩阵（便于复现/附录）
 EXPORT_MATRIX_TSV = True
@@ -127,19 +133,20 @@ def _clip(mat: np.ndarray, v: float) -> np.ndarray:
 def _make_palette(scheme: str, reverse: bool) -> LinearSegmentedColormap:
     scheme = (scheme or "scheme1").strip().lower()
 
-    # 方案1（绿 ↔ 粉 发散）：来自图片 hex
+    # 方案1（梦幻清新发散：薄荷绿 ↔ 白 ↔ 粉紫系）
+    # 说明：比旧版 scheme1 更柔和、更“奶”，但仍保留发散对比，适合 row z-score。
     scheme1 = [
-        "#4D9221FF",
-        "#7FBC41FF",
-        "#B8E186FF",
-        "#E6F5D0FF",
-        "#FDE0EFFF",
-        "#F1B6DAFF",
-        "#DE77AEFF",
-        "#C51B7DFF",
+        "#7FD3C8",  # mint
+        "#9FD5CB",  # softer mint
+        "#D7F2EC",  # very light mint
+        "#FFFFFF",  # white
+        "#FDE0EF",  # very light pink
+        "#F7B6D2",  # soft pink
+        "#F6C6E7",  # pink-lilac
+        "#9E90E6",  # soft purple
     ]
 
-    # 方案2（薄荷绿 → 蓝 递进）：来自图片 hex
+    # 方案2（薄荷绿 → 蓝 递进）：来自旧图片 hex（保留）
     scheme2 = [
         "#B0F2BCFF",
         "#8EEEAEFF",
@@ -151,12 +158,22 @@ def _make_palette(scheme: str, reverse: bool) -> LinearSegmentedColormap:
         "#257D98FF",
     ]
 
+    # 方案3（Mint(负) - White(0) - Peach(正)）：皇上截图指定
+    # 注意：这是发散三锚点，适合 z-score（负/0/正）
+    scheme3 = [
+        "#7FD3C8",  # Mint (low / negative)
+        "#FFFFFF",  # White (mid / zero)
+        "#F79D93",  # Peach (high / positive)
+    ]
+
     if scheme == "scheme1":
         colors = scheme1
     elif scheme == "scheme2":
         colors = scheme2
+    elif scheme == "scheme3":
+        colors = scheme3
     else:
-        raise ValueError("PALETTE_SCHEME 只能是 'scheme1' 或 'scheme2'")
+        raise ValueError("PALETTE_SCHEME 只能是 'scheme1'/'scheme2'/'scheme3'")
 
     if reverse:
         colors = list(reversed(colors))
@@ -331,11 +348,25 @@ def main():
         merged["_theme_cat"] = merged["_theme_cat"].cat.add_categories(["__OTHER__"]).fillna("__OTHER__")
         merged = merged.sort_values(by=["_theme_cat"], kind="stable").drop(columns=["_theme_cat"])
 
-    # GeneSymbol 大小写统一 +（可选）消歧
-    symbols_raw = merged["GeneSymbol"].tolist()
-    symbols_norm = [_normalize_symbol(s, SYMBOL_CASE_MODE) for s in symbols_raw]
-    if DISAMBIGUATE_DUP_SYMBOLS:
-        symbols_norm = _disambiguate_labels(symbols_norm)
+    # ===== y轴标签：GeneID or GeneSymbol（新增）=====
+    y_source = (Y_LABEL_SOURCE or "GeneSymbol").strip().lower()
+    if y_source == "geneid":
+        y_labels = merged["GeneID"].astype(str).tolist()
+    elif y_source == "genesymbol":
+        symbols_raw = merged["GeneSymbol"].tolist()
+        symbols_norm = [_normalize_symbol(s, SYMBOL_CASE_MODE) for s in symbols_raw]
+
+        # 如果某些 symbol 为空，稳妥起见用 GeneID 顶上（避免出现空标签）
+        gene_ids_fallback = merged["GeneID"].astype(str).tolist()
+        symbols_norm = [sym if (sym is not None and str(sym).strip() != "") else gene_ids_fallback[i]
+                       for i, sym in enumerate(symbols_norm)]
+
+        if DISAMBIGUATE_DUP_SYMBOLS:
+            symbols_norm = _disambiguate_labels(symbols_norm)
+        y_labels = symbols_norm
+    else:
+        print("[ERROR] Y_LABEL_SOURCE 只能是 'GeneID' 或 'GeneSymbol'", file=sys.stderr)
+        sys.exit(1)
 
     # 表达矩阵
     expr = merged[srr_cols].apply(pd.to_numeric, errors="coerce").fillna(0.0)
@@ -378,7 +409,6 @@ def main():
         col_labels = tissue_labels
 
     else:
-        # ========== 关键修改在这里 ==========
         # sample 模式：18列，横轴显示组织名 + 编号（foot-1/2/3）
         if SAMPLE_ORDER_MODE.strip().lower() == "grouped":
             ordered_srr = []
@@ -401,7 +431,6 @@ def main():
             tissue = sample_to_group.get(s, "NA")
             rep_count[tissue] = rep_count.get(tissue, 0) + 1
             col_labels.append(f"{tissue}-{rep_count[tissue]}")
-        # ========== 关键修改结束 ==========
 
     # 变换
     if DO_LOG2:
@@ -438,10 +467,16 @@ def main():
             os.path.basename(OUT_PREFIX) + "." + EXPORT_MATRIX_SUFFIX
         )
         out_df = pd.DataFrame(mat_plot, columns=col_labels)
-        out_df.insert(0, "GeneSymbol", symbols_norm)
-        out_df.insert(0, "GeneID", merged["GeneID"].tolist())
+
+        # 导出时仍保留两列标识，方便复现/追溯
+        out_df.insert(0, "GeneSymbol", merged["GeneSymbol"].astype(str).tolist())
+        out_df.insert(0, "GeneID", merged["GeneID"].astype(str).tolist())
         out_df.insert(2, "Theme", merged["Theme"].tolist())
         out_df.insert(3, "PutativeFunction", merged["PutativeFunction"].tolist())
+
+        # 额外记录：这次画图实际用的 y 轴标签是什么
+        out_df.insert(0, "YLabelUsed", y_labels)
+
         out_df.to_csv(out_mat_path, sep="\t", index=False)
 
     # 画图
@@ -468,7 +503,7 @@ def main():
     if AGG_MODE.strip().lower() == "tissue":
         mode_tag += f"({AGG_METHOD})"
 
-    title = f"Heatmap ({mode_tag}) | {value_label} | {PALETTE_SCHEME}{'_rev' if PALETTE_REVERSE else ''}"
+    title = f"Heatmap ({mode_tag}) | {value_label} | {PALETTE_SCHEME}{'_rev' if PALETTE_REVERSE else ''} | y={Y_LABEL_SOURCE}"
     ax.set_title(title, fontsize=12)
 
     ax.set_xticks(np.arange(n_cols))
@@ -476,10 +511,14 @@ def main():
 
     if SHOW_GENE_LABELS:
         ax.set_yticks(np.arange(n_rows))
-        ax.set_yticklabels(symbols_norm, fontsize=FONT_SIZE_Y)
+        ax.set_yticklabels(y_labels, fontsize=FONT_SIZE_Y)
     else:
         ax.set_yticks([])
         ax.set_yticklabels([])
+
+    # ===== 去掉横纵轴黑框（隐藏四条 spines）=====
+    for side in ["left", "right", "top", "bottom"]:
+        ax.spines[side].set_visible(False)
 
     cbar = plt.colorbar(im, ax=ax, fraction=0.02, pad=0.02)
     cbar.set_label(cbar_label)

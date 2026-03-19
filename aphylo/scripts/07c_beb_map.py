@@ -1,25 +1,36 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-07c_beb_map.py —— BEB 位点映射与 3D 标注清单导出
+07c_beb_map.py
+BEB 位点映射与 3D 标注清单导出
 
 功能：
 1) 读取 results/05_cmlagg/D_beb_sites.tsv（BEB 位点长表）
-2) 映射到：
+2) 额外读取 results/05_cmlagg/D_fdr_genes.tsv（OG + foreground 层面的 P/Q）
+3) 映射到：
    - results/03_codon/pep_trimal/OGxxxx.pep.trimal.fa（修剪后蛋白对齐）
    - results/03_codon/colnumbering/OGxxxx.colnumbering.txt（修剪后列 -> MAFFT 列映射）
    - results/03_codon/_tmp_codon_msa/OGxxxx.pep.mafft.fa（修剪前 MAFFT 蛋白对齐）
    - phylo/data/proteomes/*（原始蛋白，用于核对 raw_aa）
-3) 输出两张表（覆盖写）：
+4) 输出两张表（覆盖写）：
    A) results/05_cmlagg/D_beb_sites_mapped.tsv
-      —— 每个位点一行（可追溯、可调试）
+      - 每个位点一行（可追溯、可调试）
+      - 新增 OG_FG_pvalue / OG_FG_qvalue
    B) results/05_cmlagg/D_beb_sites_mapped_gene.tsv
-      —— 精简版：一个 (OG, foreground, gene_id) 一行；忽略 gap；只保留合并字段
-         sites_3d_label 形如：Y39(0.998);H40(0.998);T44(0.992)
+      - 精简版：一个 (OG, foreground, gene_id) 一行
+      - 新增 OG_FG_pvalue / OG_FG_qvalue
+      - sites_3d_label 形如：Y39(0.998);H40(0.998);T44(0.992)
+
+说明：
+- 这里补回去的 p/q 是 OG + foreground 层面的统计值
+- 不是单个 gene 自己重新计算出来的 p/q
+- 因此同一个 (OG, foreground) 下的多个 gene 会共享同一组 p/q
 
 用法：
-- 不走命令行参数；只需在“皇上在这里改参数”区域按需改路径/开关
-- 运行：python3 scripts/07c_beb_map.py
+- 不走命令行参数
+- 只需在“皇上在这里改参数”区域按需修改
+- 运行：
+  python3 scripts/07c_beb_map.py
 """
 
 from __future__ import annotations
@@ -34,24 +45,27 @@ from typing import Dict, List, Optional, Tuple
 # 皇上在这里改参数（不走命令行）
 # ==========================
 
-# —— 项目根目录：默认脚本位于 aphylo/scripts/ 下，因此根目录是 scripts 的上一级
+# 项目根目录：默认脚本位于 aphylo/scripts/ 下，因此根目录是 scripts 的上一级
 APHYLO_ROOT = Path(__file__).resolve().parent.parent
 
-# —— 输入：06 聚合输出的位点长表
+# 输入：BEB 位点长表
 INPUT_TSV = APHYLO_ROOT / "results/05_cmlagg/D_beb_sites.tsv"
 
-# —— 03 输出：修剪后蛋白对齐、列映射、修剪前 MAFFT 蛋白对齐
+# 输入：OG + foreground 层面的 P/Q 表
+FDR_TSV = APHYLO_ROOT / "results/05_cmlagg/D_fdr_genes.tsv"
+
+# 03 输出：修剪后蛋白对齐、列映射、修剪前 MAFFT 蛋白对齐
 PEP_TRIMAL_DIR = APHYLO_ROOT / "results/03_codon/pep_trimal"
 COLNUM_DIR = APHYLO_ROOT / "results/03_codon/colnumbering"
 MAFFT_DIR = APHYLO_ROOT / "results/03_codon/_tmp_codon_msa"  # 里面应有 OGxxxx.pep.mafft.fa
 
-# —— 输出：映射后的长表（覆盖）
+# 输出：映射后的长表（覆盖）
 OUTPUT_MAPPED_TSV = APHYLO_ROOT / "results/05_cmlagg/D_beb_sites_mapped.tsv"
 
-# —— 输出：精简基因表（覆盖）
+# 输出：精简基因表（覆盖）
 OUTPUT_GENE_TSV = APHYLO_ROOT / "results/05_cmlagg/D_beb_sites_mapped_gene.tsv"
 
-# —— 是否用原始 proteome 核对 raw_aa（建议 True）
+# 是否用原始 proteome 核对 raw_aa（建议 True）
 DO_PROTEOME_CHECK = True
 
 # phylo 项目默认与 aphylo 同级：~/project/phylo
@@ -59,11 +73,16 @@ PHYLO_ROOT = APHYLO_ROOT.parent / "phylo"
 PROTEOME_DIR = PHYLO_ROOT / "data/proteomes"
 PROTEOME_SUFFIXES = (".fa", ".faa", ".fasta")
 
-# —— 打印进度（行数很多时用）
+# 打印进度（行数很多时用）
 PROGRESS_EVERY = 20000
 
-# —— sites_3d_label 里 posterior 保留的小数位（建议 3 位：0.998）
+# sites_3d_label 里 posterior 保留的小数位（建议 3 位）
 POST_DECIMALS = 3
+
+# 若 FDR_TSV 不存在或缺少 P/Q 列时，是否直接报错退出
+# True：严格模式，缺少就退出
+# False：宽松模式，继续运行，但 p/q 为空并打印警告
+STRICT_REQUIRE_FDR = False
 
 
 # ==========================
@@ -123,7 +142,8 @@ def split_gene_ids(s: str) -> List[str]:
         p = p.strip()
         if p:
             out.append(p)
-    # 去重保持顺序
+
+    # 去重并保持顺序
     seen = set()
     uniq: List[str] = []
     for x in out:
@@ -135,7 +155,7 @@ def split_gene_ids(s: str) -> List[str]:
 
 def load_proteomes_index(proteome_dir: Path, suffixes: Tuple[str, ...]) -> Dict[str, str]:
     """
-    扫描 PROTEOME_DIR，构建 {normalized_id: aa_sequence} 索引。
+    扫描 PROTEOME_DIR，构建 {normalized_id: aa_sequence} 索引
     """
     idx: Dict[str, str] = {}
     files: List[Path] = []
@@ -170,7 +190,7 @@ def aln_char_at(seq: str, col_1based: int) -> str:
 
 def residue_index_from_alignment(seq: str, col_1based: int) -> Optional[int]:
     """
-    在 alignment 序列中，计算 col_1based 对应的“去 gap residue index”(1-based)
+    在 alignment 序列中，计算 col_1based 对应的“去 gap residue index”（1-based）
     - 若该列为 gap 或越界，返回 None
     """
     if not seq or col_1based <= 0 or col_1based > len(seq):
@@ -199,14 +219,14 @@ def find_seq_by_id(aln: Dict[str, str], gene_id_norm: str) -> Tuple[Optional[str
 
 def parse_colnumbering_strict(fp: Path, target_len: int) -> Optional[List[int]]:
     """
-    解析 trimAl 的 -colnumbering 输出，得到“修剪后列 -> 修剪前（MAFFT）列”的映射。
+    解析 trimAl 的 -colnumbering 输出，得到“修剪后列 -> 修剪前（MAFFT）列”的映射
 
-    关键点（这也是你现在 fg_aa_trim vs fg_aa_mafft 对不上的根因）：
-    - trimAl 的 colnumbering 文件里真正可靠的是 `ColumnsMap`。
-    - `ColumnsMap` 会包含：
+    关键点：
+    - trimAl 的 colnumbering 文件里真正可靠的是 ColumnsMap
+    - ColumnsMap 会包含：
         * -1：该列被 trimAl 剪掉了
         * 0-based 的列号：该列在“修剪前（MAFFT 对齐）”中的位置
-    - 你的 BEB site 是“修剪后对齐”的 1-based 列号，因此：
+    - BEB site 是“修剪后对齐”的 1-based 列号，因此：
         mafft_col_1based = (ColumnsMap 过滤掉 -1 后取第 site 个值) + 1
 
     返回：
@@ -222,14 +242,12 @@ def parse_colnumbering_strict(fp: Path, target_len: int) -> Optional[List[int]]:
     if p < 0:
         return None
 
-    # 从 ColumnsMap 开始向后，把所有整数（包含 -1）都捞出来
     nums = [int(x) for x in re.findall(r"-?\d+", txt[p:])]
     if not nums:
         return None
 
     kept = [n for n in nums if n != -1]
 
-    # 正常情况下 kept 的长度应当等于修剪后对齐长度（target_len）
     if len(kept) != target_len:
         return None
 
@@ -257,6 +275,118 @@ def fmt_post(s: str, decimals: int = 3) -> str:
         return s
 
 
+def first_existing_col(col2i: Dict[str, int], candidates: List[str]) -> Optional[str]:
+    """
+    在候选列名中，返回第一个存在于表头里的列名
+    """
+    for c in candidates:
+        if c in col2i:
+            return c
+    return None
+
+
+def load_og_fg_pq_map(fdr_tsv: Path, strict: bool = False) -> Dict[Tuple[str, str], Tuple[str, str]]:
+    """
+    读取 D_fdr_genes.tsv，构建：
+      pq_map[(OG, foreground)] = (pvalue_str, qvalue_str)
+
+    兼容多种列名写法，常见候选如下：
+    - P / p / pvalue / p_value / pval / p_val
+    - Q / q / qvalue / q_value / qval / q_val / FDR / fdr / padj
+    """
+    pq_map: Dict[Tuple[str, str], Tuple[str, str]] = {}
+
+    if not fdr_tsv.exists():
+        msg = f"[WARN] FDR_TSV not found, OG_FG_pvalue / OG_FG_qvalue will be blank: {fdr_tsv}"
+        if strict:
+            print(msg.replace("[WARN]", "[ERR]"), file=sys.stderr, flush=True)
+            raise FileNotFoundError(str(fdr_tsv))
+        print(msg, flush=True)
+        return pq_map
+
+    with fdr_tsv.open("r", encoding="utf-8", errors="ignore") as f:
+        header = f.readline().rstrip("\n")
+        if not header:
+            msg = f"[WARN] Empty FDR_TSV, OG_FG_pvalue / OG_FG_qvalue will be blank: {fdr_tsv}"
+            if strict:
+                print(msg.replace("[WARN]", "[ERR]"), file=sys.stderr, flush=True)
+                raise ValueError("Empty FDR_TSV")
+            print(msg, flush=True)
+            return pq_map
+
+        cols = header.split("\t")
+        col2i = {c: i for i, c in enumerate(cols)}
+
+        if "OG" not in col2i or "foreground" not in col2i:
+            msg = f"[WARN] FDR_TSV missing required columns OG/foreground: {cols}"
+            if strict:
+                print(msg.replace("[WARN]", "[ERR]"), file=sys.stderr, flush=True)
+                raise ValueError("Missing OG/foreground in FDR_TSV")
+            print(msg, flush=True)
+            return pq_map
+
+        p_col = first_existing_col(
+            col2i,
+            ["P", "p", "pvalue", "p_value", "pval", "p_val"]
+        )
+        q_col = first_existing_col(
+            col2i,
+            ["Q", "q", "qvalue", "q_value", "qval", "q_val", "FDR", "fdr", "padj", "adj_p", "adj_pvalue"]
+        )
+
+        if p_col is None or q_col is None:
+            msg = (
+                f"[WARN] FDR_TSV cannot find p/q columns. "
+                f"Detected p_col={p_col}, q_col={q_col}. "
+                f"Found columns: {cols}"
+            )
+            if strict:
+                print(msg.replace("[WARN]", "[ERR]"), file=sys.stderr, flush=True)
+                raise ValueError("Missing p/q columns in FDR_TSV")
+            print(msg, flush=True)
+            return pq_map
+
+        n_rows = 0
+        n_kept = 0
+        n_dup = 0
+
+        for line in f:
+            line = line.rstrip("\n")
+            if not line:
+                continue
+            n_rows += 1
+            parts = line.split("\t")
+            if len(parts) < len(cols):
+                continue
+
+            og = parts[col2i["OG"]].strip()
+            fg = parts[col2i["foreground"]].strip()
+            p_str = parts[col2i[p_col]].strip()
+            q_str = parts[col2i[q_col]].strip()
+
+            if not og or not fg:
+                continue
+
+            key = (og, fg)
+            if key not in pq_map:
+                pq_map[key] = (p_str, q_str)
+                n_kept += 1
+            else:
+                n_dup += 1
+                old_p, old_q = pq_map[key]
+                # 若旧值为空而新值非空，则用新值补上
+                if (not old_p and p_str) or (not old_q and q_str):
+                    pq_map[key] = (p_str or old_p, q_str or old_q)
+
+        print(
+            f"[INFO] Loaded P/Q map from {relpath(fdr_tsv)}: "
+            f"rows={n_rows}, unique_OG_FG={n_kept}, duplicate_keys={n_dup}",
+            flush=True
+        )
+
+    return pq_map
+
+
 # ==========================
 # 主程序
 # ==========================
@@ -273,6 +403,13 @@ def main() -> int:
         return 2
     if not MAFFT_DIR.is_dir():
         print(f"[ERR] MAFFT_DIR not found: {MAFFT_DIR}", file=sys.stderr, flush=True)
+        return 2
+
+    # 读取 OG + foreground 层面的 P/Q
+    try:
+        pq_map = load_og_fg_pq_map(FDR_TSV, strict=STRICT_REQUIRE_FDR)
+    except Exception as e:
+        print(f"[ERR] Failed to load FDR_TSV: {e}", file=sys.stderr, flush=True)
         return 2
 
     proteome_index: Optional[Dict[str, str]] = None
@@ -309,9 +446,14 @@ def main() -> int:
             print(f"[ERR] Found columns: {cols}", file=sys.stderr, flush=True)
             return 3
 
-        # A) 长表输出表头（与你现有列一致/兼容）
+        # A) 长表输出表头
         mapped_cols = [
-            "OG", "foreground", "site", "post",
+            "OG",
+            "foreground",
+            "site",
+            "post",
+            "OG_FG_pvalue",
+            "OG_FG_qvalue",
             "gene_id",
             "ref_aa",
             "input_aa",
@@ -364,6 +506,8 @@ def main() -> int:
                 except Exception:
                     continue
 
+                og_fg_pvalue, og_fg_qvalue = pq_map.get((og, fg), ("", ""))
+
                 gene_ids = split_gene_ids(gene_ids_raw)
                 if not gene_ids:
                     gene_ids = [""]
@@ -407,12 +551,12 @@ def main() -> int:
                 mafft_col0: Optional[int] = None
                 if colmap and 1 <= site <= len(colmap):
                     mafft_col0 = colmap[site - 1]
+
                 # 转成 1-based，供 aln_char_at / residue_index_from_alignment 使用
                 mafft_col1: Optional[int] = (mafft_col0 + 1) if mafft_col0 is not None else None
 
                 # posterior 统一格式化（用于 label）
                 post_fmt = fmt_post(post_raw, POST_DECIMALS)
-                post_float = None
                 try:
                     post_float = float(post_raw)
                 except Exception:
@@ -485,7 +629,9 @@ def main() -> int:
                         "OG": og,
                         "foreground": fg,
                         "site": str(site),
-                        "post": post_fmt,  # 长表也输出格式化后的 post，便于一致阅读
+                        "post": post_fmt,
+                        "OG_FG_pvalue": og_fg_pvalue,
+                        "OG_FG_qvalue": og_fg_qvalue,
                         "gene_id": gid_norm,
                         "ref_aa": ref_aa,
                         "input_aa": input_aa,
@@ -518,20 +664,35 @@ def main() -> int:
                         if ridx_int > 0:
                             key = (og, fg, gid_norm)
                             gene_sites.setdefault(key, []).append(
-                                (ridx_int, raw_aa, float(post_raw) if post_float == post_float else float("nan"), post_fmt)
+                                (ridx_int, raw_aa, post_float if post_float == post_float else float("nan"), post_fmt)
                             )
 
                 if PROGRESS_EVERY and n_in % int(PROGRESS_EVERY) == 0:
-                    print(f"[PROGRESS] lines={n_in} mapped_rows={n_out} gene_groups={len(gene_sites)}", flush=True)
+                    print(
+                        f"[PROGRESS] lines={n_in} mapped_rows={n_out} gene_groups={len(gene_sites)}",
+                        flush=True
+                    )
 
     # 写精简表
-    gene_cols = ["OG", "foreground", "gene_id", "n_sites", "max_post", "sites_3d_label"]
+    gene_cols = [
+        "OG",
+        "foreground",
+        "gene_id",
+        "OG_FG_pvalue",
+        "OG_FG_qvalue",
+        "n_sites",
+        "max_post",
+        "sites_3d_label",
+    ]
+
     with OUTPUT_GENE_TSV.open("w", encoding="utf-8") as wg:
         wg.write("\t".join(gene_cols) + "\n")
 
         # 为了输出稳定：按 OG, foreground, gene_id 排序
         for (og, fg, gid) in sorted(gene_sites.keys()):
             items = gene_sites[(og, fg, gid)]
+            og_fg_pvalue, og_fg_qvalue = pq_map.get((og, fg), ("", ""))
+
             # 去重：同一个 residue_index_raw 可能因重复行出现，保留最高 post
             best_by_ridx: Dict[int, Tuple[str, float, str]] = {}
             for ridx, aa, postf, postfmt in items:
@@ -545,7 +706,6 @@ def main() -> int:
                     elif (postf == postf) and (old_postf == old_postf) and (postf > old_postf):
                         best_by_ridx[ridx] = (aa, postf, postfmt)
                     else:
-                        # 保留原有
                         best_by_ridx[ridx] = (best_by_ridx[ridx][0], old_postf, old_postfmt)
 
             # 按 residue_index_raw 升序
@@ -560,19 +720,27 @@ def main() -> int:
                         max_post = postf
 
             n_sites = len(tokens)
-            max_post_str = ""
             if max_post == float("-inf"):
                 max_post_str = ""
             else:
                 max_post_str = fmt_post(str(max_post), POST_DECIMALS)
 
             wg.write("\t".join([
-                og, fg, gid,
+                og,
+                fg,
+                gid,
+                og_fg_pvalue,
+                og_fg_qvalue,
                 str(n_sites),
                 max_post_str,
                 ";".join(tokens),
             ]) + "\n")
 
+    print(f"[INFO] Input BEB rows: {n_in}", flush=True)
+    print(f"[INFO] Output mapped rows: {n_out}", flush=True)
+    print(f"[INFO] status == GAP_AT_SITE: {stat_gap}", flush=True)
+    print(f"[INFO] status == OK: {stat_ok}", flush=True)
+    print(f"[INFO] status == OK and match_raw_fg == TRUE: {stat_ok_match}", flush=True)
     print("[DONE] Wrote:", relpath(OUTPUT_MAPPED_TSV), flush=True)
     print("[DONE] Wrote:", relpath(OUTPUT_GENE_TSV), flush=True)
     return 0
@@ -580,4 +748,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

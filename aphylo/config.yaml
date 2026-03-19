@@ -40,7 +40,7 @@ species:
 
 codon:
   threads: 30
-  min_taxa: 18
+  min_taxa: 19
   min_codon_len: 120
   max_gap_frac: 0.5
   stopcodon_action: "fail"   # fail | mask(NNN)
@@ -73,7 +73,7 @@ cafe5:
   max_autofix_rounds: 3                                # primary 阶段极端 OG 自动修正最多轮数
 
   two_stage_large:                                     # 第二阶段：large 家族（≥ copy_threshold）
-    enable: false                                       # true 启用；false 不跑 large
+    enable: true                                       # true 启用；false 不跑 large
     copy_threshold: 100                                # 任一物种计数 ≥ 此值划入 large
 
   error_model:                                         # 误差模型（-e）
@@ -137,7 +137,7 @@ mcmctree:
   rooted_tree: "../phylo/results/publish/aphylo_ready/species_tree_rooted.nwk"
   source_tree: "results/06_cafe/mcmctree/species_calib.trees"   # 08 产出：有分支长度
   tree:        "results/06_cafe/mcmctree/species_calib.nobl.trees"   # 同上（与部分脚本兼容）
-  outgroups:   ["Lottia_gigantea"]
+  outgroups:   ["Nematostella_vectensis"]
 
   # -------- 工作目录与关键输入（10 步在该目录内就地运行）--------
   outdir:   "results/06_cafe/mcmctree"

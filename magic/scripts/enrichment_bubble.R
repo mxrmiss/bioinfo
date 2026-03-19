@@ -38,6 +38,9 @@ USE_FIXED_HEIGHT    <- TRUE
 # [参数] 锁定模式下的高度 (单位: inch)
 FIXED_HEIGHT_VAL    <- 9.5
 
+# [参数] 锁定模式下单面图固定宽度 (单位: inch)
+FIXED_WIDTH_VAL     <- 15
+
 # [参数] 单面图的宽高比 (Aspect Ratio)
 # 例：1.9 代表宽度 ≈ 高度 / 1.9，保持气泡区域视觉统一
 SINGLE_ASPECT_RATIO <- 2.0
@@ -51,7 +54,7 @@ FACET_WIDTH_INCH    <- 12.0
 FACET_HEIGHT_INCH   <- 10.0
 
 # 文字排版：通路名称超过多少字符自动换行
-MANUAL_WRAP_WIDTH   <- 60
+MANUAL_WRAP_WIDTH   <- 40
 
 # ------------------------------------------------------------------------------
 # [B] 外观与配色 (AESTHETICS & COLORS)
@@ -88,8 +91,8 @@ COLOR_MAP_OPTION <- "viridis"
 VIRIDIS_N <- 256
 
 # 字体设置
-FONT_FAMILY  <- "sans"     # 字体 (Arial/Helvetica)
-BASE_SIZE    <- 14         # 基础字号
+FONT_FAMILY  <- "Arial"     # 字体 (Arial/Helvetica)
+BASE_SIZE    <- 22         # 基础字号
 
 # ------------------------------------------------------------------------------
 # [C] 路径设置 (PATHS)
@@ -195,7 +198,10 @@ for (f_path in files) {
     slice_head(n = target_n) %>%
     ungroup() %>%
     arrange(GeneRatioNumeric) %>%
-    mutate(TermWrapped = factor(TermWrapped, levels = unique(TermWrapped)))
+    mutate(
+      TermWrapped = factor(TermWrapped, levels = unique(TermWrapped)),
+      negLog10FDR = -log10(p_adjust)
+    )
 
   final_count <- nrow(df_ready)
 
@@ -209,19 +215,20 @@ for (f_path in files) {
   } else {
     if (USE_FIXED_HEIGHT) {
       final_height_inch <- FIXED_HEIGHT_VAL
+      final_width_inch  <- FIXED_WIDTH_VAL
     } else {
       final_height_inch <- (final_count * ROW_HEIGHT_INCH) + BASE_HEIGHT_INCH
       final_height_inch <- max(final_height_inch, 3.0)
+
+      grid_width_inch <- final_height_inch / SINGLE_ASPECT_RATIO
+
+      max_char_len    <- max(nchar(as.character(df_ready$TermWrapped)), na.rm = TRUE)
+      text_width_inch <- max_char_len * 0.09 + 0.5
+
+      legend_width_inch <- 2.0
+
+      final_width_inch <- text_width_inch + grid_width_inch + legend_width_inch
     }
-
-    grid_width_inch <- final_height_inch / SINGLE_ASPECT_RATIO
-
-    max_char_len    <- max(nchar(as.character(df_ready$TermWrapped)), na.rm = TRUE)
-    text_width_inch <- max_char_len * 0.09 + 0.5
-
-    legend_width_inch <- 2.0
-
-    final_width_inch <- text_width_inch + grid_width_inch + legend_width_inch
   }
 
   cat(sprintf("   [尺寸] %.2f x %.2f inch | 模式: %s | 颜色: %s\n",
@@ -253,16 +260,15 @@ for (f_path in files) {
   # --- Plotting ---
   p <- ggplot(df_ready, aes(x = GeneRatioNumeric, y = TermWrapped)) +
 
-    geom_point(aes(size = gene_count, color = p_adjust), alpha = 0.9) +
+    geom_point(aes(size = gene_count, color = negLog10FDR), alpha = 0.9) +
 
     scale_color_gradientn(
       colours = color_vec,
-      trans   = "log10",
-      breaks  = plot_breaks,
-      limits  = plot_limits,
-      labels  = scientific_p_formatter,
+      breaks  = -log10(plot_breaks),
+      limits  = -log10(rev(plot_limits)),
+      labels  = label_number(accuracy = 0.1),
       oob     = scales::squish,
-      name    = "P.adjust\n"
+      name    = "-log10(FDR)\n"
     ) +
 
     scale_size_continuous(
@@ -316,11 +322,10 @@ for (f_path in files) {
     p,
     width  = final_width_inch,
     height = final_height_inch,
-    dpi    = 300,
+    dpi    = 600,
     bg     = "white"
   )
   cat("   [成功] 图片已保存。\n")
 }
 
 cat("所有任务处理完成。\n")
-

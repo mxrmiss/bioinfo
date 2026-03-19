@@ -171,21 +171,68 @@ def scan_species_in_raw():
         log(f"[错误] 原始数据目录不存在：{DIR_RAW}")
         sys.exit(1)
 
-    files = [f for f in os.listdir(DIR_RAW) if not f.startswith(".")]
-    if not files:
-        log(f"[错误] raw_data/ 为空，请放入 gff + protein（+ 可选 genome）后再运行。")
+    # -------------------------------------------------------------------------
+    # ✅ 修改处（仅修改扫描目录逻辑）：支持 raw_data/{gff,proteins,genome}/ 结构
+    # -------------------------------------------------------------------------
+    gff_dir = os.path.join(DIR_RAW, "gff")
+    prot_dir = os.path.join(DIR_RAW, "proteins")
+    genome_dir = os.path.join(DIR_RAW, "genome")
+
+    # 至少需要 gff + proteins 目录存在
+    if not os.path.isdir(gff_dir) or not os.path.isdir(prot_dir):
+        # 兼容旧布局：若 raw_data/ 根目录下直接放文件，才允许继续旧扫描
+        # 但你当前布局是分目录，因此这里优先提示目录缺失
+        log(f"[错误] raw_data/ 需要包含子目录：gff/ 与 proteins/（genome/ 可选）")
+        log(f"       当前检测到：{DIR_RAW}")
+        log(f"       - gff_dir exists? {os.path.isdir(gff_dir)} : {gff_dir}")
+        log(f"       - prot_dir exists? {os.path.isdir(prot_dir)} : {prot_dir}")
         sys.exit(1)
 
     species_files = defaultdict(dict)
 
-    for fname in files:
-        ftype = classify_file_type(fname)
-        if ftype == "unknown":
+    # 1) 扫描 gff/
+    for fname in os.listdir(gff_dir):
+        if fname.startswith("."):
             continue
-        # 物种前缀：取第一个 '.' 之前的部分
+        full_path = os.path.join(gff_dir, fname)
+        if not os.path.isfile(full_path):
+            continue
+        ftype = classify_file_type(fname)
+        if ftype != "gff":
+            continue
         species = fname.split(".")[0]
-        full_path = os.path.join(DIR_RAW, fname)
-        species_files[species][ftype] = full_path
+        species_files[species]["gff"] = full_path
+
+    # 2) 扫描 proteins/
+    for fname in os.listdir(prot_dir):
+        if fname.startswith("."):
+            continue
+        full_path = os.path.join(prot_dir, fname)
+        if not os.path.isfile(full_path):
+            continue
+        ftype = classify_file_type(fname)
+        if ftype != "prot":
+            continue
+        species = fname.split(".")[0]
+        species_files[species]["prot"] = full_path
+
+    # 3) 扫描 genome/（可选）
+    if os.path.isdir(genome_dir):
+        for fname in os.listdir(genome_dir):
+            if fname.startswith("."):
+                continue
+            full_path = os.path.join(genome_dir, fname)
+            if not os.path.isfile(full_path):
+                continue
+            ftype = classify_file_type(fname)
+            if ftype != "genome":
+                continue
+            species = fname.split(".")[0]
+            species_files[species]["genome"] = full_path
+
+    # -------------------------------------------------------------------------
+    # ✅ 修改结束：后续逻辑保持原样
+    # -------------------------------------------------------------------------
 
     # 过滤掉缺少必需文件的
     valid = {
