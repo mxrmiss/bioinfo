@@ -140,20 +140,6 @@ def clean_newick_for_cafe(newick: str) -> str:
         s = s + ";"
     return s
 
-def scale_newick_branch_lengths(newick: str, factor: float = 100.0) -> str:
-    """
-    将 Newick 中所有 branch lengths（冒号后的数字）统一乘以指定因子。
-    只处理分支长度，不修改物种名、拓扑结构和末尾分号。
-    """
-
-    def _scale_match(m: re.Match) -> str:
-        original = m.group(1)
-        value = float(original)
-        scaled = value * factor
-        return f":{scaled:.10f}".rstrip("0").rstrip(".")
-
-    return re.sub(r":([0-9]+(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?)", _scale_match, newick)
-
 def extract_ultrametric_newick_from_figtree(figtree_path: Path) -> str:
     """从 FigTree.tre 中提取一棵去除注释并清洗格式的超时钟树（Newick 字符串）。"""
     if not figtree_path.exists():
@@ -199,13 +185,11 @@ def publish_ultrametric_tree(work_dir: Path, cfg: Optional[dict], log_path: Path
 
     ensure_dir(out_path.parent)
     newick = extract_ultrametric_newick_from_figtree(figtree)
-    newick = scale_newick_branch_lengths(newick, factor=100.0)
     # 写出为单行 Newick，末尾补换行符
     out_path.write_text(newick + "\n", encoding="utf-8")
 
     with open(log_path, "a", encoding="utf-8") as lf:
         lf.write(f"[{ts()}] [INFO] Stage3: ultrametric tree written to {out_path}\n")
-        lf.write(f"[{ts()}] [INFO] Stage3: branch lengths scaled by 100 for CAFE output\n")
 
     print(f"[Stage3] 已从 {figtree} 发布超时钟树到 {out_path}")
     return out_path
@@ -448,3 +432,4 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         print("\n[INTERRUPTED] 用户中断。")
         sys.exit(130)
+
