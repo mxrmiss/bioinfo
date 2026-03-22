@@ -7,8 +7,9 @@ r4_build_psg_reg_joint.py
 功能：
 1）读取现有 PSG 主线结果表
 2）读取 r3_make_reg_table.py 生成的 REG_plot_input.tsv
-3）按 OG + foreground 合并，生成 PSG × REG 联合表
-4）输出：
+3）额外读取 07b 生成的高可信 PSG 表（BEB>=0.95）
+4）按 OG + foreground 合并，生成 PSG × REG 联合表
+5）输出：
    results/05_sbranch_model/summary/
      - PSG_REG_joint.tsv
      - PSG_REG_counts.tsv
@@ -16,8 +17,9 @@ r4_build_psg_reg_joint.py
      - .r4.done
 
 说明：
-- 本脚本默认优先使用 PSG 的 Q 值来判定显著性
+- 本脚本默认优先使用 PSG 的 Q 值来判定 gene-level 显著性
 - 可通过 config.yaml: branch_model.psg_alpha_mode 改为用 P 值
+- 最终 psg_sig = gene-level 显著 AND BEB>=0.95 支持
 - joint_class 分四类：
     None
     PSG_only
@@ -25,6 +27,10 @@ r4_build_psg_reg_joint.py
     Both
 - x_psg_p = -log10(psg_p)
 - y_reg_fdr 直接取 REG_plot_input.tsv 中的 y_reg_fdr
+
+注意：
+- 本版严格保持原版 r4 输出表头不变，不新增任何列
+- 只改变 psg_sig 和 joint_class 的判定逻辑
 
 运行方式：
   python scripts/r4_build_psg_reg_joint.py
@@ -37,7 +43,7 @@ import sys
 import math
 import logging
 from pathlib import Path
-from typing import Dict, Any, List, Tuple
+from typing import Dict, Any, List, Tuple, Set
 
 
 # ==============================
@@ -53,9 +59,11 @@ OUT_COUNTS = "PSG_REG_counts.tsv"
 OUT_LABELS = "PSG_REG_labels.tsv"
 DONE_FILENAME = ".r4.done"
 
-# 现有 PSG 主表默认路径
-# 优先从 config.yaml: branch_model.psg_table 读取
+# PSG 主表：必须继续使用全量 gene-level 结果表
 DEFAULT_PSG_TABLE = PROJECT_ROOT / "results/05_cmlagg/D_fdr_genes.tsv"
+
+# 07b 输出的高可信 PSG 表：仅用来判断某个 OG×FG 是否满足 BEB>=0.95
+DEFAULT_BEB_SIG_TABLE = PROJECT_ROOT / "results/05_cmlagg/PSG_qsig_bebsig_OGxFG.tsv"
 
 
 # ==============================
@@ -100,12 +108,6 @@ def ensure_dir(p: Path) -> Path:
     return p
 
 
-def ts() -> str:
-    """返回时间字符串。"""
-    import datetime
-    return datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-
 def get_logger(name: str, logfile: Path, level: int = logging.INFO) -> logging.Logger:
     """创建日志器，同时输出到屏幕与文件。"""
     ensure_dir(logfile.parent)
@@ -129,6 +131,7 @@ def get_logger(name: str, logfile: Path, level: int = logging.INFO) -> logging.L
     class _Flush(io.TextIOBase):
         def __init__(self, s):
             self.s = s
+
         def write(self, x):
             self.s.write(x)
             self.s.flush()
@@ -213,6 +216,14 @@ def find_col(cols: Dict[str, int], candidates: List[str]) -> int:
     return -1
 
 
+def resolve_path_maybe_relative(p: str | Path) -> Path:
+    """相对路径相对项目根目录解析。"""
+    pp = Path(str(p)).expanduser()
+    if pp.is_absolute():
+        return pp
+    return (PROJECT_ROOT / pp).resolve()
+
+
 # ==============================
 # 路径与输入
 # ==============================
@@ -221,14 +232,21 @@ def get_summary_dir(cfg: Dict[str, Any]) -> Path:
     """获取 results/05_sbranch_model/summary。"""
     bm = cfg.get("branch_model") or {}
     run_dir = bm.get("run_dir", "results/05_sbranch_model")
-    return PROJECT_ROOT / str(run_dir) / "summary"
+    return resolve_path_maybe_relative(run_dir) / "summary"
 
 
 def get_psg_table(cfg: Dict[str, Any]) -> Path:
     """获取 PSG 主表路径。"""
     bm = cfg.get("branch_model") or {}
     p = bm.get("psg_table", str(DEFAULT_PSG_TABLE))
-    return Path(str(p)).expanduser()
+    return resolve_path_maybe_relative(p)
+
+
+def get_beb_sig_table(cfg: Dict[str, Any]) -> Path:
+    """获取 07b 的高可信 PSG 表路径。"""
+    bm = cfg.get("branch_model") or {}
+    p = bm.get("beb_sig_table", str(DEFAULT_BEB_SIG_TABLE))
+    return resolve_path_maybe_relative(p)
 
 
 # ==============================
@@ -287,6 +305,44 @@ def load_psg_rows(psg_table: Path) -> List[Dict[str, str]]:
     return rows
 
 
+def load_beb_supported_keys(beb_sig_table: Path) -> Set[Tuple[str, str]]:
+    """
+    读取 07b 输出表，只提取满足 BEB>=0.95 的 (OG, foreground) 键。
+    不把任何新列写入联合表，避免影响 r5。
+    """
+    if not beb_sig_table.is_file():
+        raise FileNotFoundError(f"[ERR] BEB 支持表不存在：{beb_sig_table}")
+
+    lines = beb_sig_table.read_text(encoding="utf-8", errors="ignore").splitlines()
+    if not lines:
+        raise ValueError(f"[ERR] BEB 支持表为空：{beb_sig_table}")
+
+    header = lines[0].rstrip("\n").split("\t")
+    cols = {h.strip().lower(): i for i, h in enumerate(header)}
+
+    i_og = find_col(cols, ["og", "orthogroup"])
+    i_fg = find_col(cols, ["foreground", "fg"])
+
+    if i_og < 0 or i_fg < 0:
+        raise ValueError(
+            f"[ERR] BEB 支持表表头无法识别所需列。至少需要 OG / foreground。文件：{beb_sig_table}"
+        )
+
+    keys: Set[Tuple[str, str]] = set()
+    for raw in lines[1:]:
+        if not raw.strip():
+            continue
+        parts = raw.rstrip("\n").split("\t")
+        if len(parts) <= max(i_og, i_fg):
+            continue
+        og = parts[i_og].strip()
+        fg = parts[i_fg].strip()
+        if og and fg:
+            keys.add((og, fg))
+
+    return keys
+
+
 # ==============================
 # gene label 与显著性判定
 # ==============================
@@ -325,7 +381,7 @@ def calc_minus_log10(x: Any, zero_cap: float = 300.0) -> str:
 
 def psg_is_sig(psg_p: str, psg_q: str, mode: str, alpha: float) -> bool:
     """
-    PSG 显著性判定。
+    PSG gene-level 显著性判定。
     mode:
       - q：优先用 q 值
       - p：用 p 值
@@ -367,7 +423,7 @@ def main() -> int:
     cfg = load_config(CONFIG_PATH)
 
     paths = cfg.get("paths") or {}
-    logs_dir = PROJECT_ROOT / str(paths.get("logs_dir", "logs"))
+    logs_dir = resolve_path_maybe_relative(paths.get("logs_dir", "logs"))
     log_file = logs_dir / "r4_build_psg_reg_joint.log"
     log = get_logger("aphylo.r4", log_file)
 
@@ -381,16 +437,20 @@ def main() -> int:
     summary_dir = get_summary_dir(cfg)
     reg_plot_tsv = summary_dir / REG_INPUT_FILENAME
     psg_table = get_psg_table(cfg)
+    beb_sig_table = get_beb_sig_table(cfg)
 
     if psg_alpha_mode not in {"q", "p"}:
         raise ValueError(f"[ERR] branch_model.psg_alpha_mode 只能是 q 或 p，当前为：{psg_alpha_mode}")
 
     log.info(f"[INIT] PSG_TABLE={psg_table}")
+    log.info(f"[INIT] BEB_SIG_TABLE={beb_sig_table}")
     log.info(f"[INIT] REG_PLOT={reg_plot_tsv}")
     log.info(f"[RULE] psg_alpha_mode={psg_alpha_mode}; psg_alpha={psg_alpha}; label_top_n={label_top_n}")
+    log.info("[RULE] 最终 psg_sig = gene-level 显著 AND BEB-supported")
 
     psg_rows = load_psg_rows(psg_table)
     reg_rows = read_tsv(reg_plot_tsv)
+    beb_supported_keys = load_beb_supported_keys(beb_sig_table)
 
     if not psg_rows:
         log.error("[ERR] PSG 表无有效数据")
@@ -415,13 +475,15 @@ def main() -> int:
     # 用并集，保证四类都能出现
     all_keys = sorted(set(psg_map.keys()) | set(reg_map.keys()))
     log.info(f"[INIT] PSG_keys={len(psg_map)}; REG_keys={len(reg_map)}; UNION_keys={len(all_keys)}")
+    log.info(f"[INIT] BEB_supported_keys={len(beb_supported_keys)}")
 
     rows_joint: List[Dict[str, Any]] = []
     class_count = {"None": 0, "PSG_only": 0, "REG_only": 0, "Both": 0}
 
     for og, fg in all_keys:
-        pr = psg_map.get((og, fg), {})
-        rr = reg_map.get((og, fg), {})
+        key = (og, fg)
+        pr = psg_map.get(key, {})
+        rr = reg_map.get(key, {})
 
         psg_p = pr.get("psg_p", "")
         psg_q = pr.get("psg_q", "")
@@ -439,7 +501,12 @@ def main() -> int:
 
         gene_label = choose_joint_label(fg_gene_ids, reg_label, og)
 
-        psg_sig = psg_is_sig(psg_p, psg_q, psg_alpha_mode, psg_alpha)
+        # gene-level 显著
+        psg_sig_gene = psg_is_sig(psg_p, psg_q, psg_alpha_mode, psg_alpha)
+
+        # 叠加 BEB 支持
+        psg_sig = psg_sig_gene and (key in beb_supported_keys)
+
         reg_sig_bool = reg_is_sig_from_plot(reg_sig)
         joint_class = joint_class_of(psg_sig, reg_sig_bool)
         class_count[joint_class] += 1
@@ -465,6 +532,7 @@ def main() -> int:
         rows_joint.append(row)
 
     # 写联合表
+    # 表头严格保持原版 r4 一模一样
     out_joint = summary_dir / OUT_JOINT
     head_joint = [
         "OG",
