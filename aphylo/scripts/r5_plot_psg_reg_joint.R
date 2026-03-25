@@ -92,6 +92,7 @@ PNG_DPI <- 600
 POINT_SIZE <- 2.4
 POINT_ALPHA <- 0.85
 STROKE_SIZE <- 0.15
+HOLLOW_STROKE_SIZE <- 0.55
 
 # ---- 阈值线样式 ----
 THRESHOLD_LINE_COLOR <- "grey55"
@@ -140,6 +141,14 @@ INFO_LINE_SPACING_RATIO <- 0.06
 INFO_TEXT_SIZE <- 4.2
 INFO_LABEL_FILL_ALPHA <- 0.78
 
+# ---- 点型说明样式 ----
+POINT_LEGEND_X_RATIO <- 0.58
+POINT_LEGEND_START_Y_RATIO <- 0.69
+POINT_LEGEND_LINE_SPACING_RATIO <- 0.05
+POINT_LEGEND_TEXT_SIZE <- 3.5
+POINT_LEGEND_LABEL_FILL_ALPHA <- 0.78
+POINT_LEGEND_COLOR <- "grey20"
+
 # ---- 颜色设置 ----
 COLOR_NONE <- "#BFBFBF"
 COLOR_PSG_ONLY <- "#00A087"
@@ -180,6 +189,11 @@ ensure_dir <- function(path) {
 
 safe_num <- function(x) {
   suppressWarnings(as.numeric(x))
+}
+
+to_bool_flag <- function(x) {
+  x2 <- str_to_upper(trimws(ifelse(is.na(x), "", as.character(x))))
+  x2 %in% c("TRUE", "T", "1", "YES", "Y")
 }
 
 calc_axis_max <- function(x, q = 0.995, fallback = 5) {
@@ -269,6 +283,25 @@ make_info_block_df <- function(xmin, xmax, ymin, ymax, counts_df) {
   )
 }
 
+make_point_legend_df <- function(xmin, xmax, ymin, ymax) {
+  xr <- xmax - xmin
+  yr <- ymax - ymin
+
+  x0 <- xmin + xr * POINT_LEGEND_X_RATIO
+  y0 <- ymin + yr * POINT_LEGEND_START_Y_RATIO
+  dy <- yr * POINT_LEGEND_LINE_SPACING_RATIO
+
+  tibble::tibble(
+    x = c(x0, x0),
+    y = c(y0, y0 - dy),
+    label = c(
+      "Solid circle: at least one BEB site ≥ 0.95",
+      "Hollow circle: no BEB site ≥ 0.95"
+    ),
+    color = c(POINT_LEGEND_COLOR, POINT_LEGEND_COLOR)
+  )
+}
+
 split_fg_ids <- function(fg_gene_ids) {
   ids <- unlist(strsplit(ifelse(is.na(fg_gene_ids), "", fg_gene_ids), ";", fixed = TRUE))
   ids <- trimws(ids)
@@ -332,6 +365,7 @@ apply_axis_padding_to_points <- function(x, axis_min_pad, apply_below) {
 # ==============================
 
 msg("开始读取输入文件")
+msg("输入表：", INPUT_JOINT_TSV)
 stop_if_not_file(INPUT_JOINT_TSV)
 
 joint_df <- readr::read_tsv(
@@ -339,19 +373,23 @@ joint_df <- readr::read_tsv(
   col_types = cols(.default = col_character())
 )
 
+msg("原始表行数 = ", nrow(joint_df), " ; 列数 = ", ncol(joint_df))
+
 if (nrow(joint_df) == 0) {
   stop("PSG_REG_joint.tsv 为空，无法绘图。", call. = FALSE)
 }
 
 required_cols <- c(
-  "OG", "foreground", "gene_label", "foreground_gene_ids", "joint_class",
-  "psg_q", "reg_q"
+  "OG", "foreground", "gene_label", "foreground_gene_ids",
+  "joint_class", "psg_q", "reg_q", "psg_sig", "reg_sig"
 )
 
 missing_cols <- setdiff(required_cols, colnames(joint_df))
 if (length(missing_cols) > 0) {
   stop(sprintf("联合表缺少关键列：%s", paste(missing_cols, collapse = ", ")), call. = FALSE)
 }
+
+msg("关键列检查通过：", paste(required_cols, collapse = ", "))
 
 joint_df <- joint_df %>%
   mutate(
@@ -361,7 +399,21 @@ joint_df <- joint_df %>%
     reg_q = safe_num(reg_q),
     x_psg_fdr = calc_minus_log10(psg_q),
     y_reg_fdr = calc_minus_log10(reg_q),
-    joint_class = factor(joint_class, levels = c("None", "REG_only", "PSG_only", "Both"))
+    joint_class = factor(joint_class, levels = c("None", "REG_only", "PSG_only", "Both")),
+    reg_sig_bool = to_bool_flag(reg_sig),
+    psg_beb_sig_bool = to_bool_flag(psg_sig),
+    psg_gene_sig_bool = is.finite(psg_q) & (psg_q < PSG_ALPHA),
+    display_class = dplyr::case_when(
+      psg_gene_sig_bool & reg_sig_bool ~ "Both",
+      psg_gene_sig_bool & !reg_sig_bool ~ "PSG_only",
+      !psg_gene_sig_bool & reg_sig_bool ~ "REG_only",
+      TRUE ~ "None"
+    ),
+    display_class = factor(display_class, levels = c("None", "REG_only", "PSG_only", "Both")),
+    point_hollow = dplyr::case_when(
+      as.character(display_class) %in% c("PSG_only", "Both") & !psg_beb_sig_bool ~ TRUE,
+      TRUE ~ FALSE
+    )
   )
 
 plot_df <- joint_df %>%
@@ -375,7 +427,11 @@ if (nrow(plot_df) == 0) {
   stop("没有可用于绘图的有效数值行。", call. = FALSE)
 }
 
-msg("读取完成：有效绘图点数 = ", nrow(plot_df))
+msg("有效绘图点数 = ", nrow(plot_df))
+msg("PSG gene-level significant 数量 = ", sum(plot_df$psg_gene_sig_bool, na.rm = TRUE))
+msg("REG significant 数量 = ", sum(plot_df$reg_sig_bool, na.rm = TRUE))
+msg("BEB-supported PSG 数量 = ", sum(plot_df$psg_beb_sig_bool, na.rm = TRUE))
+msg("将绘制为空心点的数量 = ", sum(plot_df$point_hollow, na.rm = TRUE))
 
 
 # ==============================
@@ -385,16 +441,23 @@ msg("读取完成：有效绘图点数 = ", nrow(plot_df))
 x_thr <- -log10(PSG_ALPHA)
 y_thr <- -log10(REG_ALPHA)
 
+msg("显著性阈值：PSG_ALPHA = ", PSG_ALPHA, " ; REG_ALPHA = ", REG_ALPHA)
+msg("阈值线位置：x_thr = ", round(x_thr, 4), " ; y_thr = ", round(y_thr, 4))
+
 if (USE_AUTO_LIMIT) {
   x_base_max <- calc_axis_max(plot_df$x_psg_fdr, q = AUTO_LIMIT_QUANTILE, fallback = max(3, x_thr + 1))
   y_base_max <- calc_axis_max(plot_df$y_reg_fdr, q = AUTO_LIMIT_QUANTILE, fallback = max(3, y_thr + 1))
+  msg("使用自动坐标上限：AUTO_LIMIT_QUANTILE = ", AUTO_LIMIT_QUANTILE)
 } else {
   x_base_max <- ifelse(is.na(X_MAX_MANUAL), max(plot_df$x_psg_fdr, na.rm = TRUE), X_MAX_MANUAL)
   y_base_max <- ifelse(is.na(Y_MAX_MANUAL), max(plot_df$y_reg_fdr, na.rm = TRUE), Y_MAX_MANUAL)
+  msg("使用手动/直接坐标上限")
 }
 
 x_base_max <- max(x_base_max, x_thr + 0.5)
 y_base_max <- max(y_base_max, y_thr + 0.5)
+
+msg("基础坐标上限：x_base_max = ", round(x_base_max, 4), " ; y_base_max = ", round(y_base_max, 4))
 
 if (CLIP_TO_AXIS_MAX) {
   plot_df <- plot_df %>%
@@ -404,6 +467,7 @@ if (CLIP_TO_AXIS_MAX) {
       clipped_x = ifelse(x_psg_fdr > x_base_max, TRUE, FALSE),
       clipped_y = ifelse(y_reg_fdr > y_base_max, TRUE, FALSE)
     )
+  msg("启用边界内缩截断：CLIP_INSET_RATIO = ", CLIP_INSET_RATIO)
 } else {
   plot_df <- plot_df %>%
     mutate(
@@ -412,15 +476,17 @@ if (CLIP_TO_AXIS_MAX) {
       clipped_x = FALSE,
       clipped_y = FALSE
     )
+  msg("未启用边界内缩截断")
 }
 
-# 坐标轴边界固定从 0 开始，避免 0 刻度位置漂移
+msg("x 方向被截断点数 = ", sum(plot_df$clipped_x, na.rm = TRUE))
+msg("y 方向被截断点数 = ", sum(plot_df$clipped_y, na.rm = TRUE))
+
 x_min <- 0
 y_min <- 0
 x_max <- x_base_max * (1 + X_AXIS_PADDING_RATIO)
 y_max <- y_base_max * (1 + Y_AXIS_PADDING_RATIO)
 
-# 点贴边内缩逻辑
 point_x_min_pad <- x_max * POINT_X_AXIS_MIN_RATIO
 point_y_min_pad <- y_max * POINT_Y_AXIS_MIN_RATIO
 point_x_apply_below <- x_max * POINT_PAD_APPLY_X_BELOW_RATIO
@@ -440,28 +506,34 @@ if (APPLY_POINT_AXIS_PADDING) {
         apply_below = point_y_apply_below
       )
     )
+  msg("启用点贴轴内缩")
 } else {
   plot_df <- plot_df %>%
     mutate(
       x_plot = x_plot_prepad,
       y_plot = y_plot_prepad
     )
+  msg("未启用点贴轴内缩")
 }
 
-# 标签活动区
 label_xlim <- c(x_max * LABEL_XMIN_RATIO, x_max * LABEL_XMAX_RATIO)
 label_ylim <- c(y_max * LABEL_YMIN_RATIO, y_max * LABEL_YMAX_RATIO)
 
-# 明确刻度，保证 0 刻度正常显示
 x_breaks <- make_axis_breaks(0, x_max, n = 6, keep_zero = TRUE)
 y_breaks <- make_axis_breaks(0, y_max, n = 6, keep_zero = TRUE)
 
-msg("坐标范围：x_min = ", round(x_min, 4), " ; x_max = ", round(x_max, 4),
+msg("最终坐标范围：x_min = ", round(x_min, 4), " ; x_max = ", round(x_max, 4),
     " ; y_min = ", round(y_min, 4), " ; y_max = ", round(y_max, 4))
 msg("点内缩参数：point_x_min_pad = ", round(point_x_min_pad, 4),
     " ; point_y_min_pad = ", round(point_y_min_pad, 4))
-msg("标签活动范围：label_xmin = ", round(label_xlim[1], 4), " ; label_xmax = ", round(label_xlim[2], 4),
-    " ; label_ymin = ", round(label_ylim[1], 4), " ; label_ymax = ", round(label_ylim[2], 4))
+msg("点内缩作用阈值：point_x_apply_below = ", round(point_x_apply_below, 4),
+    " ; point_y_apply_below = ", round(point_y_apply_below, 4))
+msg("标签活动范围：label_xmin = ", round(label_xlim[1], 4),
+    " ; label_xmax = ", round(label_xlim[2], 4),
+    " ; label_ymin = ", round(label_ylim[1], 4),
+    " ; label_ymax = ", round(label_ylim[2], 4))
+msg("x 轴刻度：", paste(round(x_breaks, 3), collapse = ", "))
+msg("y 轴刻度：", paste(round(y_breaks, 3), collapse = ", "))
 
 
 # ==============================
@@ -469,8 +541,8 @@ msg("标签活动范围：label_xmin = ", round(label_xlim[1], 4), " ; label_xma
 # ==============================
 
 counts_df <- plot_df %>%
-  count(joint_class, name = "n") %>%
-  mutate(class = as.character(joint_class)) %>%
+  count(display_class, name = "n") %>%
+  mutate(class = as.character(display_class)) %>%
   select(class, n)
 
 for (cls in c("None", "PSG_only", "REG_only", "Both")) {
@@ -497,9 +569,14 @@ if (is.null(selected_map)) {
 selected_map <- selected_map[nzchar(names(selected_map))]
 selected_ids <- unique(names(selected_map))
 
+msg("手动指定 gene_id 数量 = ", length(selected_ids))
+if (length(selected_ids) > 0) {
+  msg("手动指定 gene_id 列表：", paste(selected_ids, collapse = ", "))
+}
+
 if (length(selected_ids) == 0) {
-  msg("未指定 SELECTED_GENE_LABELS，本图将不显示任何基因标签")
   label_df <- plot_df[0, , drop = FALSE]
+  msg("未指定 SELECTED_GENE_LABELS，本图将不显示任何基因标签")
 } else {
   label_df <- plot_df %>%
     rowwise() %>%
@@ -510,26 +587,41 @@ if (length(selected_ids) == 0) {
     ungroup() %>%
     filter(
       has_selected,
-      as.character(joint_class) %in% ALLOWED_LABEL_CLASSES
+      as.character(display_class) %in% ALLOWED_LABEL_CLASSES
     ) %>%
     distinct(OG, foreground, manual_label, .keep_all = TRUE) %>%
     mutate(
       manual_label_parse = make_italic_parse_label(manual_label),
       nudge_x = LABEL_NUDGE_X_DEFAULT,
       nudge_y = dplyr::case_when(
-        as.character(joint_class) == "PSG_only" ~ LABEL_NUDGE_Y_PSG_ONLY,
-        as.character(joint_class) == "Both" ~ LABEL_NUDGE_Y_BOTH,
+        as.character(display_class) == "PSG_only" ~ LABEL_NUDGE_Y_PSG_ONLY,
+        as.character(display_class) == "Both" ~ LABEL_NUDGE_Y_BOTH,
         TRUE ~ LABEL_NUDGE_Y_DEFAULT
       )
     )
 
-  msg("手动指定 gene_id 数量 = ", length(selected_ids))
+  msg("允许显示标签的类别：", paste(ALLOWED_LABEL_CLASSES, collapse = ", "))
   msg("最终实际显示标签数量 = ", nrow(label_df))
+  if (nrow(label_df) > 0) {
+    msg("最终显示标签：", paste(label_df$manual_label, collapse = ", "))
+  }
+}
+
+top_point_df <- label_df %>%
+  distinct(
+    OG, foreground, x_plot, y_plot, display_class, point_hollow,
+    .keep_all = TRUE
+  )
+
+msg("顶层重画标签点数量 = ", nrow(top_point_df))
+if (nrow(top_point_df) > 0) {
+  msg("顶层重画实心点数量 = ", sum(!top_point_df$point_hollow, na.rm = TRUE))
+  msg("顶层重画空心点数量 = ", sum(top_point_df$point_hollow, na.rm = TRUE))
 }
 
 
 # ==============================
-# 四象限说明块
+# 说明块
 # ==============================
 
 info_df <- make_info_block_df(
@@ -538,6 +630,13 @@ info_df <- make_info_block_df(
   ymin = y_min,
   ymax = y_max,
   counts_df = counts_df
+)
+
+point_legend_df <- make_point_legend_df(
+  xmin = x_min,
+  xmax = x_max,
+  ymin = y_min,
+  ymax = y_max
 )
 
 
@@ -552,6 +651,11 @@ class_colors <- c(
   "Both" = COLOR_BOTH
 )
 
+msg("配色：None=", COLOR_NONE,
+    " ; PSG_only=", COLOR_PSG_ONLY,
+    " ; REG_only=", COLOR_REG_ONLY,
+    " ; Both=", COLOR_BOTH)
+
 
 # ==============================
 # 构图
@@ -561,32 +665,54 @@ msg("开始构图")
 
 p <- ggplot(plot_df, aes(x = x_plot, y = y_plot)) +
   geom_point(
-    data = plot_df %>% filter(joint_class == "None"),
-    aes(color = joint_class),
+    data = plot_df %>% filter(display_class == "None"),
+    aes(fill = display_class, color = display_class),
+    shape = 21,
     size = POINT_SIZE,
     alpha = POINT_ALPHA * 0.65,
     stroke = STROKE_SIZE
   ) +
   geom_point(
-    data = plot_df %>% filter(joint_class == "REG_only"),
-    aes(color = joint_class),
+    data = plot_df %>% filter(display_class == "REG_only"),
+    aes(fill = display_class, color = display_class),
+    shape = 21,
     size = POINT_SIZE,
     alpha = POINT_ALPHA,
     stroke = STROKE_SIZE
   ) +
   geom_point(
-    data = plot_df %>% filter(joint_class == "PSG_only"),
-    aes(color = joint_class),
+    data = plot_df %>% filter(display_class == "PSG_only", !point_hollow),
+    aes(fill = display_class, color = display_class),
+    shape = 21,
     size = POINT_SIZE,
     alpha = POINT_ALPHA,
     stroke = STROKE_SIZE
   ) +
   geom_point(
-    data = plot_df %>% filter(joint_class == "Both"),
-    aes(color = joint_class),
+    data = plot_df %>% filter(display_class == "Both", !point_hollow),
+    aes(fill = display_class, color = display_class),
+    shape = 21,
     size = POINT_SIZE,
     alpha = POINT_ALPHA,
     stroke = STROKE_SIZE
+  ) +
+  geom_point(
+    data = plot_df %>% filter(display_class == "PSG_only", point_hollow),
+    aes(color = display_class),
+    shape = 21,
+    fill = "white",
+    size = POINT_SIZE,
+    alpha = 1,
+    stroke = HOLLOW_STROKE_SIZE
+  ) +
+  geom_point(
+    data = plot_df %>% filter(display_class == "Both", point_hollow),
+    aes(color = display_class),
+    shape = 21,
+    fill = "white",
+    size = POINT_SIZE,
+    alpha = 1,
+    stroke = HOLLOW_STROKE_SIZE
   ) +
   geom_vline(
     xintercept = x_thr,
@@ -601,14 +727,9 @@ p <- ggplot(plot_df, aes(x = x_plot, y = y_plot)) +
     linewidth = THRESHOLD_LINE_SIZE
   ) +
   scale_color_manual(values = class_colors, drop = FALSE) +
-  scale_x_continuous(
-    breaks = x_breaks,
-    expand = expansion(mult = 0)
-  ) +
-  scale_y_continuous(
-    breaks = y_breaks,
-    expand = expansion(mult = 0)
-  ) +
+  scale_fill_manual(values = class_colors, drop = FALSE) +
+  scale_x_continuous(breaks = x_breaks, expand = expansion(mult = 0)) +
+  scale_y_continuous(breaks = y_breaks, expand = expansion(mult = 0)) +
   coord_cartesian(
     xlim = c(x_min, x_max),
     ylim = c(y_min, y_max),
@@ -630,6 +751,29 @@ p <- ggplot(plot_df, aes(x = x_plot, y = y_plot)) +
     plot.margin = margin(12, 18, 28, 12)
   )
 
+if (nrow(top_point_df) > 0) {
+  p <- p +
+    geom_point(
+      data = top_point_df %>% filter(!point_hollow),
+      aes(x = x_plot, y = y_plot, fill = display_class, color = display_class),
+      shape = 21,
+      size = POINT_SIZE,
+      alpha = POINT_ALPHA,
+      stroke = STROKE_SIZE,
+      inherit.aes = FALSE
+    ) +
+    geom_point(
+      data = top_point_df %>% filter(point_hollow),
+      aes(x = x_plot, y = y_plot, color = display_class),
+      shape = 21,
+      fill = "white",
+      size = POINT_SIZE,
+      alpha = 1,
+      stroke = HOLLOW_STROKE_SIZE,
+      inherit.aes = FALSE
+    )
+}
+
 p <- p +
   geom_label(
     data = info_df,
@@ -644,10 +788,25 @@ p <- p +
     family = BASE_FAMILY,
     fontface = "plain",
     label.padding = grid::unit(0.18, "lines")
+  ) +
+  geom_label(
+    data = point_legend_df,
+    aes(x = x, y = y, label = label),
+    inherit.aes = FALSE,
+    hjust = 0,
+    vjust = 1,
+    linewidth = 0,
+    fill = scales::alpha("white", POINT_LEGEND_LABEL_FILL_ALPHA),
+    color = point_legend_df$color,
+    size = POINT_LEGEND_TEXT_SIZE,
+    family = BASE_FAMILY,
+    fontface = "plain",
+    label.padding = grid::unit(0.16, "lines")
   )
 
 if (nrow(label_df) > 0) {
   if (requireNamespace("ggrepel", quietly = TRUE)) {
+    msg("检测到 ggrepel，将使用 geom_text_repel 绘制标签")
     p <- p +
       ggrepel::geom_text_repel(
         data = label_df,
@@ -655,7 +814,7 @@ if (nrow(label_df) > 0) {
           x = x_plot,
           y = y_plot,
           label = manual_label_parse,
-          color = joint_class
+          color = display_class
         ),
         parse = TRUE,
         nudge_x = label_df$nudge_x,
@@ -677,7 +836,7 @@ if (nrow(label_df) > 0) {
         show.legend = FALSE
       )
   } else {
-    msg("未检测到 ggrepel，标签将使用普通文本，可能发生重叠")
+    msg("未检测到 ggrepel，将退回 geom_text，标签可能重叠")
     p <- p +
       geom_text(
         data = label_df,
@@ -685,7 +844,7 @@ if (nrow(label_df) > 0) {
           x = x_plot,
           y = y_plot,
           label = manual_label_parse,
-          color = joint_class
+          color = display_class
         ),
         parse = TRUE,
         size = LABEL_SIZE,
@@ -710,6 +869,8 @@ need_export_cols <- c(
   "psg_p", "psg_q", "reg_p", "reg_q",
   "omega_foreground", "omega_background", "delta_omega",
   "psg_sig", "reg_sig", "joint_class",
+  "reg_sig_bool", "psg_beb_sig_bool", "psg_gene_sig_bool",
+  "display_class", "point_hollow",
   "x_raw", "y_raw",
   "x_plot_prepad", "y_plot_prepad",
   "x_plot", "y_plot",
@@ -731,11 +892,6 @@ if (!KEEP_ORIGINAL_COORDS) {
 readr::write_tsv(plot_export_df, plot_data_out)
 msg("已写出 plot_data：", plot_data_out)
 
-
-# ==============================
-# 导出图片
-# ==============================
-
 png_out <- file.path(OUTPUT_DIR, paste0(OUTPUT_PREFIX, ".png"))
 pdf_out <- file.path(OUTPUT_DIR, paste0(OUTPUT_PREFIX, ".pdf"))
 
@@ -748,6 +904,7 @@ choose_device_png(
 )
 print(p)
 dev.off()
+msg("PNG 导出完成")
 
 msg("开始导出 PDF：", pdf_out)
 choose_device_pdf(
@@ -758,8 +915,10 @@ choose_device_pdf(
 )
 print(p)
 dev.off()
+msg("PDF 导出完成")
 
 msg("绘图完成")
-msg("PNG：", png_out)
-msg("PDF：", pdf_out)
-msg("PLOT_DATA：", plot_data_out)
+msg("输出文件汇总：")
+msg("  PNG = ", png_out)
+msg("  PDF = ", pdf_out)
+msg("  PLOT_DATA = ", plot_data_out)
