@@ -30,7 +30,7 @@
 # User settings (edit only here)
 # =========================
 
-INPUT_DIR  <- "input"
+INPUT_DIR  <- "input2"
 OUTPUT_DIR <- "output"
 
 # Output subfolder name (no timestamp)
@@ -71,14 +71,14 @@ FONT_FAMILY <- "Arial"
 GRID_ON <- FALSE
 
 # Axis text sizes (publication-ready; adjust as needed)
-AXIS_TEXT_X_SIZE <- 13
-AXIS_TEXT_Y_SIZE <- 14
+AXIS_TEXT_X_SIZE <- 17
+AXIS_TEXT_Y_SIZE <- 18
 
 # Strip/title and legend text sizes
-STRIP_TITLE_SIZE <- 13
-PANEL_TITLE_SIZE <- 14
-LEGEND_TITLE_SIZE <- 11
-LEGEND_TEXT_SIZE  <- 10
+STRIP_TITLE_SIZE <- 17
+PANEL_TITLE_SIZE <- 18
+LEGEND_TITLE_SIZE <- 18
+LEGEND_TEXT_SIZE  <- 17
 
 # Output figures
 OUT_PNG <- TRUE
@@ -86,7 +86,7 @@ OUT_PDF <- TRUE
 PNG_DPI <- 600
 
 # Figure size (inches)
-FIG_WIDTH  <- 10
+FIG_WIDTH  <- 9.5
 FIG_HEIGHT <- 8
 
 # Bubble size range
