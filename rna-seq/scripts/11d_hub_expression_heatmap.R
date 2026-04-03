@@ -7,13 +7,6 @@
 # - Inputs: wgcna_objects.rds (datExpr), hub_genes_by_module.tsv OR module lists, samples.tsv
 # - Outputs: PNG/PDF + supplementary TSV (selected genes table)
 #
-# 2026-02-04 改进点（彻底版 + 排版增强）：
-# - 支持从 results/10_wgcna/lists/module_<color>.list 读取模块基因（默认）
-# - module list 可为 1 列（gene_id）或 2 列（gene_id + gene_name）
-# - 纵轴行名规则：list 第2列优先；否则 Swiss-Prot gene_name；否则 locus ID
-# - 自动检测重复英文名并追加 -1/-2...（仅重复的才追加）
-# - 彻底移除 Unannotated/annotation 标记：无色条、无图例、补表无该字段
-# - 新增：可将“仅 locus ID”的基因统一放到最下方（不显示任何标题）
 # =============================================================================
 
 options(stringsAsFactors = FALSE)
@@ -48,6 +41,11 @@ TOP_N_PER_MODULE <- 50
 
 # 是否将“只有 locus ID（无 list 第2列且无 Swiss-Prot gene_name）”的基因统一放到最下方
 MOVE_LOCUS_ONLY_TO_BOTTOM <- TRUE
+
+# 是否保留“未匹配到基因名称”的行（即：仅 locus ID，无 list 第2列且无 Swiss-Prot gene_name）
+# - TRUE：保留（默认）
+# - FALSE：丢弃这些行（热图与补表都不会包含它们）
+KEEP_LOCUS_ONLY_ROWS <- FALSE
 
 # 两块之间的间隔（mm）
 ROW_SPLIT_GAP_MM <- 1
@@ -88,11 +86,11 @@ SHOW_TITLE <- FALSE
 MAIN_TITLE <- "Hub gene expression (z-score)"
 
 # 图片尺寸
-PNG_WIDTH_IN  <- 8
-PNG_HEIGHT_IN <- 7
+PNG_WIDTH_IN  <- 12
+PNG_HEIGHT_IN <- 10
 PNG_RES_DPI   <- 600
-PDF_WIDTH_IN  <- 10
-PDF_HEIGHT_IN <- 8
+PDF_WIDTH_IN  <- 12
+PDF_HEIGHT_IN <- 10
 
 # 补表输出（TSV）
 SUPP_TSV <- "11d_hub_genes.tsv"
@@ -104,10 +102,11 @@ FONT_FAMILY <- "Arial"
 # - 行名字体：基因名
 # - 列名字体：样本名（当 SHOW_SAMPLE_NAMES=TRUE 时才会显示）
 # - 图例字体：z-score 与 group 两个 legend 的 title/labels
-FONT_SIZE_ROW_NAMES     <- 11
-FONT_SIZE_COL_NAMES     <- 8
-FONT_SIZE_LEGEND_TITLE  <- 10
-FONT_SIZE_LEGEND_LABELS <- 9
+FONT_SIZE_ROW_NAMES     <- 18
+FONT_SIZE_COL_NAMES     <- 17
+FONT_SIZE_TISSUE_NAMES  <- 19
+FONT_SIZE_LEGEND_TITLE  <- 18
+FONT_SIZE_LEGEND_LABELS <- 17
 
 # ------------------------------------------------------------------------------
 
@@ -378,9 +377,15 @@ col_g <- setNames(group_cols, group_levels)
 
 # ---- 3) 取表达并 z-score ----
 mat <- datExpr[, genes, drop = FALSE]
-mat <- t(mat)
-z <- t(scale(t(mat)))
-z[is.na(z)] <- 0
+mat <- t(mat)  # genes x samples
+
+# 逐行 z-score（手写实现，避免 scale() 在 sd=0 时刷 warning）
+row_mu <- rowMeans(mat, na.rm = TRUE)
+row_sd <- apply(mat, 1, sd, na.rm = TRUE)
+row_sd[is.na(row_sd) | row_sd == 0] <- 1  # sd=0 的行直接当作“无波动”，避免 NaN/Inf
+z <- (mat - row_mu) / row_sd
+z[!is.finite(z)] <- 0
+
 
 cap <- as.numeric(ZSCORE_CAP %||% 2)
 z[z >  cap] <-  cap
@@ -395,6 +400,13 @@ lab_df <- make_plot_labels(rownames(z), list_labels_vec, sp_map)
 is_locus_only <- (!nzchar(lab_df$list_label_raw)) & (!nzchar(lab_df$swissprot_gene_name_raw))
 lab_df$is_locus_only <- is_locus_only
 
+# 可选：丢弃“未匹配到基因名称（仅 locus ID）”的行
+if (!isTRUE(KEEP_LOCUS_ONLY_ROWS)) {
+    keep_idx <- !lab_df$is_locus_only
+    z <- z[keep_idx, , drop = FALSE]
+    lab_df <- lab_df[keep_idx, , drop = FALSE]
+}
+
 # 如需下移：通过 row_split 强制分成上下两块，并保持两块顺序为：先有名，后 locus-only
 row_split <- NULL
 if (isTRUE(MOVE_LOCUS_ONLY_TO_BOTTOM)) {
@@ -402,6 +414,7 @@ if (isTRUE(MOVE_LOCUS_ONLY_TO_BOTTOM)) {
   z <- z[ord_rows, , drop = FALSE]
   lab_df <- lab_df[ord_rows, , drop = FALSE]
   row_split <- factor(ifelse(lab_df$is_locus_only, "2", "1"), levels = c("1", "2"))
+  row_split <- droplevels(row_split)  # 丢弃未出现的 level，避免 row_title 长度与切片数不一致
 }
 
 rownames(z) <- lab_df$plot_label
@@ -438,7 +451,11 @@ ha <- HeatmapAnnotation(
 # row_split 不显示任何标题（避免出现“未注释/Unannotated”等文字）
 # ComplexHeatmap: row_title 可设为空字符串向量，以达到“无标题”的效果
 row_title_opt <- NULL
-if (!is.null(row_split)) row_title_opt <- rep("", length(levels(row_split)))
+if (!is.null(row_split)) {
+    n_slices <- length(levels(row_split))
+    # n_slices 与真实切片数必须一致；droplevels() 已清理空 level
+    row_title_opt <- rep("", n_slices)
+}
 
 ht <- Heatmap(
   z,
@@ -448,12 +465,14 @@ ht <- Heatmap(
   show_row_names = !isTRUE(HIDE_GENE_NAMES),
   show_column_names = isTRUE(SHOW_SAMPLE_NAMES),
   column_names_gp = gpar(fontsize = as.numeric(FONT_SIZE_COL_NAMES %||% 8), fontfamily = FONT_FAMILY),
+  column_title_gp = gpar(fontsize = as.numeric(FONT_SIZE_TISSUE_NAMES %||% 8), fontfamily = FONT_FAMILY),
   row_names_gp = gpar(fontsize = as.numeric(FONT_SIZE_ROW_NAMES %||% 8), fontfamily = FONT_FAMILY),
 
   # 行拆分：让 locus-only 的基因整体移动到下方
   row_split = row_split,
   row_gap = if (!is.null(row_split)) unit(as.numeric(ROW_SPLIT_GAP_MM %||% 2), "mm") else unit(0, "mm"),
-  row_title = row_title_opt,
+  row_title = NULL,
+  row_title_gp = gpar(fontsize = 0),
 
   # 仍允许每个 slice 内聚类（由 CLUSTER_ROWS 控制）
   cluster_rows = isTRUE(CLUSTER_ROWS),
@@ -469,16 +488,16 @@ pdf_out <- file.path(OUTDIR, "11d_hub_expression_heatmap.pdf")
 
 open_png(png_out, PNG_WIDTH_IN, PNG_HEIGHT_IN, PNG_RES_DPI)
 draw(ht,
-     heatmap_legend_side = "right",
-     annotation_legend_side = "right",
+     heatmap_legend_side = "left",
+     annotation_legend_side = "left",
      heatmap_legend_list = list(lgd_onecol),
      annotation_legend_list = NULL)
 invisible(dev.off())
 
 open_pdf(pdf_out, PDF_WIDTH_IN, PDF_HEIGHT_IN)
 draw(ht,
-     heatmap_legend_side = "right",
-     annotation_legend_side = "right",
+     heatmap_legend_side = "left",
+     annotation_legend_side = "left",
      heatmap_legend_list = list(lgd_onecol),
      annotation_legend_list = NULL)
 invisible(dev.off())
@@ -521,4 +540,3 @@ supp$rank_in_plot <- seq_len(nrow(supp))
 supp_out <- file.path(OUTDIR, SUPP_TSV)
 data.table::fwrite(supp, supp_out, sep = "\t", quote = FALSE)
 cat("[OK]", supp_out, "\n")
-

@@ -50,7 +50,7 @@ SFT_PDF_WIDTH_IN  <- 8
 SFT_PDF_HEIGHT_IN <- 4
 
 # 数字标注大小（红色 power 数字）
-SFT_LABEL_CEX <- 0.9
+SFT_LABEL_CEX <- 1.10
 
 FONT_FAMILY <- "Arial"
 
@@ -153,9 +153,9 @@ plot_soft_threshold_from_tsv <- function(tsv_path, r2_target, chosen_power, labe
   par(
     mfrow = c(1, 2),
     mar = c(4.2, 4.6, 2.6, 1.2),
-    cex.axis = 1.05,
-    cex.lab = 1.15,
-    cex.main = 1.25
+    cex.axis = 1.40,
+    cex.lab = 1.53,
+    cex.main = 1.66
   )
 
   par(family = FONT_FAMILY)
@@ -171,7 +171,7 @@ plot_soft_threshold_from_tsv <- function(tsv_path, r2_target, chosen_power, labe
   plot(
     x, y,
     xlab = "Soft threshold (power)",
-    ylab = "Scale free topology model fit, signed R^2",
+    ylab = "Scale-free topology fit (signed R²)",
     type = "n",
     main = "Scale independence",
     ylim = c(ylim_bot, ylim_top)

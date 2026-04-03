@@ -240,7 +240,7 @@ if (isTRUE(EXPORT_SUMMARY_TSV)) {
 }
 
 # 主题：更紧凑、更“论文感”
-theme_set(theme_classic(base_size = 14, base_family = FONT_FAMILY))
+theme_set(theme_classic(base_size = 18, base_family = FONT_FAMILY))
 
 p <- ggplot() +
   # y=0 参考线
@@ -280,7 +280,7 @@ p <- ggplot() +
   scale_color_manual(values = pal) +
   labs(x = NULL, y = "Module eigengene (ME)") +
   theme(
-    axis.text.x = element_text(angle = 45, hjust = 1),
+    axis.text.x = element_text(angle = 0, hjust = 0.5),
 
     # 半封闭轴线：只画 x 底线 + y 左线（细线）
     axis.line.x.bottom = element_line(linewidth = 0.35, color = "black"),

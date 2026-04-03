@@ -26,7 +26,7 @@ MAIN_TITLE <- "Module–trait relationship"
 
 PNG_WIDTH_IN  <- 10
 PNG_HEIGHT_IN <- 7
-PNG_RES_DPI   <- 300
+PNG_RES_DPI   <- 600
 PDF_WIDTH_IN  <- 10
 PDF_HEIGHT_IN <- 7
 
@@ -200,7 +200,7 @@ df_long$module <- factor(df_long$module, levels = row_lab)
 df_long$trait  <- factor(df_long$trait,  levels = col_lab_plot)
 
 base_family <- "Arial"
-theme_set(theme_classic(base_size = 12, base_family = base_family))
+theme_set(theme_classic(base_size = 17, base_family = base_family))
 
 p <- ggplot(df_long, aes(x = trait, y = module, fill = r)) +
   geom_tile(color = "white", linewidth = 0.4) +
@@ -211,7 +211,7 @@ p <- ggplot(df_long, aes(x = trait, y = module, fill = r)) +
   ) +
   labs(x = NULL, y = NULL, fill = "Correlation") +
   theme(
-    axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1),
+    axis.text.x = element_text(angle = 0, hjust = 0.5, vjust = 0.5),
     axis.ticks  = element_blank(),
 
     # ✅ 去掉横纵轴外框线（关键）
@@ -219,8 +219,8 @@ p <- ggplot(df_long, aes(x = trait, y = module, fill = r)) +
 
     # 让整体更“清爽”
     plot.margin = margin(8, 8, 8, 8),
-    legend.title = element_text(size = 11),
-    legend.text  = element_text(size = 10)
+    legend.title = element_text(size = 13),
+    legend.text  = element_text(size = 12)
   )
 
 if (isTRUE(SHOW_TITLE)) p <- p + ggtitle(MAIN_TITLE)
