@@ -62,7 +62,7 @@ abbreviate_species_names <- FALSE   # 开启属名缩写 (如 Sinonovacula -> S.
 
 input_tree_path <- file.path("input", "FigTree.tre")
 input_cafe_path <- file.path("input", "cafe_significant_clade_summary.tsv")
-output_full_path <- file.path("output", "jindd_phylo_tree")
+output_full_path <- file.path("output", "zsq_phylo_tree")
 
 # 自动创建输出目录
 if (!dir_exists(output_full_path)) {
@@ -148,6 +148,10 @@ tree_tbl_processed <- tree_tbl %>%
         # 提取置信区间 (HPD)
         hpd_lower = as.numeric(sapply(.data[["0.95HPD"]], function(x) if (is.null(x)) NA else x[1])),
         hpd_upper = as.numeric(sapply(.data[["0.95HPD"]], function(x) if (is.null(x)) NA else x[2])),
+
+        # 若开启“分歧时间乘100”开关，则同步将 HPD 区间也乘以100
+        hpd_lower = ifelse(isTRUE(multiply_divtime_by_100) & !is.na(hpd_lower), hpd_lower * 100, hpd_lower),
+        hpd_upper = ifelse(isTRUE(multiply_divtime_by_100) & !is.na(hpd_upper), hpd_upper * 100, hpd_upper),
 
         # 生成标签字符串，使用真实时间 age_display
         # 说明：
