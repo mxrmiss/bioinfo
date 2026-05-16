@@ -1,6 +1,5 @@
 species_prefixes:
-  - Sinonovacula_constricta
-  - Sinonovacula_rivularis
+  - hybrid_oyster
   # - Sinonovacula_constricta.longest
 
 threads: 25
@@ -19,9 +18,14 @@ filter:
 
 reports:
   enabled: true
+  make_long_annotation: false
+  export_annotation_xlsx: true
 
 db:
   use_metalink: true
   metalink_select_file: 6
   metalink_preferred_protocol: "https"
 
+go:
+  enabled: true
+  gaf_gz: "data/db/raw/goa_uniprot_all.gaf.gz"

@@ -163,7 +163,7 @@ kegg:
 
 # ------------------------------ GSEA 富集（08使用） --------------------------------
 gsea:
-  enable: true            # 是否启用 GSEA 通道
+  enable: false            # 是否启用 GSEA 通道
   score_from: "stat"      # 使用 DESeq2 的哪一列作为排名：stat 或 log2fc
   minGS: 10               # 基因集最小大小（与 GO ORA 保持一致即可）
   maxGS: 500              # 基因集最大大小（一般不用改）
@@ -173,7 +173,7 @@ gsea:
 
 # 一个组织对多个组织（组织特异性GSEA）
 one_vs_rest:
-  enable: true
+  enable: false
   targets: ["foot"]          # 或 ["foot","siphon"]
   label_suffix: "_vs_other"
   replace_existing_label: true
@@ -218,95 +218,182 @@ logging:
 # ------------------------------ WGCNA（10 使用） ------------------------------
 # 说明：
 # - 本块专用于 scripts/10_wgcna_modules.R
-# - 参数优先级：config.yaml > 脚本顶部默认值
-# - traits 设计完全通用：通过 group 列构建 one-hot；binary_traits 支持任意“关注集合 vs 对照集合”
+# - 想分析什么，就直接在 binary_traits / score_traits / group_order_trait / trait_columns 中明写
 wgcna:
   enable: true
-
-  # 变换方法：推荐 vst（顶刊稳妥）；也支持 voom（验证/对照用）
-  method: "vst"   # vst / voom
-
-  # 输入文件（建议保持与本项目目录一致）
+  method: "vst"                  # 可选: "vst" / "voom"
   input_counts: "results/05_matrix/counts/gene_counts.tsv"
-  samples_tsv:  "data/samples.tsv"
-
-  # 输出目录：若同时设置 dirs.wgcna，则 wgcna.outdir 优先
+  samples_tsv: "data/samples.tsv"
   outdir: "results/10_wgcna"
-
-  # 复现性
   save_rds: true
   random_seed: 20260108
+  threads: 8                     # 若同时写了 resources.threads.wgcna，则外层优先
 
-  # ---------------- 过滤：先低表达（counts），再低方差（transform 后） ----------------
   filter:
-    min_count: 10          # counts>=10 视为“可检测”
-    min_samples: 6         # 至少在 >=6 个样本可检测（18样本 1/3；可按样本量调整）
-    var_metric: "mad"      # mad / variance
-    keep_top_fraction: 0.5 # 保留变化最大的 top 50%
-    # keep_top_n: 8000      # 可选：若设置则优先于 keep_top_fraction
+    min_count: 10
+    min_samples: 6
+    var_metric: "mad"            # 可选: "mad" / "variance"
+    keep_top_fraction: 0.5
+    # keep_top_n: 8000
 
-  # ---------------- VST 配置（method=vst 时生效） ----------------
   vst:
-    blind: true            # 不引入分组信息（更稳妥，更好写 Methods）
+    blind: true
 
-  # ---------------- voom 配置（method=voom 时生效） ----------------
   voom:
-    enable_tmm: true       # edgeR::calcNormFactors (TMM)
-    plot_mean_var: false   # 是否输出 voom mean-variance 图（一般不需要）
+    enable_tmm: true
+    plot_mean_var: false
 
-  # ---------------- 网络构建（WGCNA） ----------------
   network:
-    networkType: "signed"            # signed / unsigned
+    networkType: "signed"
     TOMType: "signed"
-    corType: "bicor"                 # bicor / pearson
-    maxPOutliers: 0.05               # bicor 参数（离群点鲁棒）
-    useObs: "pairwise.complete.obs"  # 相关性缺失值处理
+    corType: "bicor"
+    maxPOutliers: 0.05
+    useObs: "pairwise.complete.obs"
 
-  # ---------------- soft-threshold power 选择 ----------------
   power:
     candidates: [1,2,3,4,5,6,7,8,9,10,12,14,16,18,20]
     scale_free_R2_target: 0.85
     min_mean_connectivity: 20
-    # fixed: 12                 # 可选：固定 power，跳过自动选择
+    # fixed: 12
 
-  # ---------------- 模块识别 ----------------
   modules:
     minModuleSize: 30
-    deepSplit: 2
+    deepSplit: 3
     pamRespectsDendro: false
-    mergeCutHeight: 0.25
+    mergeCutHeight: 0.2
     reassignThreshold: 0
     numericLabels: true
 
-  # ---------------- traits：完全通用（不要写死任何组织名） ----------------
   traits:
-    sample_column: "sample"
-    group_column:  "group"
+    sample_column: "sample"      # samples.tsv 中样本列名
+    group_column: "group"        # samples.tsv 中分组列名
 
-    # 自动对所有 group 做 one-hot traits（推荐开启）
-    build_onehot: true
+    build_group_onehot: true     # 是否按 group 自动生成 one-hot trait
+    group_onehot_prefix: "group_"
 
-    # 可选：定义一个或多个“二元性状”
-    # - negative_groups 为空：表示“除了 positive_groups 之外的全部”
-    # - 需要你自己把 group 名字写成 samples.tsv 里真实出现过的值
-    binary_traits:
-      - name: "target_vs_rest"
-        positive_groups: ["foot"]
-        negative_groups: []
+    ordered_group_levels:        # 若 group 有天然顺序，在这里给出；没有顺序可留空 []
+      - "F"
+      - "M"
+      - "B"
+      - "T"
+      - "D"
+      - "U"
+      - "E"
+      - "J"
+      - "S"
+      - "DS"
 
-    # 可选：把 samples.tsv 里的其它列也作为 traits（数值保留；字符/分类自动 one-hot）
-    extra_columns_as_traits: []
+    group_order_trait:           # 是否基于 ordered_group_levels 生成顺序 trait
+      enable: true
+      name: "stage_order"
 
-  # ---------------- 输出控制 ----------------
+    #binary_traits:               # 手工定义二元 trait
+      #- name: "late_stage_binary"
+        #positive_groups: ["E", "J", "S", "DS"]
+        #negative_groups: ["F", "M", "B", "T", "D", "U"]
+
+    score_traits:                # 手工定义分值 trait
+      - name: "foot_activation_score"
+        mapping:
+          F: 0
+          M: 0.1
+          B: 1
+          T: 0.8
+          D: 0.7
+          U: 0.5
+          E: 0
+          J: 0
+          S: 0
+          DS: 0
+
+    trait_columns: []            # 直接把 samples.tsv 中已有列纳入 trait。示例：
+                                 # - column: "batch"
+                                 #   name: "batch"
+                                 #   kind: "categorical"   # numeric / categorical / auto
+
+    redundancy:
+      enable: true
+      cor_threshold: 0.85
+      p_adjust_method: "BH"
+
   export:
     gene_module_table: true
     module_lists: true
 
     hub_genes:
       enable: true
-      top_n_per_module: 50
+      top_n_per_module: 10
       rank_by: ["kME", "GS"]
-      primary_trait: "target_vs_rest"   # 可选：指定 hub genes 依据的主 trait
-      # 说明：可填 "target_vs_rest"（脚本会自动匹配 binary_ 前缀）或填 trait_matrix 里的完整列名
 
+      primary_trait: "foot_activation_score"          # 留空时自动选择
+      primary_trait_selection:
+        method: "best_significant"
+        padj_cutoff: 0.05
+        prefer_continuous: true
+        exclude_prefixes: []
 
+wgcna_plot:
+  module_trait_heatmap:
+    input_cor_tsv: "results/10_wgcna/assoc/module_trait_cor.tsv"
+    input_fdr_tsv: "results/10_wgcna/assoc/module_trait_padj.tsv"
+    input_assign_tsv: "results/10_wgcna/modules/gene_module_assignments.tsv"
+    outdir: "results/10_wgcna/figures"
+
+    sort_trait: ""   # 留空时按自动选择的主 trait 或原列顺序显示   # 留空时由 11a 自动选择；若想固定某个 trait 再手动填写
+    append_module_size: true
+    hide_traits: ["stage_order", "late_stage_binary"]                    # 通用模板默认不隐藏
+
+    show_title: false
+    main_title: "Module-trait relationship"
+
+    png_width_in: 10
+    png_height_in: 7
+    png_res_dpi: 300
+    pdf_width_in: 10
+    pdf_height_in: 7
+
+    fill_limit: 1
+    fill_low: "#7FD3C8"
+    fill_mid: "white"
+    fill_high: "#F79D93"
+
+    font_family: "Arial"
+    base_font_size: 15
+    cell_text_size: 3
+    axis_text_size: 14
+    x_text_size: 14
+    y_text_size: 14
+    legend_title_size: 14
+    legend_text_size: 13
+    title_size: 16
+
+    x_text_angle: 45
+    x_text_hjust: 1
+    x_text_vjust: 1
+
+    # 可选：自定义显示名
+    trait_label_map:
+    #   stage_order: "Developmental order"
+    #   late_stage_binary: "Late stage"
+      foot_activation_score: "Foot activation"
+
+wgcna_enrich:
+  outdir: "results/10_wgcna/enrich"
+  r_enrich_script: "scripts/08_g_enrich.R"
+
+  geneset_mode: "module_lists"         # module_lists / hub_top
+  min_genes_per_set: 10
+  background_mode: "annotated_wgcna_universe"    # wgcna_universe / annotated_wgcna_universe
+  run_enrich: true
+
+  modules_include: ["pink","yellow","blue"]
+  modules_exclude: ["grey"]
+
+  trait_filter:
+    enable: false
+    target_trait: ""                   # 留空时可自动继承 wgcna.export.hub_genes.primary_trait
+    direction: "both"                  # positive / negative / both
+    cor_min: 0.30
+    fdr_max: 0.05
+
+  geneid_col: "gene_id"
