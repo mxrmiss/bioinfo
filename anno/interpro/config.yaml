@@ -1,0 +1,70 @@
+# config.yaml
+# =============================================================================
+# InterProScan + TSV2Wide pipeline config
+# 所有可调参数集中在这里。脚本不需要命令行参数。
+# =============================================================================
+
+interproscan:
+  ver: "5.76-107.0"
+  ips_sh_tpl: "data/interproscan-{ver}/interproscan.sh"
+
+  # Step01 结果目录（工程化目录）
+  outdir_tpl: "results/01_interproscan/{ver}.core"
+
+  tmp_dir: "tmp"
+  cpu: 20
+
+  format: "TSV"
+  dp: true
+  goterms: true
+
+  appl:
+    - Pfam
+    - SMART
+    - ProSitePatterns
+    - ProSiteProfiles
+    - SUPERFAMILY
+    - PANTHER
+    - Gene3D
+
+inputs:
+  # 最稳：显式列出 inputs
+  inputs:
+    - "data/query/hybrid_oyster.faa"
+
+  # 可选：若 inputs 为空/未设置，则扫描目录
+  inputs_dir: "data/query"
+  inputs_ext: ".faa"
+
+wide_table:
+  # Step02 结果目录（更短：02_wide）
+  outdir_tpl: "results/02_wide/{ver}.core"
+
+  # 宽表格式开关
+  write_tsv: true
+  write_xlsx: true
+
+  # 关键开关：是否把 GO 也抽成宽表的一列（列名 GO）
+  include_go: false
+  go_column_name: "GO"
+  go_join_sep: "; "
+
+  target_analyses:
+    - Pfam
+    - SMART
+    - ProSitePatterns
+    - ProSiteProfiles
+    - SUPERFAMILY
+    - PANTHER
+    - Gene3D
+
+  join_sep: "; "
+  sanitize_desc: true
+
+  xlsx_skip_if_too_many_rows: true
+
+logging:
+  log_dir: "logs"
+  level: "INFO"
+  print_command: true
+

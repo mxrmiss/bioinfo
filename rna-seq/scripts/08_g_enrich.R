@@ -216,6 +216,12 @@ format_kegg_res <- function(dt, test_set, universe_size,
   )
 }
 
+
+filter_ora_sig <- function(dt, fdr_cutoff) {
+  if (is.null(dt) || nrow(dt) == 0L) return(dt)
+  dt[!is.na(p_adjust) & p_adjust <= fdr_cutoff]
+}
+
 #------------------------- 读取配置与任务 -------------------------#
 
 config_file <- "config.yaml"
@@ -293,7 +299,10 @@ go_obsolete_policy <- cfg$go$obsolete_policy %||% "replace_or_consider"
 
 enrich_fdr <- cfg$enrich$fdr %||% 0.05
 enrich_output_sig_sorted <- cfg$enrich$output_sig_sorted %||% TRUE
-use_pvalue_cutoff_1 <- cfg$enrich$use_pvalue_cutoff_1 %||% FALSE
+
+# ORA 正式输出不在 enricher() 内按显著性提前截断；后续统一用 p_adjust 判断显著。
+ora_pvalue_cutoff <- 1.0
+ora_qvalue_cutoff <- 1.0
 
 kegg_count_mode <- cfg$kegg$count_mode %||% "by_gene"
 kegg_padj_method <- cfg$kegg$p_adjust_method %||% "BH"
@@ -384,6 +393,27 @@ setnames(ont_df, c("GOID", "ONTOLOGY"), c("term_id", "ontology"))
 go_ontology_map <- ont_df$ontology
 names(go_ontology_map) <- ont_df$term_id
 
+# GO ORA 使用 BP/CC/MF 独立 TERM2GENE，避免三本体混合富集后再拆分。
+go_term2gene_annot <- merge(
+  go_term2gene,
+  unique(ont_df[ontology %in% c("BP", "CC", "MF"), .(term_id, ontology)]),
+  by = "term_id",
+  all.x = FALSE
+)
+go_term2name_annot <- merge(
+  go_term2name,
+  unique(ont_df[ontology %in% c("BP", "CC", "MF"), .(term_id, ontology)]),
+  by = "term_id",
+  all.x = FALSE
+)
+
+go_term2gene_by_ont <- list()
+go_term2name_by_ont <- list()
+for (ont in c("BP", "CC", "MF")) {
+  go_term2gene_by_ont[[ont]] <- go_term2gene_annot[ontology == ont, .(term_id, gene_id)]
+  go_term2name_by_ont[[ont]] <- go_term2name_annot[ontology == ont, .(term_id, term_name)]
+}
+
 # GO / KEGG 的 gene 宇宙
 go_gene_universe   <- unique(go_term2gene$gene_id)
 kegg_gene_universe <- unique(kegg_term2gene2$gene_id)
@@ -446,57 +476,58 @@ for (lb in labels_unique) {
 
     # ---- GO ORA ----
     go_res_list <- list()
-    if (length(test_go) >= 1L && length(universe_go) >= go_minGS) {
-      eg <- tryCatch(
-        clusterProfiler::enricher(
-          gene          = test_go,
-          universe      = universe_go,
-          TERM2GENE     = go_term2gene,
-          TERM2NAME     = go_term2name,
-          pAdjustMethod = go_padj_method,
-          minGS         = go_minGS,
-          maxGS         = go_maxGS,
-          pvalueCutoff  = if (isTRUE(use_pvalue_cutoff_1)) 1.0 else 0.05,
-          qvalueCutoff  = 1.0
-        ),
-        error = function(e) {
-          log_msg("WARNING", "GO enricher 失败：label=", label,
-                  ", test_set=", test_set, "；原因：", e$message)
-          NULL
-        }
+    for (ont in c("BP", "CC", "MF")) {
+      go_res_list[[ont]] <- format_go_sub(
+        dt_sub        = NULL,
+        ontology      = ont,
+        test_set      = test_set,
+        universe_size = universe_size_go,
+        minGS         = go_minGS,
+        maxGS         = go_maxGS,
+        gene_name_map = gene_name_map
       )
-      if (!is.null(eg) && nrow(as.data.frame(eg)) > 0L) {
-        df <- as.data.table(as.data.frame(eg))
-        df[, ontology := go_ontology_map[as.character(ID)]]
-        for (ont in c("BP", "CC", "MF")) {
-          sub <- df[ontology == ont]
-          if (nrow(sub) == 0L) {
-            go_res_list[[ont]] <- format_go_sub(
-              dt_sub        = NULL,
-              ontology      = ont,
-              test_set      = test_set,
-              universe_size = universe_size_go,
-              minGS         = go_minGS,
-              maxGS         = go_maxGS,
-              gene_name_map = gene_name_map
-            )
-          } else {
-            sub[, p_adjust := stats::p.adjust(pvalue, method = go_padj_method)]
-            go_res_list[[ont]] <- format_go_sub(
-              dt_sub        = sub,
-              ontology      = ont,
-              test_set      = test_set,
-              universe_size = universe_size_go,
-              minGS         = go_minGS,
-              maxGS         = go_maxGS,
-              gene_name_map = gene_name_map
-            )
-          }
+    }
+
+    if (length(test_go) >= 1L && length(universe_go) >= go_minGS) {
+      for (ont in c("BP", "CC", "MF")) {
+        term2gene_ont <- go_term2gene_by_ont[[ont]]
+        term2name_ont <- go_term2name_by_ont[[ont]]
+        if (is.null(term2gene_ont) || nrow(term2gene_ont) == 0L) {
+          next
         }
-      } else {
-        for (ont in c("BP", "CC", "MF")) {
+
+        ont_gene_universe <- unique(term2gene_ont$gene_id)
+        universe_go_ont <- intersect(universe_go, ont_gene_universe)
+        test_go_ont <- intersect(test_go, universe_go_ont)
+
+        if (length(test_go_ont) < 1L || length(universe_go_ont) < go_minGS) {
+          next
+        }
+
+        eg <- tryCatch(
+          clusterProfiler::enricher(
+            gene          = test_go_ont,
+            universe      = universe_go_ont,
+            TERM2GENE     = term2gene_ont,
+            TERM2NAME     = term2name_ont,
+            pAdjustMethod = go_padj_method,
+            minGS         = go_minGS,
+            maxGS         = go_maxGS,
+            pvalueCutoff  = ora_pvalue_cutoff,
+            qvalueCutoff  = ora_qvalue_cutoff
+          ),
+          error = function(e) {
+            log_msg("WARNING", "GO ", ont, " enricher 失败：label=", label,
+                    ", test_set=", test_set, "；原因：", e$message)
+            NULL
+          }
+        )
+
+        if (!is.null(eg) && nrow(as.data.frame(eg)) > 0L) {
+          df <- as.data.table(as.data.frame(eg))
+          df[, p_adjust := stats::p.adjust(pvalue, method = go_padj_method)]
           go_res_list[[ont]] <- format_go_sub(
-            dt_sub        = NULL,
+            dt_sub        = df,
             ontology      = ont,
             test_set      = test_set,
             universe_size = universe_size_go,
@@ -506,24 +537,13 @@ for (lb in labels_unique) {
           )
         }
       }
-    } else {
-      for (ont in c("BP", "CC", "MF")) {
-        go_res_list[[ont]] <- format_go_sub(
-          dt_sub        = NULL,
-          ontology      = ont,
-          test_set      = test_set,
-          universe_size = universe_size_go,
-          minGS         = go_minGS,
-          maxGS         = go_maxGS,
-          gene_name_map = gene_name_map
-        )
-      }
     }
 
     for (ont in c("BP", "CC", "MF")) {
       out_fp <- file.path(outdir, sprintf("GO_%s_by_term_%s.tsv", ont, test_set))
       if (!identical(test_set, "all")) {
-        data.table::fwrite(go_res_list[[ont]], file = out_fp, sep = "\t",
+        go_res_out <- filter_ora_sig(go_res_list[[ont]], enrich_fdr)
+        data.table::fwrite(go_res_out, file = out_fp, sep = "\t",
                            quote = FALSE, na = "NA")
       }
     }
@@ -539,8 +559,8 @@ for (lb in labels_unique) {
           pAdjustMethod = kegg_padj_method,
           minGS         = go_minGS,
           maxGS         = go_maxGS,
-          pvalueCutoff  = if (isTRUE(use_pvalue_cutoff_1)) 1.0 else 0.05,
-          qvalueCutoff  = 1.0
+          pvalueCutoff  = ora_pvalue_cutoff,
+          qvalueCutoff  = ora_qvalue_cutoff
         ),
         error = function(e) {
           log_msg("WARNING", "KEGG enricher 失败：label=", label,
@@ -584,7 +604,8 @@ for (lb in labels_unique) {
 
     kegg_out_fp <- file.path(outdir, sprintf("KEGG_by_term_%s.tsv", test_set))
     if (!identical(test_set, "all")) {
-      data.table::fwrite(kegg_res, file = kegg_out_fp, sep = "\t",
+      kegg_res_out <- filter_ora_sig(kegg_res, enrich_fdr)
+      data.table::fwrite(kegg_res_out, file = kegg_out_fp, sep = "\t",
                          quote = FALSE, na = "NA")
     }
   }
@@ -1000,3 +1021,4 @@ data.table::fwrite(summary_dt, file = summary_fp, sep = "\t",
 
 log_msg("INFO", "已写出富集汇总表：", summary_fp)
 log_msg("INFO", "===== 08_g_enrich.R 执行完成 =====")
+

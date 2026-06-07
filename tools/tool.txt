@@ -11,3 +11,14 @@ awk -F'\t' 'NR==FNR{k[$2]=1; next} FNR==1{print; next} ($3 in k)' A.tsv B.tsv
 
 19gene_heatmap.R	果冻感的方块热图
 
+# SRA文件分开并压缩
+mkdir -p tmp_fasterq
+
+fasterq-dump ./ERR15696470 \
+  --split-3 \
+  --threads 8 \
+  --temp ./tmp_fasterq \
+  --outdir . \
+  --progress
+
+pigz -p 8 ERR15696470*.fastq

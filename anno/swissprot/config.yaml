@@ -1,0 +1,31 @@
+species_prefixes:
+  - hybrid_oyster
+  # - Sinonovacula_constricta.longest
+
+threads: 25
+
+diamond:
+  sensitivity: sensitive
+  evalue: 1e-5
+  max_target_seqs: 50
+
+filter:
+  EV_MAX: 1e-5
+  MIN_BITSCORE: 50
+  MIN_ALN_LEN: 50
+  MIN_QCOV: 0.50
+  MIN_SCOV: 0.00
+
+reports:
+  enabled: true
+  make_long_annotation: false
+  export_annotation_xlsx: true
+
+db:
+  use_metalink: true
+  metalink_select_file: 6
+  metalink_preferred_protocol: "https"
+
+go:
+  enabled: true
+  gaf_gz: "data/db/raw/goa_uniprot_all.gaf.gz"
