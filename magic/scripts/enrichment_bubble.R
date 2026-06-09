@@ -20,10 +20,10 @@ suppressPackageStartupMessages({
 
 USE_FIXED_HEIGHT    <- TRUE
 
-FIXED_HEIGHT_VAL    <- 7.9
+FIXED_HEIGHT_VAL    <- 11.5
 FIXED_WIDTH_VAL     <- 13
 
-SINGLE_ASPECT_RATIO <- 2.0
+SINGLE_ASPECT_RATIO <- 2.2
 
 ROW_HEIGHT_INCH     <- 0.35
 BASE_HEIGHT_INCH    <- 1.5
@@ -44,8 +44,8 @@ USE_DARK_GRID       <- FALSE
 GRID_COLOR_LIGHT    <- "grey92"
 GRID_COLOR_DARK     <- "grey80"
 
-FONT_FAMILY         <- "sans"
-BASE_SIZE           <- 22
+FONT_FAMILY         <- "Arial"
+BASE_SIZE           <- 22.8
 
 POINT_ALPHA         <- 0.90
 POINT_SIZE_MIN      <- 3.5
@@ -70,11 +70,10 @@ GLOBAL_P_MIN <- 1e-10
 GLOBAL_P_MAX <- 0.05
 
 CUSTOM_FDR_COLORS <- c(
-  "#95C8F2",
-  "#A99BEF",
-  "#F3A6C9",
-  "#F79D93",
-  "#F5B07E"
+  "#C8E8C8",
+  "#68CDD2",
+  "#4DBBD5",
+  "#3C5488"
 )
 
 COLOR_N <- 256
@@ -373,7 +372,7 @@ for (f_path in files) {
       aspect.ratio = if (!is_multi_ontology) SINGLE_ASPECT_RATIO else NULL,
 
       panel.background = element_rect(fill = "white", colour = NA),
-      panel.border = element_rect(colour = "black", fill = NA, linewidth = 0.4),
+      panel.border = element_rect(colour = "black", fill = NA, linewidth = 0.25),
 
       panel.grid.major.x = if (SHOW_GRID) {
         element_line(colour = grid_col, linewidth = 0.3)
